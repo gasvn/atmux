@@ -35,7 +35,7 @@ python3 autotmux.py
 Start the application by running:
 
 ```bash
-autotmux
+atmux
 ```
 
 ### Dashboard Controls
