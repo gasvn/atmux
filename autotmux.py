@@ -395,7 +395,7 @@ def draw_menu(stdscr, app, current_row):
 
         # --- Header ---
         refresh_status = " [Refreshing...]" if app.refreshing else ""
-        header_text = f" AutoTmux v0.3 | Active: {len(active_items)} | Offline: {len(stale_items)} | Errors: {len(app.errors)}{refresh_status} | Filter: [{app.filter_query}]"
+        header_text = f" AutoTmux v0.3.0 | Active: {len(active_items)} | Offline: {len(stale_items)} | Errors: {len(app.errors)}{refresh_status} | Filter: [{app.filter_query}]"
         
         # Ensure header doesn't overflow
         header_text = header_text[:width-1]
