@@ -6,13 +6,21 @@ AutoTmux is a powerful, terminal-based tool designed to streamline the managemen
 
 - **Automatic Node Discovery**: Queries `squeue` to find all compute nodes currently allocated to your user.
 - **Session Scanning**: Connects to each node via SSH to list active tmux sessions.
-- **Interactive TUI (Text User Interface)**: A clean, color-coded dashboard built with `curses`.
+- **Split-View Dashboard**: Compact session list on the left, live snapshot preview on the right.
+- **Mouse Support**: Click rows to select, use mouse wheel to scroll.
+- **Live Refresh**: Sessions are automatically re-scanned in the background every 30 seconds. (Press `r` to force refresh).
+- **Session Management**:
+  - **Attach**: Instantly attach to any tmux session or start a new shell.
+  - **Create (`c`)**: Create new named sessions on any node directly from the UI.
+  - **Kill (`k`)**: Terminate sessions with a confirmation prompt.
+- **Search / Filter (`/`)**: Quickly filter the session list by typing queries.
 - **One-Key Connection**:
   - **Attach**: Instantly attach to any tmux session with `ENTER`.
   - **Shell**: Open a fresh shell on any active node with `s`.
-- **Snapshot Mode**: View a live preview (last 10 lines) of all your running tmux sessions simultaneously without attaching to them.
 - **Persistent Notes**: Add custom notes to any session (`n` key) to keep track of experiment status or to-do items. Notes are saved to `~/.autotmux_notes.json`.
-- **Stale Session Tracking**: Keeps track of sessions you've noted even if they go offline (displayed in red), so you don't lose context.
+- **Persistent Snapshots**: Snapshots are automatically captured and saved to `~/.autotmux_snapshots.json` so they are available instantly and across restarts.
+- **Error Logging (`e`)**: View connection errors and issues directly within the tool.
+- **Stale Session Tracking**: Keeps track of sessions you've noted even if they go offline (displayed in red).
 
 ## Installation
 
@@ -45,17 +53,15 @@ atmux
 | **UP / DOWN** | Navigate the list of sessions. |
 | **ENTER** | **Attach** to the selected tmux session via SSH. |
 | **s** | Open a raw SSH **shell** on the selected node. |
-| **S** | Enter **Snapshot Mode** (view pane previews). |
+| **r** | **Refresh** the session list. |
+| **k** | **Kill** the selected session (with confirmation). |
+| **c** | **Create** a new session on a specific node. |
+| **/** | **Search / Filter** the list. |
 | **n** | **Add/Edit Note** for the selected session. |
 | **d** | **Delete Note** (and remove from list if session is offline). |
+| **e** | **View Error Log**. |
+| **?** | **Show Help** screen. |
 | **q** | **Quit** the application. |
-
-### Snapshot Mode
-
-Press `S` from the main menu to see a read-only view of all your sessions.
-- **Auto-Refresh**: The view updates every 60 seconds.
-- **Navigation**: Use `UP`, `DOWN`, `PageUp`, `PageDown` to scroll through the output.
-- **q / Esc**: Return to the main dashboard.
 
 ## Requirements
 
