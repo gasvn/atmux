@@ -7,9 +7,12 @@ import curses
 import time
 import json
 import threading
+import hashlib
+import urllib.request
 
 NOTES_FILE = os.path.expanduser("~/.autotmux_notes.json")
 SNAPSHOTS_FILE = os.path.expanduser("~/.autotmux_snapshots.json")
+CONFIG_FILE = os.path.expanduser("~/.autotmux_config.json")
 
 class AppState:
     def __init__(self):
@@ -18,10 +21,43 @@ class AppState:
         self.node_times = {}
         self.sessions = []
         self.errors = []
+        self.errors = []
+        self.watches = {}
+        self.config = self.load_config()
         self.filter_query = ""
         self.refreshing = False
         self.last_refresh_time = 0
         self.refresh_interval = 30
+
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    def save_config(self):
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.config, f, indent=2)
+        except:
+            pass
+            
+    def send_slack_alert(self, node, session, mins):
+        url = self.config.get("slack_webhook_url", "")
+        if not url: return
+        
+        msg = f"🚨 *AutoTmux Alert*\nSession `{session}` on node `{node}` has been inactive for *{mins:.1f} minutes*."
+        payload = {"text": msg}
+        try:
+            data = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                pass
+        except Exception as e:
+            self.errors.append(f"Slack Error: {e}")
 
     def load_notes(self):
         if os.path.exists(NOTES_FILE):
@@ -203,6 +239,23 @@ class AppState:
                             s_node, s_sess, lines = future.result()
                             key = f"{s_node}:{s_sess}"
                             self.snapshots[key] = lines
+                            
+                            # Watch Mode Logic
+                            if key in self.watches:
+                                content_str = "".join(lines)
+                                curr_hash = hashlib.md5(content_str.encode('utf-8')).hexdigest()
+                                w_data = self.watches[key]
+                                
+                                if w_data['last_hash'] != curr_hash:
+                                    w_data['last_hash'] = curr_hash
+                                    w_data['last_change'] = time.time()
+                                    w_data['alert_sent'] = False
+                                else:
+                                    # Check for alert
+                                    idle = time.time() - w_data.get('last_change', time.time())
+                                    if idle > w_data.get('threshold', 300) and not w_data.get('alert_sent'):
+                                        self.send_slack_alert(s_node, s_sess, idle/60)
+                                        w_data['alert_sent'] = True
                         except:
                             pass
             
@@ -280,6 +333,58 @@ def confirm_action(stdscr, prompt):
     # Handle resize or other errors gracefully?
     return key in [ord('y'), ord('Y')]
 
+def draw_settings(stdscr, app):
+    current = 0
+    items = ["Slack Webhook URL", "Refresh Interval (s)", "Exit"]
+    
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+        
+        # Draw Header
+        title = " SETTINGS "
+        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+        stdscr.addstr(0, 0, title.ljust(width))
+        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+        
+        # Draw Items
+        for i, item in enumerate(items):
+            y = 2 + i
+            prefix = "[x]" if i == current else "[ ]"
+            
+            val_disp = ""
+            if i == 0:
+                val = app.config.get("slack_webhook_url", "")
+                val_disp = f": {val[:50]}..." if val else ": (Not Set)"
+            elif i == 1:
+                val_disp = f": {app.refresh_interval}"
+                
+            line = f"{prefix} {item}{val_disp}"
+            
+            if i == current:
+                stdscr.attron(curses.A_REVERSE)
+                stdscr.addstr(y, 2, line)
+                stdscr.attroff(curses.A_REVERSE)
+            else:
+                stdscr.addstr(y, 2, line)
+                
+        stdscr.refresh()
+        key = stdscr.getch()
+        
+        if key == ord('q') or key == 27: break
+        if key == curses.KEY_UP: current = max(0, current - 1)
+        if key == curses.KEY_DOWN: current = min(len(items)-1, current + 1)
+        if key == 10: # Enter
+            if current == 0: # Slack
+                curr = app.config.get("slack_webhook_url", "")
+                new_val = get_input(stdscr, "Slack Webhook URL (empty to disable):")
+                if new_val is not None:
+                    app.config["slack_webhook_url"] = new_val.strip()
+                    app.save_config()
+            elif current == 1: # Refresh
+                pass 
+            elif current == 2: break
+
 def draw_help(stdscr):
     height, width = stdscr.getmaxyx()
     win = curses.newwin(14, 50, (height-14)//2, (width-50)//2)
@@ -291,7 +396,7 @@ def draw_help(stdscr):
         "s       : Open Shell on node",
         "n       : Add/Edit Note",
         "d       : Delete Note",
-        "S       : Snapshot View (Deprecated/TODO)",
+        "S       : Settings",
         "r       : Refresh Sessions",
         "k       : Kill Session",
         "c       : Create Session",
@@ -405,7 +510,7 @@ def draw_menu(stdscr, app, current_row):
         stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
 
         # --- Footer ---
-        footer_text = " ENTER:Conn | n:Note | d:Del | k:Kill | c:New | /:Search | r:Ref | ?:Help | q:Quit "
+        footer_text = " ENTER:Conn | n:Note | d:Del | w:Watch | S:Settings | k:Kill | c:New | /:Search | r:Ref | ?:H "
         stdscr.attron(curses.color_pair(4))
         try:
             stdscr.addstr(height-1, 0, footer_text.ljust(width))
@@ -439,14 +544,25 @@ def draw_menu(stdscr, app, current_row):
             note_key = f"{node}:{session}"
             note = app.notes.get(note_key, "")
 
-            # Colors
+            # Colors & Watch Status
+            watch_data = app.watches.get(note_key)
+            
             if is_stale:
                 attr = curses.color_pair(2)
                 time_disp = "[OFFLINE]"
             else:
                 attr = curses.color_pair(3)
                 time_disp = f"[{time_left}]"
-            
+                
+            if watch_data:
+                idle = time.time() - watch_data['last_change']
+                thresh = watch_data['threshold']
+                if idle > thresh:
+                    attr = curses.color_pair(2) | curses.A_BLINK | curses.A_BOLD
+                    time_disp = f"[ALRT {int(idle/60)}m]"
+                else:
+                    time_disp = f"[W {int(idle/60)}m]"
+
             if session == "<Start Shell>":
                 sess_disp = "<Start Shell>"
                 wins_disp = "-"
@@ -567,6 +683,29 @@ def draw_menu(stdscr, app, current_row):
                 if new_n is not None:
                     app.notes[note_key] = new_n
                     app.save_notes()
+        elif key == ord('S'):
+             draw_settings(stdscr, app)
+        elif key == ord('w'):
+            if all_items:
+                node, session, _, is_stale = all_items[current_row]
+                if not is_stale and session != "<Start Shell>":
+                    key_w = f"{node}:{session}"
+                    if key_w in app.watches:
+                        del app.watches[key_w]
+                    else:
+                        thresh_str = get_input(stdscr, "Alert after N mins inactivity (default 5):")
+                        try:
+                            if not thresh_str: thresh_str = "5"
+                            mins = float(thresh_str)
+                            app.watches[key_w] = {
+                                'threshold': mins * 60,
+                                'last_change': time.time(),
+                                'last_hash': '' # Will update on next refresh
+                            }
+                        except:
+                            pass
+                    # Trigger immediate update to register watch state
+                    app.start_background_refresh()
         elif key == ord('d'):
             if all_items:
                 node, session, _, _ = all_items[current_row]
@@ -617,77 +756,7 @@ def draw_menu(stdscr, app, current_row):
                     else:
                         subprocess.call(['ssh', '-t', node, 'tmux', 'attach', '-t', session])
 
-def draw_snapshot_mode(stdscr, app):
-    curses.curs_set(0)
-    scroll_y = 0
-    stdscr.timeout(100) # 100ms non-blocking
-    
-    display_lines = []
-    
-    def prepare_display_data():
-        lines = []
-        # Sort sessions for consistent display
-        # Use app.sessions to know order, then lookup snapshot
-        for node, session, wins in app.sessions:
-            if session == "<Start Shell>": continue
-            key = f"{node}:{session}"
-            snapshot_lines = app.snapshots.get(key, ["(No snapshot available)"])
-            
-            header = f"=== {node} : {session} ({wins} wins) ==="
-            lines.append(('header', header))
-            for sl in snapshot_lines:
-                lines.append(('content', sl))
-            lines.append(('separator', ""))
-        return lines
 
-    while True:
-        display_lines = prepare_display_data()
-        
-        stdscr.clear()
-        height, width = stdscr.getmaxyx()
-        
-        # Title Bar
-        time_str = time.strftime("%H:%M:%S", time.localtime(app.last_refresh_time))
-        refresh_status = " [Refreshing...]" if app.refreshing else ""
-        title = f" SNAPSHOT MODE | Last: {time_str}{refresh_status} | q/Esc back "
-        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-        stdscr.addstr(0, 0, title.ljust(width))
-        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-        
-        # Viewport
-        view_height = height - 1
-        max_scroll = max(0, len(display_lines) - view_height)
-        
-        if scroll_y > max_scroll: scroll_y = max_scroll
-        if scroll_y < 0: scroll_y = 0
-        
-        for i in range(view_height):
-            idx = scroll_y + i
-            if idx >= len(display_lines):
-                break
-            
-            line_type, text = display_lines[idx]
-            y = i + 1
-            
-            if y >= height: break
-
-            try:
-                if line_type == 'header':
-                    max_len = width - 4
-                    disp_text = text[:max_len]
-                    stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
-                    stdscr.addstr(y, 1, disp_text)
-                    stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
-                elif line_type == 'content':
-                    max_len = width - 5
-                    disp_text = text[:max_len]
-                    stdscr.attron(curses.A_DIM) 
-                    stdscr.addstr(y, 2, disp_text) 
-                    stdscr.attroff(curses.A_DIM)
-            except Exception:
-                pass
-        
-        stdscr.refresh()
         
         key = stdscr.getch()
         

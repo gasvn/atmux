@@ -8,6 +8,8 @@ AutoTmux is a powerful, terminal-based tool designed to streamline the managemen
 - **Session Scanning**: Connects to each node via SSH to list active tmux sessions.
 - **Split-View Dashboard**: Compact session list on the left, live snapshot preview on the right.
 - **Mouse Support**: Click rows to select, use mouse wheel to scroll.
+- **Watch Mode**: Set an inactivity alert (`w`) on any session to get notified if it hangs or stops updating.
+- **Slack Notifications**: Receive real-time alerts in your Slack channel when a watched session becomes inactive. (Config via `S`).
 - **Live Refresh**: Sessions are automatically re-scanned in the background every 30 seconds. (Press `r` to force refresh).
 - **Session Management**:
   - **Attach**: Instantly attach to any tmux session or start a new shell.
