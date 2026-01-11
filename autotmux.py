@@ -50,7 +50,11 @@ class AppState:
         if not url: return
         
         msg = f"🚨 *AutoTmux Alert*\nSession `{session}` on node `{node}` has been inactive for *{mins:.1f} minutes*."
-        payload = {"text": msg}
+        payload = {
+            "text": msg,
+            "username": "AutoTmux",
+            "icon_emoji": ":robot_face:"
+        }
         try:
             data = json.dumps(payload).encode('utf-8')
             req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
@@ -338,7 +342,7 @@ def draw_settings(stdscr, app):
     items = ["Slack Webhook URL", "Refresh Interval (s)", "Exit"]
     
     while True:
-        stdscr.clear()
+        stdscr.erase()
         height, width = stdscr.getmaxyx()
         
         # Draw Header
@@ -370,6 +374,8 @@ def draw_settings(stdscr, app):
                 
         stdscr.refresh()
         key = stdscr.getch()
+        
+        if key == -1: continue
         
         if key == ord('q') or key == 27: break
         if key == curses.KEY_UP: current = max(0, current - 1)
@@ -408,7 +414,9 @@ def draw_help(stdscr):
         win.addstr(i+1, 2, line)
     win.addstr(12, 2, "Press any key to close...")
     win.refresh()
-    win.getch()
+    while True:
+        k = win.getch()
+        if k != -1: break
 
 def draw_errors(stdscr, errors):
     height, width = stdscr.getmaxyx()
@@ -417,7 +425,7 @@ def draw_errors(stdscr, errors):
     win.addstr(0, 2, " Error Log ")
     scroll = 0
     while True:
-        win.clear()
+        win.erase()
         win.box()
         win.addstr(0, 2, f" Error Log ({len(errors)}) - q to close ")
         max_y = win.getmaxyx()[0] - 2
@@ -429,6 +437,8 @@ def draw_errors(stdscr, errors):
         
         win.refresh()
         k = win.getch()
+        if k == -1: continue
+        
         if k == ord('q'): break
         elif k == curses.KEY_UP and scroll > 0: scroll -= 1
         elif k == curses.KEY_DOWN and scroll < len(errors) - max_y: scroll += 1
@@ -461,7 +471,7 @@ def draw_menu(stdscr, app, current_row):
         # Check for auto-refresh
         if time.time() - app.last_refresh_time > app.refresh_interval:
             app.start_background_refresh()
-        stdscr.clear()
+        stdscr.erase()
         height, width = stdscr.getmaxyx()
         
         # --- Split Layout Calculation ---
@@ -500,7 +510,7 @@ def draw_menu(stdscr, app, current_row):
 
         # --- Header ---
         refresh_status = " [Refreshing...]" if app.refreshing else ""
-        header_text = f" AutoTmux v0.3.0 | Active: {len(active_items)} | Offline: {len(stale_items)} | Errors: {len(app.errors)}{refresh_status} | Filter: [{app.filter_query}]"
+        header_text = f" AutoTmux v0.3.1 | Active: {len(active_items)} | Offline: {len(stale_items)} | Errors: {len(app.errors)}{refresh_status} | Filter: [{app.filter_query}]"
         
         # Ensure header doesn't overflow
         header_text = header_text[:width-1]
@@ -559,15 +569,16 @@ def draw_menu(stdscr, app, current_row):
                 thresh = watch_data['threshold']
                 if idle > thresh:
                     attr = curses.color_pair(2) | curses.A_BLINK | curses.A_BOLD
-                    time_disp = f"[ALRT {int(idle/60)}m]"
+                    sess_disp = "🚨 " + session
                 else:
-                    time_disp = f"[W {int(idle/60)}m]"
+                    sess_disp = "👀 " + session
+            else:
+                sess_disp = "   " + session
 
             if session == "<Start Shell>":
-                sess_disp = "<Start Shell>"
+                sess_disp = "🐚 <Shell>"
                 wins_disp = "-"
             else:
-                sess_disp = session
                 wins_disp = str(wins)
 
             # Truncating
@@ -606,6 +617,15 @@ def draw_menu(stdscr, app, current_row):
                 else:
                     pkey = f"{p_node}:{p_session}"
                     plines = app.snapshots.get(pkey, ["(Waiting for snapshot...)"])
+                    
+                    # Watch Details
+                    pw_data = app.watches.get(pkey)
+                    if pw_data:
+                        pidle = time.time() - pw_data['last_change']
+                        pthr = pw_data['threshold']
+                        status = "ALERT" if pidle > pthr else "WATCHING"
+                        info = f" [{status}] Idle: {int(pidle/60)}m / Limit: {int(pthr/60)}m"
+                        plines = [info, "-"*len(info)] + plines
                 
                 # Draw lines
                 for idx, line in enumerate(plines):
@@ -744,8 +764,6 @@ def draw_menu(stdscr, app, current_row):
                 node, _, _, _ = all_items[current_row]
                 curses.endwin()
                 subprocess.call(['ssh', '-t', node])
-        elif key == ord('S'):
-            draw_snapshot_mode(stdscr, app)
         elif key == ord('\n'):
              if all_items:
                 node, session, _, is_stale = all_items[current_row]
@@ -755,28 +773,6 @@ def draw_menu(stdscr, app, current_row):
                         subprocess.call(['ssh', '-t', node])
                     else:
                         subprocess.call(['ssh', '-t', node, 'tmux', 'attach', '-t', session])
-
-
-        
-        key = stdscr.getch()
-        
-        if key == -1:
-            if time.time() - app.last_refresh_time > app.refresh_interval:
-                app.start_background_refresh()
-            continue
-            
-        if key == ord('q') or key == 27: # Esc
-            return
-        elif key == curses.KEY_UP:
-            scroll_y -= 1
-        elif key == curses.KEY_DOWN:
-            scroll_y += 1
-        elif key == curses.KEY_NPAGE or key == 6: 
-            scroll_y += view_height
-        elif key == curses.KEY_PPAGE or key == 2: 
-            scroll_y -= view_height
-        elif key == ord('r'): 
-             app.start_background_refresh()
 
 def main():
     app = AppState()
