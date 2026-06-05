@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autotmux"
+version = "0.4.0"
+description = "Terminal dashboard for managing tmux sessions across slurm compute nodes."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Shanghua Gao" }]
+keywords = ["tmux", "slurm", "ssh", "hpc", "terminal", "tui"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Clustering",
+    "Topic :: Terminals",
+]
+dependencies = [
+    "textual>=0.40",
+    "rich>=13.0",
+]
+
+[project.scripts]
+atmux = "autotmux:main"
+atd = "autotmux_daemon:main_entry"
+
+[tool.setuptools]
+py-modules = ["autotmux", "autotmux_daemon"]

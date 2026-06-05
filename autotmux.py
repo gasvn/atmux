@@ -1,960 +1,877 @@
 #!/usr/bin/env python3
-import subprocess
-import concurrent.futures
-import sys
-import os
-import curses
-import time
-import json
-import threading
+"""AutoTmux – Textual frontend.
+
+The frontend is 100% passive: it reads /tmp/autotmux_daemon_<uid>.json
+written by the atd backend and renders it.  It NEVER runs squeue, ssh,
+or any slow command for the purpose of listing nodes or sessions.
+
+The only network calls the frontend makes are:
+  1) tmux capture-pane via SSH for the live preview (async, non-blocking).
+  2) ssh/tmux attach when the user explicitly presses Enter/s/o.
+"""
+import asyncio
+import fcntl
 import hashlib
-import urllib.request
-import multiprocessing
-import queue
+import json
+import os
+import pty
+import select
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, VerticalScroll
+from textual.reactive import reactive
+from textual.widgets import DataTable, Footer, Header, Static
+import rich.text
+
+__version__ = '0.4.0'
+
+_UID = os.getuid()
+STATE_FILE = f'/tmp/autotmux_daemon_{_UID}.json'
+CTL_DIR = f'/tmp/autotmux_ctl_{_UID}'
+PID_FILE = f'/tmp/autotmux_daemon_{_UID}.pid'
+SNAPSHOT_FILE = f'/tmp/autotmux_snapshots_{_UID}.json'
 
 
-NOTES_FILE = os.path.expanduser("~/.autotmux_notes.json")
-SNAPSHOTS_FILE = os.path.expanduser("~/.autotmux_snapshots.json")
-CONFIG_FILE = os.path.expanduser("~/.autotmux_config.json")
-CACHE_FILE = os.path.expanduser("~/.autotmux_cache.json")
+def _ctl_path(node: str) -> str:
+    safe = node.replace('/', '_').replace(':', '_')
+    return os.path.join(CTL_DIR, f'cm_{safe}')
 
-def fetch_nodes(user):
-    node_infos = {}
-    if not user: return node_infos
+
+def _get_ssh_args(node: str) -> list:
+    """Return ControlPath + keepalive flags so an idle slave channel
+    doesn't get silently dropped by NAT/firewalls (which is what kicks
+    `<Start Shell>` users out — plain bash has no keepalive of its own,
+    unlike tmux which talks to its server periodically)."""
+    args = ['-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3']
+    ctl = _ctl_path(node)
+    if os.path.exists(ctl):
+        args += ['-o', f'ControlPath={ctl}']
+    return args
+
+
+def read_state() -> dict:
+    """Read the daemon state file.  Returns {} on any error."""
     try:
-        # Fetch detailed info: NodeList, TimeLeft, JobID, JobName, Partition, User, State, TimeUsed, NumDes, Reason
-        cmd = ['squeue', '-u', user, '-h', '-o', '%N|%L|%j|%i|%P|%u|%T|%M|%D|%R']
-        result = subprocess.check_output(cmd, universal_newlines=True, timeout=15)
-        
-        for line in result.splitlines():
-            line = line.strip()
-            if not line: continue
-            parts = line.split('|')
-            if len(parts) < 10: continue
-            
-            node_part = parts[0]
-            time_left = parts[1]
-            job_name = parts[2]
-            job_id = parts[3]
-            partition = parts[4]
-            user_name = parts[5]
-            state = parts[6]
-            time_used = parts[7]
-            num_nodes = parts[8]
-            reason = parts[9] # This is typically the last one
+        with open(STATE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-            # Construct detailed string for top of preview
-            details = f"JobId={job_id} Name={job_name} User={user_name} Partition={partition} State={state} Time={time_used} TimeLeft={time_left} Nodes={num_nodes} NodeList={node_part} Reason={reason}"
 
-            info = {
-                'time': time_left,
-                'job_name': job_name,
-                'job_id': job_id,
-                'details': details
-            }
+def read_snapshots() -> dict:
+    """Read the persistent preview snapshot cache. Returns {} on any error."""
+    try:
+        with open(SNAPSHOT_FILE, 'r') as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
 
-            if '[' in node_part or ',' in node_part:
+
+class WarmSlavePool:
+    """Maintains an idle interactive ssh slave per remote node, so that
+    `tmux attach` is near-instant.
+
+    The slow part of an attach over a high-load compute node is not the SSH
+    handshake itself (the master takes care of that) — it's the remote sshd
+    forking a fresh shell process that has to wait its turn on a busy CPU.
+    By keeping a long-lived `ssh -tt` running in the background, that fork
+    has already happened. When the user presses Enter we just send
+    `exec tmux attach -t SESS\\n` into the warm shell and proxy bytes
+    between the local terminal and the pty until the user detaches.
+
+    Slaves are spawned with `pty.fork()`, so we hold the pty master fd in
+    this process and can read/write to the remote shell. Failure to spawn
+    or attach silently falls back to the cold subprocess-based path.
+    """
+
+    def __init__(self) -> None:
+        # node -> (pid, master_fd)
+        self._slaves: dict = {}
+        # Serialize spawn/cleanup so concurrent warm() calls (e.g. from
+        # back-to-back _refresh_table workers) can't both fork for the
+        # same node, leaking one slave.
+        self._lock = threading.Lock()
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+
+    def warm(self, node: str) -> None:
+        """Idempotently spawn a warm slave for node, if the master socket
+        is up and we don't already have a live one."""
+        if node == 'localhost':
+            return
+        ctl = _ctl_path(node)
+        if not os.path.exists(ctl):
+            return
+        with self._lock:
+            if self._still_alive_locked(node):
+                return
+            try:
+                pid, master_fd = pty.fork()
+            except OSError:
+                return
+            if pid == 0:
+                # child — replace with ssh
                 try:
-                    expanded = subprocess.check_output(['scontrol', 'show', 'hostnames', node_part], universal_newlines=True)
-                    for node in expanded.splitlines():
-                        if node.strip(): 
-                            node_infos[node.strip()] = info
-                except: 
-                    node_infos[node_part] = info
-            else:
-                node_infos[node_part] = info
-    except: pass
-    return node_infos
+                    os.execvp('ssh', [
+                        'ssh',
+                        '-o', f'ControlPath={ctl}',
+                        '-o', 'StrictHostKeyChecking=no',
+                        '-o', 'ServerAliveInterval=30',
+                        '-o', 'ServerAliveCountMax=3',
+                        '-tt', node,
+                    ])
+                except Exception:
+                    os._exit(127)
+            # parent — make the master fd close-on-exec so child processes don't
+            # accidentally inherit it.
+            try:
+                flags = fcntl.fcntl(master_fd, fcntl.F_GETFD)
+                fcntl.fcntl(master_fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+            except Exception:
+                pass
+            self._slaves[node] = (pid, master_fd)
 
-def fetch_sessions_on_node(node):
-    sessions = []
-    error = None
-    try:
-        cmd = ['ssh', '-o', 'ControlMaster=auto', '-o', 'ControlPath=/tmp/ssh_mux_%u_%h_%p_%r', '-o', 'ControlPersist=600', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=2', node, "tmux list-sessions -F '#{session_name}:#{session_windows}'"]
+    def warm_all(self, nodes) -> None:
+        """Spawn warm slaves for `nodes` and tear down slaves for any node
+        that's no longer in the set — so departing slurm allocations don't
+        leave orphan ssh processes for hours."""
+        wanted = set(nodes)
+        with self._lock:
+            current = set(self._slaves)
+        # Kill slaves for nodes that left the view.
+        for departed in (current - wanted):
+            self._cleanup(departed)
+        # Spawn missing ones.
+        for n in wanted:
+            self.warm(n)
 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        stdout, stderr = process.communicate(timeout=10)
-        if process.returncode == 0:
-            for line in stdout.splitlines():
-                if line.strip():
-                    if ':' in line:
-                        parts = line.split(':')
-                        sessions.append((node, parts[0], parts[1] if len(parts)>1 else "?"))
-                    else:
-                        sessions.append((node, line.strip(), "?"))
-        else:
-            if "Connection timed out" in stderr or "Permission denied" in stderr or "Could not resolve hostname" in stderr:
-                error = f"{node}: {stderr.strip()}"
-    except subprocess.TimeoutExpired:
-        error = f"{node}: Connection timed out (subprocess)"
-    except Exception as e:
-        error = f"{node}: {str(e)}"
-    return sessions, error
+    def shutdown(self) -> None:
+        """Tear down every warm slave. Called from on_unmount."""
+        for node in list(self._slaves):
+            self._cleanup(node)
 
-def fetch_snapshot(node, session):
-    if session == "<Start Shell>": return (node, session, ["(Shell - No Active Session)"])
-    try:
-        cmd = ['ssh', '-o', 'ControlMaster=auto', '-o', 'ControlPath=/tmp/ssh_mux_%u_%h_%p_%r', '-o', 'ControlPersist=600', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=3', node, f"tmux capture-pane -pt {session} -S -10"]
-        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, universal_newlines=True)
+    # ── attach path ─────────────────────────────────────────────────────────
 
-        return (node, session, output.splitlines())
-    except Exception as e:
-        return (node, session, [f"Error fetching snapshot: {str(e)}"])
+    def attach(self, node: str, session: str) -> bool:
+        """Try to attach using a warm slave. Returns True if the proxy ran
+        (the user's terminal was handed over and they've now detached);
+        False if no warm slave was available — caller should fall back."""
+        slave = self._take(node)
+        if not slave:
+            return False
+        pid, master_fd = slave
+        try:
+            # Drain whatever the remote bash already printed (welcome
+            # banner, prompt, etc.) so the user sees a clean tmux paint.
+            self._drain(master_fd)
+            cmd = f'exec tmux attach -t {shlex.quote(session)}\n'
+            try:
+                os.write(master_fd, cmd.encode())
+            except OSError:
+                return False
+            self._proxy(master_fd, pid)
+        finally:
+            self._reap_child(pid)
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+        return True
 
-def background_result_worker(result_queue, user):
-    try:
-        # 1. Fetch Nodes
-        node_infos = fetch_nodes(user)
-        nodes = list(node_infos.keys())
-        
-        # Send partial result to unblock UI
-        result_queue.put({
-            'node_infos': node_infos,
-            'sessions': [],
-            'errors': [],
-            'snapshots': {}
-        })
-        
-        # 2. Fetch Sessions
-        new_sessions = []
-        new_errors = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_node = {executor.submit(fetch_sessions_on_node, node): node for node in nodes}
+    @staticmethod
+    def _reap_child(pid: int) -> None:
+        """Send SIGTERM, give it a beat to wind down, escalate to SIGKILL,
+        then waitpid so we don't leak zombies."""
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(20):
+            try:
+                wpid, _ = os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                return
+            if wpid == pid:
+                return
+            time.sleep(0.05)
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
 
-            for future in concurrent.futures.as_completed(future_to_node):
+    # ── internals ───────────────────────────────────────────────────────────
+
+    def _still_alive(self, node: str) -> bool:
+        with self._lock:
+            return self._still_alive_locked(node)
+
+    def _still_alive_locked(self, node: str) -> bool:
+        """Caller must hold self._lock."""
+        slave = self._slaves.get(node)
+        if not slave:
+            return False
+        pid, _ = slave
+        try:
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+            if wpid == 0:
+                return True
+        except OSError:
+            pass
+        # Process gone — drop without re-locking.
+        self._slaves.pop(node, None)
+        return False
+
+    def _take(self, node: str):
+        with self._lock:
+            if not self._still_alive_locked(node):
+                return None
+            return self._slaves.pop(node, None)
+
+    def _cleanup(self, node: str) -> None:
+        with self._lock:
+            slave = self._slaves.pop(node, None)
+        if not slave:
+            return
+        pid, fd = slave
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+        # Reap so we don't leak zombies. SIGTERM should be enough; escalate
+        # to SIGKILL if the child is stuck.
+        for _ in range(20):
+            try:
+                wpid, _ = os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                return
+            if wpid == pid:
+                return
+            time.sleep(0.05)
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _drain(master_fd: int) -> None:
+        """Read and discard whatever the slave already produced."""
+        try:
+            while True:
+                r, _, _ = select.select([master_fd], [], [], 0.05)
+                if master_fd not in r:
+                    return
                 try:
-                    s, e = future.result()
-                    new_sessions.extend(s)
-                    if e: new_errors.append(e)
-                except: pass
-        
-        # 3. Fetch Snapshots
-        new_snapshots = {}
-        if new_sessions:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                futures = []
+                    if not os.read(master_fd, 8192):
+                        return
+                except OSError:
+                    return
+        except (OSError, ValueError):
+            return
 
-                for node, session, _ in new_sessions:
-                     if session != "<Start Shell>":
-                         futures.append(executor.submit(fetch_snapshot, node, session))
-                for future in concurrent.futures.as_completed(futures):
+    @staticmethod
+    def _proxy(master_fd: int, child_pid: int) -> None:
+        """Bridge fd 0/1 to/from master_fd until the child exits.
+
+        Mirrors what `ssh` itself does between user terminal and remote pty,
+        but we're in front of the ssh client this time.
+        """
+        try:
+            old_attr = termios.tcgetattr(0)
+        except termios.error:
+            old_attr = None
+
+        def on_winch(_sig=None, _frame=None):
+            try:
+                cols, rows = os.get_terminal_size(0)
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                            struct.pack('HHHH', rows, cols, 0, 0))
+            except Exception:
+                pass
+
+        old_winch = signal.signal(signal.SIGWINCH, on_winch)
+        on_winch()
+        if old_attr is not None:
+            tty.setraw(0)
+        try:
+            while True:
+                try:
+                    r, _, _ = select.select([0, master_fd], [], [], 0.5)
+                except (OSError, ValueError):
+                    break
+                if 0 in r:
                     try:
-                        sn, ss, lines = future.result()
-                        new_snapshots[f"{sn}:{ss}"] = lines
-                    except: pass
-        
-        # 4. Return Data
-        result = {
-            'node_infos': node_infos,
-            'sessions': new_sessions,
-            'errors': new_errors,
-            'snapshots': new_snapshots
-        }
-        result_queue.put(result)
-    except Exception as e:
-        result_queue.put({'error': str(e)})
-
-class AppState:
-    def __init__(self):
-        self.notes = self.load_notes()
-        self.snapshots = self.load_snapshots()
-        
-        # Load Cache
-        cache = self.load_cache()
-        self.node_infos = cache.get('node_infos', {})
-        self.sessions = cache.get('sessions', [])
-        
-        self.errors = []
-        self.watches = {}
-        self.config = self.load_config()
-        self.filter_query = ""
-        self.refreshing = False
-        self.last_refresh_time = 0
-        self.refresh_interval = 30
-        self.result_queue = multiprocessing.Queue()
-        self.refresh_process = None
-        self.dirty = True  # Force initial redraw
-
-        
-        self.lock = threading.Lock()
-        
-        # Start poller thread
-        self.poller_thread = threading.Thread(target=self._poll_worker, daemon=True)
-        self.poller_thread.start()
-
-
-    def load_config(self):
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, 'r') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
-
-    def load_cache(self):
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {}
-
-    def save_cache(self):
-        cache = {
-            'node_infos': self.node_infos,
-            'sessions': self.sessions
-        }
-        self._trigger_save(CACHE_FILE, cache)
-
-    def _save_file_worker(self, filename, data):
-        try:
-            with open(filename, 'w') as f:
-                json.dump(data, f, indent=2)
-        except: pass
-
-    def _trigger_save(self, filename, data):
-        t = threading.Thread(target=self._save_file_worker, args=(filename, data), daemon=True)
-        t.start()
-
-    def save_config(self):
-        self._trigger_save(CONFIG_FILE, self.config)
-            
-    def send_slack_alert(self, node, session, mins):
-        url = self.config.get("slack_webhook_url", "")
-        if not url: return
-        
-        msg = f"🚨 *AutoTmux Alert*\nSession `{session}` on node `{node}` has been inactive for *{mins:.1f} minutes*."
-        payload = {
-            "text": msg,
-            "username": "AutoTmux",
-            "icon_emoji": ":robot_face:"
-        }
-        try:
-            data = json.dumps(payload).encode('utf-8')
-            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req, timeout=5) as response:
-                pass
-        except Exception as e:
-            self.errors.append(f"Slack Error: {e}")
-
-    def load_notes(self):
-        if os.path.exists(NOTES_FILE):
-            try:
-                with open(NOTES_FILE, 'r') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
-
-    def save_notes(self):
-        self._trigger_save(NOTES_FILE, self.notes)
-
-    def load_snapshots(self):
-        if os.path.exists(SNAPSHOTS_FILE):
-            try:
-                with open(SNAPSHOTS_FILE, 'r') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
-
-    def save_snapshots(self):
-        self._trigger_save(SNAPSHOTS_FILE, self.snapshots)
-
-    def start_background_refresh(self):
-        # Don't start if already running
-        if self.refresh_process and self.refresh_process.is_alive():
-            return
-            
-        self.refreshing = True
-        
-        # Start new process
-        user = os.environ.get('USER')
-        self.refresh_process = multiprocessing.Process(
-            target=background_result_worker, 
-            args=(self.result_queue, user)
-        )
-        self.refresh_process.daemon = True
-        self.refresh_process.start()
-
-    def _poll_worker(self):
-        while True:
-            try:
-                # Blocking get with timeout to allow checking for exit if needed (though daemon thread helps)
-                res = self.result_queue.get() 
-                
-                if 'error' in res:
-                    with self.lock:
-                        self.errors.append(res['error'])
-                        # Must finish refresh even on error
-                        self.refreshing = False
-                    continue
-                
-                # Unpack - No lock needed yet
-                node_infos = res.get('node_infos', {})
-                new_sessions = res.get('sessions', [])
-                errors = res.get('errors', [])
-                new_snapshots = res.get('snapshots', {})
-
-                # --- Prepare Watch Updates (Outside Lock) ---
-                # We calculate what needs to change so we hold lock for less time
-                updates_to_apply = []
-                alerts_to_send = []
-
-                # We need a read-copy of watches or just iterate carefully?
-                # Since this is the only thread writing to watches (except main enabling/disabling),
-                # we can be a bit careful. But `watches` is shared.
-                # Actually, strictly speaking `watches` is read by UI thread.
-                # So we should probably capture the state we need or just accept we might need lock for reads.
-                # To really optimize, we can calculate hashes first.
-                
-                snapshot_hashes = {}
-                for k, lines in new_snapshots.items():
-                    content_str = "".join(lines)
-                    snapshot_hashes[k] = hashlib.md5(content_str.encode('utf-8')).hexdigest()
-
-                # --- Critical Section ---
-                with self.lock:
-                    self.node_infos = node_infos
-                    self.sessions = new_sessions
-                    self.errors.extend(errors) # Append new errors
-                    
-                    # Merge snapshots
-                    for k, v in new_snapshots.items():
-                        self.snapshots[k] = v
-                    
-                    # Watch Logic
-                    # Now we process the pre-calculated hashes against the current state
-                    curr_time = time.time()
-
-                    for k, curr_hash in snapshot_hashes.items():
-                         # Auto-enroll
-                        if k not in self.watches:
-                            self.watches[k] = {
-                                'threshold': 300,
-                                'last_change': curr_time,
-                                'last_hash': '',
-                                'alert_enabled': False,
-                                'alert_sent': False
-                            }
-                        
-                        w_data = self.watches[k]
-                        if w_data['last_hash'] != curr_hash:
-                            w_data['last_hash'] = curr_hash
-                            w_data['last_change'] = curr_time
-                            w_data['alert_sent'] = False
-                        else:
-                            # Check for alert
-                            idle = curr_time - w_data.get('last_change', curr_time)
-                            if idle > w_data.get('threshold', 300) and not w_data.get('alert_sent') and w_data.get('alert_enabled', False):
-                                alerts_to_send.append((k, idle))
-                                w_data['alert_sent'] = True
-                    
-                    self.save_snapshots()
-
-                    # Add placeholders
-                    nodes = list(self.node_infos.keys())
-                    nodes_with_sessions = set(node for node, _, _ in new_sessions)
-                    empty_nodes = [node for node in nodes if node not in nodes_with_sessions]
-                    for node in empty_nodes:
-                        self.sessions.append((node, "<Start Shell>", "0"))
-                        
-                    self.sessions.sort()
-                    self.last_refresh_time = time.time()
-                    self.refreshing = False
-                    self.save_cache()
-                    
-                    # UI needs update
-                    self.dirty = True
-
-                # --- Send Alerts (Outside Lock) ---
-                for k, idle_sec in alerts_to_send:
-                     parts = k.split(':')
-                     if len(parts) >= 2:
-                         sn = parts[0]
-                         ss = ":".join(parts[1:])
-                         t = threading.Thread(target=self.send_slack_alert, args=(sn, ss, idle_sec/60))
-                         t.start()
-
-            except Exception as e:
-                # In case of queue errors or other mess
-                time.sleep(1)
-
-    def refresh_data(self):
-        # Synchronous wrapper for initial load or forced sync actions
-        self.start_background_refresh()
-        # Wait for refresh to complete
-        while self.refreshing:
-            time.sleep(0.1)
-
-
-    def _action_worker(self, cmd):
-        try:
-            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except: pass
-        # Trigger refresh to show update
-        self.start_background_refresh()
-
-    def kill_session_async(self, node, session):
-        cmd = ['ssh', '-o', 'ControlMaster=auto', '-o', 'ControlPath=/tmp/ssh_mux_%u_%h_%p_%r', '-o', 'ControlPersist=600', node, 'tmux', 'kill-session', '-t', session]
-        t = threading.Thread(target=self._action_worker, args=(cmd,), daemon=True)
-        t.start()
-
-    def create_session_async(self, node, session_name):
-        cmd = ['ssh', '-o', 'ControlMaster=auto', '-o', 'ControlPath=/tmp/ssh_mux_%u_%h_%p_%r', '-o', 'ControlPersist=600', node, 'tmux', 'new-session', '-d', '-s', session_name]
-        t = threading.Thread(target=self._action_worker, args=(cmd,), daemon=True)
-        t.start()
-
-def draw_centered_msg(stdscr, msg):
-    height, width = stdscr.getmaxyx()
-    y = height // 2
-    x = max(0, (width - len(msg)) // 2)
-    stdscr.clear()
-    stdscr.addstr(y, x, msg, curses.A_BOLD)
-    stdscr.refresh()
-
-def get_input(stdscr, prompt):
-    curses.echo()
-    curses.curs_set(1)
-    height, width = stdscr.getmaxyx()
-    win = curses.newwin(5, 60, (height-5)//2, (width-60)//2)
-    win.box()
-    win.addstr(1, 2, prompt)
-    win.refresh()
-    try:
-        data = win.getstr(2, 2).decode('utf-8')
-    except:
-        data = ""
-    curses.noecho()
-    curses.curs_set(0)
-    return data
-
-def confirm_action(stdscr, prompt):
-    height, width = stdscr.getmaxyx()
-    win = curses.newwin(5, 60, (height-5)//2, (width-60)//2)
-    win.box()
-    win.addstr(1, 2, prompt + " (y/n)")
-    win.refresh()
-    key = win.getch()
-    # Handle resize or other errors gracefully?
-    return key in [ord('y'), ord('Y')]
-
-def draw_settings(stdscr, app):
-    current = 0
-    items = ["Slack Webhook URL", "Refresh Interval (s)", "Exit"]
-    
-    while True:
-        stdscr.erase()
-        height, width = stdscr.getmaxyx()
-        
-        # Draw Header
-        title = " SETTINGS "
-        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-        stdscr.addstr(0, 0, title.ljust(width))
-        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-        
-        # Draw Items
-        for i, item in enumerate(items):
-            y = 2 + i
-            prefix = "[x]" if i == current else "[ ]"
-            
-            val_disp = ""
-            if i == 0:
-                val = app.config.get("slack_webhook_url", "")
-                val_disp = f": {val[:50]}..." if val else ": (Not Set)"
-            elif i == 1:
-                val_disp = f": {app.refresh_interval}"
-                
-            line = f"{prefix} {item}{val_disp}"
-            
-            if i == current:
-                stdscr.attron(curses.A_REVERSE)
-                stdscr.addstr(y, 2, line)
-                stdscr.attroff(curses.A_REVERSE)
-            else:
-                stdscr.addstr(y, 2, line)
-                
-        stdscr.refresh()
-        key = stdscr.getch()
-        
-        if key == -1: continue
-        
-        if key == ord('q') or key == 27: break
-        if key == curses.KEY_UP: current = max(0, current - 1)
-        if key == curses.KEY_DOWN: current = min(len(items)-1, current + 1)
-        if key == 10: # Enter
-            if current == 0: # Slack
-                curr = app.config.get("slack_webhook_url", "")
-                new_val = get_input(stdscr, "Slack Webhook URL (empty to disable):")
-                if new_val is not None:
-                    app.config["slack_webhook_url"] = new_val.strip()
-                    app.save_config()
-            elif current == 1: # Refresh
-                pass 
-            elif current == 2: break
-
-def draw_help(stdscr):
-    height, width = stdscr.getmaxyx()
-    win = curses.newwin(14, 50, (height-14)//2, (width-50)//2)
-    win.box()
-    win.addstr(0, 2, " Help ")
-    lines = [
-        "Movement: Arrow Keys / PgUp / PgDn",
-        "Enter   : Attach to session",
-        "s       : Open Shell on node",
-        "n       : Add/Edit Note",
-        "d       : Delete Note",
-        "S       : Settings",
-        "r       : Refresh Sessions",
-        "k       : Kill Session",
-        "c       : Create Session",
-        "/       : Filter / Search",
-        "e       : View Errors",
-        "q       : Quit"
-    ]
-    for i, line in enumerate(lines):
-        win.addstr(i+1, 2, line)
-    win.addstr(12, 2, "Press any key to close...")
-    win.refresh()
-    while True:
-        k = win.getch()
-        if k != -1: break
-
-def draw_errors(stdscr, errors):
-    height, width = stdscr.getmaxyx()
-    win = curses.newwin(min(20, height-4), min(100, width-4), 2, 2)
-    win.box()
-    win.addstr(0, 2, " Error Log ")
-    scroll = 0
-    while True:
-        win.erase()
-        win.box()
-        win.addstr(0, 2, f" Error Log ({len(errors)}) - q to close ")
-        max_y = win.getmaxyx()[0] - 2
-        
-        for i in range(max_y):
-            idx = scroll + i
-            if idx < len(errors):
-                win.addstr(i+1, 2, errors[idx][:90])
-        
-        win.refresh()
-        k = win.getch()
-        if k == -1: continue
-        
-        if k == ord('q'): break
-        elif k == curses.KEY_UP and scroll > 0: scroll -= 1
-        elif k == curses.KEY_DOWN and scroll < len(errors) - max_y: scroll += 1
-
-def setup_curses_and_run(stdscr, app):
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN) 
-    curses.init_pair(2, curses.COLOR_RED, -1)
-    curses.init_pair(3, curses.COLOR_GREEN, -1)
-    curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE)
-    curses.init_pair(5, curses.COLOR_YELLOW, -1)
-    curses.init_pair(6, curses.COLOR_MAGENTA, -1)
-    curses.init_pair(7, curses.COLOR_CYAN, -1)
-
-    curses.curs_set(0)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-    curses.curs_set(0)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-    stdscr.timeout(50) # Faster response
-    current_row = 0
-
-    
-    # Initial load
-    # draw_centered_msg(stdscr, "Scanning nodes... please wait...")
-    app.start_background_refresh()
-    app.last_refresh_time = time.time()
-
-    return draw_menu(stdscr, app, current_row)
-
-def draw_menu(stdscr, app, current_row):
-    while True:
-        # Check for auto-refresh
-        if time.time() - app.last_refresh_time > app.refresh_interval:
-            app.start_background_refresh()
-            app.dirty = True
-        
-        # Check if refreshing but process died?
-        if app.refreshing and app.refresh_process:
-            if not app.refresh_process.is_alive():
-                # Process crashed or finished without sending done signal?
-                app.refreshing = False
-                app.errors.append("Refresh process died unexpectedly.")
-                app.dirty = True
-        
-        
-        # Draw Interface (only if dirty)
-        if app.dirty:
-            stdscr.erase()
-            height, width = stdscr.getmaxyx()
-            
-            # --- Split Layout Calculation ---
-            list_width = max(60, int(width * 0.45))
-            preview_start_x = list_width + 1
-            preview_width = width - preview_start_x - 1
-            
-            # Prepare Data
-            # Capture State - Minimize lock time
-            with app.lock:
-                snap_sessions = list(app.sessions)
-                snap_node_infos = app.node_infos # Ref safe? Yes as worker replaces object
-                snap_watches = app.watches.copy()
-                snap_errors = list(app.errors)
-                snap_notes = app.notes.copy()
-                snap_snapshots = app.snapshots # Ref safe for get()
-                
-            # Processing and Rendering (Unlocked)
-            active_items = []
-            for node, session, wins in snap_sessions:
-                active_items.append((node, session, wins, False))
-                
-            stale_items = []
-            active_keys = set(f"{node}:{session}" for node, session, _ in snap_sessions)
-            for key in snap_notes:
-                if key not in active_keys:
-                    parts = key.split(':')
-                    if len(parts) >= 2:
-                        node = parts[0]
-                        session = ':'.join(parts[1:])
-                        stale_items.append((node, session, "?", True))
-            
-            stale_items.sort()
-            all_items = active_items + stale_items
-            
-            # Filter
-            if app.filter_query:
-                all_items = [
-                    i for i in all_items 
-                    if app.filter_query.lower() in i[0].lower() or app.filter_query.lower() in i[1].lower()
-                ]
-
-            # Clamp row
-            if current_row >= len(all_items): current_row = max(0, len(all_items) - 1)
-            if current_row < 0: current_row = 0
-
-            # --- Header ---
-            refresh_status = " [Refreshing...]" if app.refreshing else ""
-            header_text = f" AutoTmux v0.3.1 | Active: {len(active_items)} | Offline: {len(stale_items)} | Errors: {len(snap_errors)}{refresh_status} | Filter: [{app.filter_query}]"
-            
-            # Ensure header doesn't overflow
-            header_text = header_text[:width-1]
-            
-            stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-            stdscr.addstr(0, 0, header_text.ljust(width))
-            stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-
-            # --- Footer ---
-            footer_text = " ENTER:Conn | n:Note | d:Del | w:Watch | S:Settings | k:Kill | c:New | /:Search | r:Ref | ?:H "
-            stdscr.attron(curses.color_pair(4))
-            try:
-                stdscr.addstr(height-1, 0, footer_text.ljust(width))
-            except: pass
-            stdscr.attroff(curses.color_pair(4))
-
-            # --- Column Headers ---
-            col_fmt = "{:<10} {:<10} {:<14} {:<16} {:<4} {}"
-            col_header = col_fmt.format("TIME", "JOB", "NODE", "SESSION", "WIN", "NOTES")
-            stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
-            stdscr.addstr(1, 1, col_header[:list_width-2])
-            stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
-            stdscr.hline(2, 0, curses.ACS_HLINE, list_width)
-
-            # --- List ---
-            list_height = height - 4
-            start_y = 3
-            
-            scroll_offset = 0
-            if current_row >= list_height:
-                scroll_offset = current_row - list_height + 1
-            
-            display_end = min(len(all_items), scroll_offset + list_height)
-            
-            for i in range(scroll_offset, display_end):
-                node, session, wins, is_stale = all_items[i]
-                y = start_y + (i - scroll_offset)
-                
-                # Data
-                node_info = snap_node_infos.get(node, {})
-                # backward compat or if it's just a time string (old cache)
-                if isinstance(node_info, str):
-                    time_left = node_info
-                    job_name = "?"
-                else:
-                    time_left = node_info.get('time', "N/A")
-                    job_name = node_info.get('job_name', "?")
-
-                note_key = f"{node}:{session}"
-                note = snap_notes.get(note_key, "")
-
-                # Colors & Watch Status
-                watch_data = snap_watches.get(note_key)
-                
-                if is_stale:
-                    attr = curses.color_pair(2)
-                    time_disp = "OFFLINE"
-                else:
-                    attr = curses.color_pair(3)
-                    time_disp = f"{time_left}"
-                    
-                if watch_data:
-                    idle = time.time() - watch_data['last_change']
-                    
-                    if watch_data.get('alert_enabled', False):
-                        thresh = watch_data['threshold']
-                        if idle > thresh:
-                            attr = curses.color_pair(2) | curses.A_BLINK | curses.A_BOLD
-                            sess_disp = "🚨 " + session
-                        else:
-                            sess_disp = "🔔 " + session
-                    else:
-                        sess_disp = "👀 " + session
-                else:
-                    sess_disp = "   " + session
-
-                if session == "<Start Shell>":
-                    sess_disp = "🐚 <Shell>"
-                    wins_disp = "-"
-                else:
-                    wins_disp = str(wins)
-
-                # Truncating
-                line_str = col_fmt.format(
-                    time_disp[:10], job_name[:10], node[:14], sess_disp[:16], wins_disp[:4], note
-                )
-                # Truncate to list width
-                line_str = line_str[:list_width-2]
-            
-                # Draw
-                if i == current_row:
-                    stdscr.attron(curses.color_pair(1))
-                    stdscr.addstr(y, 1, line_str.ljust(list_width-2))
-                    stdscr.attroff(curses.color_pair(1))
-                else:
-                    stdscr.attron(attr)
-                    stdscr.addstr(y, 1, line_str)
-                    stdscr.attroff(attr)
-
-            # --- Separator ---
-            stdscr.vline(1, list_width, curses.ACS_VLINE, height - 2)
-
-            # --- Preview Pane (Right) ---
-            if preview_width > 5:
-                # Preview Header
-                stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
-                stdscr.addstr(1, preview_start_x + 1, " PREVIEW / SNAPSHOT ")
-                stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
-                stdscr.hline(2, preview_start_x, curses.ACS_HLINE, preview_width)
-                
-                # Preview Content
-                if 0 <= current_row < len(all_items):
-                    p_node, p_session, _, _ = all_items[current_row]
-                    if p_session == "<Start Shell>":
-                            plines = ["", "  [ready to start shell]", "", "  Node: " + p_node]
-                    else:
-                        pkey = f"{p_node}:{p_session}"
-                        plines = snap_snapshots.get(pkey, ["(Waiting for snapshot...)"])
-                        
-                        # Watch Details
-                        pw_data = snap_watches.get(pkey)
-                        if pw_data:
-                            pidle = time.time() - pw_data['last_change']
-                            pthr = pw_data['threshold']
-                            if pw_data.get('alert_enabled', False):
-                                    status = "ALERTING" if pidle > pthr else "ARMED"
-                            else:
-                                    status = "WATCHING"
-                            info = f" [{status}] Idle: {int(pidle/60)}m / Limit: {int(pthr/60)}m"
-                            plines = [info, "-"*len(info)] + plines
-                    
-                    # Add Job Details
-                    p_info = snap_node_infos.get(p_node)
-                    if p_info and isinstance(p_info, dict):
-                        details = p_info.get('details', "")
-                        if details:
-                                # Wrap details if too long? Or just let it be truncated.
-                                # Splitting by space might be nice for readability
-                                # details = details.replace(" ", "  ") 
-                                plines = [details, "-"*len(details)] + plines
-                    
-                    # Draw lines
-                    for idx, line in enumerate(plines):
-                        py = start_y + idx
-                        if py >= height - 2: break
-                        try:
-                            disp = line[:preview_width-2]
-                            stdscr.attron(curses.A_DIM)
-                            stdscr.addstr(py, preview_start_x + 2, disp)
-                            stdscr.attroff(curses.A_DIM)
-                        except: pass
-                else:
-                    stdscr.addstr(start_y, preview_start_x + 2, "(No selection)")
-            
-            stdscr.refresh()
-            app.dirty = False
-
-        key = stdscr.getch()
-        
-        if key == -1:
-            # Timeout, just loop again
-            continue
-            
-        # Any key input makes UI dirty (selection change, scroll, etc)
-        app.dirty = True
-
-        
-        if key == curses.KEY_MOUSE:
-            try:
-                _, mx, my, _, bstate = curses.getmouse()
-                # Check for list area click
-                if start_y <= my < start_y + list_height:
-                    clicked_rel = my - start_y
-                    clicked_idx = scroll_offset + clicked_rel
-                    if 0 <= clicked_idx < len(all_items):
-                        current_row = clicked_idx
-                
-                # Scroll Wheel
-                if bstate & curses.BUTTON4_PRESSED: # Wheel Up
-                    current_row -= 1
-                elif bstate & 65536: # Button 4 legacy
-                    current_row -= 1
-                
+                        data = os.read(0, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    try:
+                        os.write(master_fd, data)
+                    except OSError:
+                        break
+                if master_fd in r:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    os.write(1, data)
+                # Has the ssh process exited?
                 try:
-                    if bstate & curses.BUTTON5_PRESSED: # Wheel Down
-                        current_row += 1
-                except: pass
-            except:
-                pass
-
-        if key == curses.KEY_UP:
-            current_row -= 1
-        elif key == curses.KEY_DOWN:
-            current_row += 1
-        elif key == curses.KEY_PPAGE:
-            current_row -= list_height
-        elif key == curses.KEY_NPAGE:
-            current_row += list_height
-        elif key == ord('q'):
-            return
-        elif key == ord('?'):
-            draw_help(stdscr)
-        elif key == ord('e'):
-            draw_errors(stdscr, app.errors)
-        elif key == ord('r'):
-            # Force background refresh
-            app.start_background_refresh()
-        elif key == ord('/') or key == 27: # Esc to clear filter often commonly used
-             if key == 27:
-                 app.filter_query = ""
-             else:
-                 q = get_input(stdscr, "Search Query:")
-                 if q is not None: app.filter_query = q
-        elif key == ord('n'):
-            if all_items:
-                node, session, _, _ = all_items[current_row]
-                note_key = f"{node}:{session}"
-                curr = app.notes.get(note_key, "")
-                new_n = get_input(stdscr, f"Note for {session}:")
-                if new_n is not None:
-                    app.notes[note_key] = new_n
-                    app.save_notes()
-        elif key == ord('S'):
-             draw_settings(stdscr, app)
-        elif key == ord('w'):
-            if all_items:
-                node, session, _, is_stale = all_items[current_row]
-                if not is_stale and session != "<Start Shell>":
-                    key_w = f"{node}:{session}"
-                    if key_w not in app.watches:
-                         # Should be there, but just in case
-                         app.watches[key_w] = {
-                            'threshold': 300,
-                            'last_change': time.time(),
-                            'last_hash': '', 
-                            'alert_enabled': False,
-                            'alert_sent': False
-                         }
-                    
-                    w_data = app.watches[key_w]
-                    # Toggle Alert
-                    current_state = w_data.get('alert_enabled', False)
-                    
-                    if current_state:
-                        # Turn OFF
-                        w_data['alert_enabled'] = False
-                        w_data['alert_sent'] = False # Reset
-                    else:
-                        # Turn ON
-                        thresh_str = get_input(stdscr, "Alert after N mins inactivity (default 5):")
+                    pid, _ = os.waitpid(child_pid, os.WNOHANG)
+                    if pid != 0:
+                        # Drain any final output before we leave.
                         try:
-                            if not thresh_str: thresh_str = "5"
-                            mins = float(thresh_str)
-                            w_data['threshold'] = mins * 60
-                            w_data['alert_enabled'] = True
-                            w_data['alert_sent'] = False
-                        except: pass
-                    
-                    # Trigger immediate update
-                    app.start_background_refresh()
-        elif key == ord('d'):
-            if all_items:
-                node, session, _, _ = all_items[current_row]
-                note_key = f"{node}:{session}"
-                if note_key in app.notes:
-                    del app.notes[note_key]
-                    app.save_notes()
-        elif key == ord('k'):
-            if all_items:
-                node, session, _, is_stale = all_items[current_row]
-                if not is_stale and session != "<Start Shell>":
-                    if confirm_action(stdscr, f"Kill session '{session}' on {node}?"):
-                        app.kill_session_async(node, session)
-        elif key == ord('c'):
-            # Create session
-            # For simplicity, pick node from current selection or if empty list, pick from node_times
-            default_node = ""
-            if all_items:
-                default_node = all_items[current_row][0]
-            elif app.node_infos:
-                default_node = list(app.node_infos.keys())[0]
-            
-            target_node = get_input(stdscr, f"Node (default {default_node}):")
-            if not target_node and default_node: target_node = default_node
-            
-            if target_node:
-                s_name = get_input(stdscr, "New Session Name:")
-                if s_name:
-                    app.create_session_async(target_node, s_name)
-        elif key == ord('s'):
-             if all_items:
-                node, _, _, _ = all_items[current_row]
-                curses.endwin()
-                subprocess.call(['ssh', '-o', 'ControlMaster=auto', '-o', 'ControlPath=/tmp/ssh_mux_%u_%h_%p_%r', '-o', 'ControlPersist=600', '-t', node])
-                stdscr.clear()
-                stdscr.refresh()
-                app.last_refresh_time = time.time()
-        elif key == ord('\n'):
-             if all_items:
-                node, session, _, is_stale = all_items[current_row]
-                if not is_stale:
-                    curses.endwin()
-                    ssh_base = ['ssh', '-o', 'ControlMaster=auto', '-o', 'ControlPath=/tmp/ssh_mux_%u_%h_%p_%r', '-o', 'ControlPersist=600', '-t', node]
-                    if session == "<Start Shell>":
-                        subprocess.call(ssh_base)
-                    else:
-                        subprocess.call(ssh_base + ['tmux', 'attach', '-t', session])
-                    stdscr.clear()
-                    stdscr.refresh()
-                    app.last_refresh_time = time.time()
+                            data = os.read(master_fd, 8192)
+                            if data:
+                                os.write(1, data)
+                        except OSError:
+                            pass
+                        break
+                except OSError:
+                    break
+        finally:
+            try:
+                signal.signal(signal.SIGWINCH, old_winch)
+            except Exception:
+                pass
+            if old_attr is not None:
+                try:
+                    termios.tcsetattr(0, termios.TCSADRAIN, old_attr)
+                except Exception:
+                    pass
+
+
+def build_session_rows(state: dict) -> list:
+    """Turn daemon state into a flat list of display rows.
+
+    Each row: (node, session, wins, time_left, status, cpu, load)
+    `cpu` is the nproc the slurm allocation gave us; `load` is the 1-min
+    load average. Together they tell the user whether attaching will be
+    snappy or sluggish.
+    """
+    rows = []
+    for node, nd in state.get('nodes', {}).items():
+        info = nd.get('info', {})
+        time_left = info.get('time', '')
+        cpu = info.get('nproc', '')
+        load = info.get('load', '')
+        last_error = nd.get('last_error') or ''
+        if not nd.get('alive'):
+            status = f'OFFLINE: {last_error[:30]}' if last_error else 'OFFLINE'
+            rows.append((node, '<offline>', '-', time_left, status, cpu, load))
+            continue
+        sessions = nd.get('sessions', [])
+        if sessions:
+            for s in sessions:
+                name = s[0] if isinstance(s, list) else str(s)
+                wins = s[1] if isinstance(s, list) and len(s) > 1 else '?'
+                rows.append((node, name, wins, time_left, 'Active', cpu, load))
+        else:
+            rows.append((node, '<Start Shell>', '-', time_left, 'No sessions', cpu, load))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return rows
+
+
+class AutotmuxApp(App):
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+    #upper {
+        height: 1fr;
+    }
+    #left_pane {
+        width: 45%;
+        border-right: solid $primary;
+    }
+    #right_pane_scroll {
+        width: 55%;
+        background: $surface;
+        padding: 0 1;
+    }
+    #right_pane {
+        width: 100%;
+        height: auto;
+    }
+    #jobs_panel {
+        height: 14;
+        border-top: solid $primary;
+        padding: 0 1;
+        overflow-y: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("q", "app.quit", "Quit"),
+        Binding("r", "refresh_table", "Refresh"),
+        # Enter is handled by on_data_table_row_selected (DataTable consumes
+        # the key itself and emits RowSelected, so an App-level Binding
+        # for "enter" would never fire).
+        Binding("s", "open_shell", "Shell"),
+        Binding("t", "local_shell", "Local Shell"),
+        Binding("o", "new_window", "New Window"),
+        Binding("j", "toggle_jobs_view", "Jobs view"),
+    ]
+
+    title = reactive(f"AutoTmux v{__version__}")
+    sub_title = reactive("")
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal(id="upper"):
+            yield DataTable(id="left_pane")
+            with VerticalScroll(id="right_pane_scroll"):
+                yield Static("", id="right_pane")
+        yield Static("(loading squeue...)", id="jobs_panel")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        self.table = self.query_one(DataTable)
+        self.table.cursor_type = "row"
+        self.table.add_columns("NODE", "SESSION", "WIN", "TIME", "CPU", "LOAD", "STATUS")
+
+        self.log_view = self.query_one("#right_pane", Static)
+        self.jobs_view = self.query_one("#jobs_panel", Static)
+
+        self.all_sessions: list = []
+        self.selected_node = ""
+        self.selected_session = ""
+        # Two views: 'long' (squeue -l) and 'pending' (squeue -l --start).
+        self.jobs_view_mode = 'long'
+        self.snapshots: dict = read_snapshots()
+        # Per-(node, session, ts) cache of parsed Rich Text — repeating
+        # the same row is essentially free.
+        self._rendered_cache: dict = {}
+        self._last_rows_sig: tuple | None = None
+        # Lightweight debounce so a fast burst of ↑↓ doesn't queue up
+        # a render per keystroke.
+        self._preview_render_timer = None
+        self._selection_changed_at = 0.0
+        # Pool of pre-warmed ssh slaves — see WarmSlavePool docstring.
+        self._warm_pool = WarmSlavePool()
+
+        # Populate immediately, then keep refreshing
+        self._refresh_table()
+        self._refresh_jobs()
+        self.set_interval(5, self._refresh_table)
+        self.set_interval(10, self._refresh_jobs)
+        # Snapshot reload runs in a worker thread to avoid blocking the
+        # event loop on filesystem hiccups.
+        self.set_interval(30, self._reload_snapshots_async)
+        self.run_worker(self._preview_loop(), exclusive=True)
+
+    # ── table refresh (pure local file read, <1ms) ───────────────────────────
+
+    def _refresh_table(self) -> None:
+        state = read_state()
+        rows = build_session_rows(state)
+        updated = state.get('updated', '?')
+
+        sig = tuple(rows)
+        if sig == self._last_rows_sig:
+            # Hot path — rows haven't changed, skip the expensive rebuild
+            # (every clear+add_row triggers RowHighlighted churn).
+            if not state.get('nodes'):
+                self.sub_title = "waiting for daemon… (run `atd status` to inspect)"
+            else:
+                self.sub_title = f"{len(rows)} sessions · updated {updated}"
+            return
+        self._last_rows_sig = sig
+
+        # Restore by (node, session) so the cursor sticks even if rows reorder.
+        previous = (self.selected_node, self.selected_session)
+
+        self.all_sessions = rows
+        self.table.clear()
+        for r in rows:
+            # row layout: (node, session, wins, time, status, cpu, load)
+            self.table.add_row(r[0], r[1], r[2], r[3], r[5], r[6], r[4])
+
+        if rows:
+            new_idx = 0
+            for i, r in enumerate(rows):
+                if (r[0], r[1]) == previous:
+                    new_idx = i
+                    break
+            self.table.move_cursor(row=new_idx)
+
+        if not state.get('nodes'):
+            self.sub_title = "waiting for daemon… (run `atd status` to inspect)"
+        else:
+            stale = self._daemon_age_seconds(updated)
+            if stale is not None and stale > 30:
+                self.sub_title = f"⚠ daemon stale ({stale:.0f}s old) · run `atd status`"
+            else:
+                self.sub_title = f"{len(rows)} sessions · updated {updated}"
+        # Keep an idle ssh slave warm for every node we know about — but
+        # do the pty.fork off the main thread so it never blocks the UI.
+        # exclusive=True ensures back-to-back refreshes don't dispatch
+        # parallel warm-alls (which could race even with the per-pool lock
+        # by re-spawning slaves between checks).
+        nodes_in_view = {r[0] for r in rows} - {'localhost'}
+        self.run_worker(
+            self._warm_pool_warm_all_async(nodes_in_view),
+            exclusive=True, group='warm-pool',
+        )
+
+    @staticmethod
+    def _daemon_age_seconds(updated: str):
+        """How many seconds ago did the daemon last write? Returns None
+        if the timestamp can't be parsed."""
+        try:
+            from datetime import datetime
+            t = datetime.strptime(updated, '%Y-%m-%d %H:%M:%S')
+            return (datetime.now() - t).total_seconds()
+        except Exception:
+            return None
+
+    async def _warm_pool_warm_all_async(self, nodes) -> None:
+        """pty.fork can be ~10–50ms on a busy login node; off the event loop."""
+        await asyncio.to_thread(self._warm_pool.warm_all, nodes)
+
+    async def action_refresh_table(self) -> None:
+        self._refresh_table()
+        self._refresh_jobs()
+        self._reload_snapshots()
+
+    # ── jobs panel (bottom) ──────────────────────────────────────────────────
+
+    def _refresh_jobs(self) -> None:
+        state = read_state()
+        if self.jobs_view_mode == 'pending':
+            text = state.get('squeue_pending', '')
+            title = '── PENDING JOBS (squeue --start)  [j: switch view] ──'
+        else:
+            text = state.get('squeue_long', '')
+            title = '── ALL JOBS (squeue -l)  [j: switch view] ──'
+        if not text.strip():
+            text = '(no squeue data yet — daemon may still be starting)'
+        updated = state.get('squeue_updated', '?')
+        self.jobs_view.update(f'{title}  updated {updated}\n{text}')
+
+    async def action_toggle_jobs_view(self) -> None:
+        self.jobs_view_mode = 'pending' if self.jobs_view_mode == 'long' else 'long'
+        self._refresh_jobs()
+
+    # ── persistent snapshot cache ────────────────────────────────────────────
+
+    def _reload_snapshots(self) -> None:
+        self.snapshots = read_snapshots()
+
+    async def _reload_snapshots_async(self) -> None:
+        # Filesystem could be slow / NFS-y; never block the event loop on it.
+        try:
+            self.snapshots = await asyncio.to_thread(read_snapshots)
+        except Exception:
+            pass
+
+    def _show_cached_snapshot(self, node: str, session: str) -> bool:
+        snap = self.snapshots.get(f'{node}:{session}')
+        if not isinstance(snap, dict):
+            return False
+        text = snap.get('lines') or ''
+        ts = snap.get('ts', '?')
+        if not text:
+            return False
+        cache_key = (node, session, ts)
+        # LRU: pop on hit and reinsert so it moves to the end of insertion order.
+        rendered = self._rendered_cache.pop(cache_key, None)
+        if rendered is None:
+            base = rich.text.Text.from_ansi(text)
+            rendered = rich.text.Text(f'(cached snapshot · {ts})\n', style='dim') + base
+        self._rendered_cache[cache_key] = rendered
+        # Keep cache bounded — evict the LEAST recently used (head of dict).
+        if len(self._rendered_cache) > 64:
+            first_key = next(iter(self._rendered_cache))
+            del self._rendered_cache[first_key]
+        self.log_view.update(rendered)
+        return True
+
+    # ── row selection ────────────────────────────────────────────────────────
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key is None:
+            return
+        try:
+            idx = self.table.get_row_index(event.row_key)
+        except Exception:
+            return
+        if not (0 <= idx < len(self.all_sessions)):
+            return
+        new_node = self.all_sessions[idx][0]
+        new_sess = self.all_sessions[idx][1]
+        # Skip when the highlight event is just from a refresh that landed
+        # on the same row — clearing here is what caused the 5s preview flicker.
+        if (new_node, new_sess) == (self.selected_node, self.selected_session):
+            return
+        self.selected_node = new_node
+        self.selected_session = new_sess
+        self._selection_changed_at = time.monotonic()
+        # Coalesce bursts of ↑/↓ into a single repaint. The cursor itself
+        # moves immediately; only the right-pane preview waits 30 ms.
+        if self._preview_render_timer is not None:
+            self._preview_render_timer.stop()
+        self._preview_render_timer = self.set_timer(0.03, self._render_preview_now)
+
+    def _render_preview_now(self) -> None:
+        self._preview_render_timer = None
+        node, sess = self.selected_node, self.selected_session
+        if not node or not sess:
+            return
+        if sess in ('<Start Shell>', '<offline>'):
+            self.log_view.update("")
+            return
+        if not self._show_cached_snapshot(node, sess):
+            self.log_view.update(f"Loading preview  {node}:{sess} …")
+
+    async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        # DataTable owns Enter and emits this; route to attach.
+        await self.action_attach_session()
+
+    # ── live preview (the ONLY network call in the frontend) ─────────────────
+
+    async def _preview_loop(self) -> None:
+        """Spawn `tmux capture-pane` for the highlighted row.
+
+        Carefully avoids leaking ssh processes: on timeout we explicitly
+        kill the subprocess and reap it (asyncio.wait_for cancels the
+        await but does NOT kill the OS process). And we skip the live
+        fetch entirely if the user is actively navigating, so a fast burst
+        of ↑/↓ doesn't spawn 10 ssh's that all time out 3s later.
+        """
+        last_key = ""
+        last_hash = ""
+        # Per-(node, session) consecutive timeout counter — backs off
+        # live preview for sessions on overloaded nodes.
+        timeout_counts: dict = {}
+        backoff_until: dict = {}
+        import time as _time
+        while True:
+            await asyncio.sleep(1.0)
+            node = self.selected_node
+            sess = self.selected_session
+            if not node or not sess or sess in ('<Start Shell>', '<offline>'):
+                continue
+            # Skip if the user is still navigating quickly.
+            if _time.monotonic() - getattr(self, '_selection_changed_at', 0) < 0.5:
+                continue
+            key = f"{node}:{sess}"
+            # Honor per-session backoff after repeated timeouts.
+            if backoff_until.get(key, 0) > _time.monotonic():
+                continue
+
+            proc = None
+            try:
+                if node == 'localhost':
+                    proc = await asyncio.create_subprocess_exec(
+                        'tmux', 'capture-pane', '-p', '-e', '-t', sess,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                else:
+                    ctl = _get_ssh_args(node)
+                    proc = await asyncio.create_subprocess_exec(
+                        'ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
+                        *ctl, node,
+                        f"tmux capture-pane -p -e -t {shlex.quote(sess)}",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=4)
+                content = stdout.decode(errors='replace')
+                # Successful fetch — reset failure counter for this session.
+                timeout_counts.pop(key, None)
+                backoff_until.pop(key, None)
+
+                if (node, sess) != (self.selected_node, self.selected_session):
+                    continue
+                h = hashlib.md5(content.encode()).hexdigest()
+                if key == last_key and h == last_hash:
+                    continue
+                last_key, last_hash = key, h
+                self.log_view.update(rich.text.Text.from_ansi(content))
+            except asyncio.TimeoutError:
+                # Reap the runaway ssh — otherwise it accumulates as a
+                # zombie eating CPU on the login node.
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+                n = timeout_counts.get(key, 0) + 1
+                timeout_counts[key] = n
+                # After 2 consecutive timeouts, stop probing this session
+                # for 60s — the remote is too overloaded to be useful.
+                if n >= 2:
+                    backoff_until[key] = _time.monotonic() + 60
+            except Exception:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+
+    # ── interactive actions ──────────────────────────────────────────────────
+
+    async def action_attach_session(self) -> None:
+        node, sess = self.selected_node, self.selected_session
+        if not node or not sess or sess == '<offline>':
+            return
+        used_warm = False
+        with self.suspend():
+            if node == 'localhost':
+                if sess == '<Start Shell>':
+                    subprocess.call([os.environ.get('SHELL', '/bin/bash')])
+                else:
+                    subprocess.call(['tmux', 'attach', '-t', sess])
+            elif sess == '<Start Shell>':
+                sys.stdout.write(f"\n[atmux] connecting to {node}…\n")
+                sys.stdout.flush()
+                base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+                subprocess.call(base)
+            else:
+                # Try the pre-warmed ssh slave first — instant if available.
+                used_warm = self._warm_pool.attach(node, sess)
+                if not used_warm:
+                    sys.stdout.write(f"\n[atmux] connecting to {node}:{sess}…\n")
+                    sys.stdout.flush()
+                    base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+                    subprocess.call(base + ['tmux', 'attach', '-t', shlex.quote(sess)])
+        # Replace the (now-consumed) warm slave so the next attach is fast too.
+        if node != 'localhost' and sess not in ('<Start Shell>',):
+            self._warm_pool.warm(node)
+
+    async def action_open_shell(self) -> None:
+        node = self.selected_node
+        if not node:
+            return
+        with self.suspend():
+            if node == 'localhost':
+                subprocess.call([os.environ.get('SHELL', '/bin/bash')])
+            else:
+                sys.stdout.write(f"\n[atmux] connecting to {node}…\n")
+                sys.stdout.flush()
+                base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+                subprocess.call(base)
+
+    async def action_local_shell(self) -> None:
+        with self.suspend():
+            subprocess.call(['tmux', 'new-session', '-A', '-s', 'autotmux_local'])
+
+    async def on_unmount(self) -> None:
+        # Tear down warm slaves so we don't leave orphan ssh processes.
+        try:
+            self._warm_pool.shutdown()
+        except Exception:
+            pass
+
+    async def action_new_window(self) -> None:
+        node, sess = self.selected_node, self.selected_session
+        if not node or not sess or sess == '<offline>':
+            return
+        if node == 'localhost':
+            cmd = [os.environ.get('SHELL', '/bin/bash')] if sess == '<Start Shell>' else ['tmux', 'attach', '-t', sess]
+        else:
+            base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+            cmd = base if sess == '<Start Shell>' else base + ['tmux', 'attach', '-t', shlex.quote(sess)]
+
+        if os.environ.get('TMUX'):
+            wname = f"{node}-{sess}" if sess != '<Start Shell>' else f"{node}-shell"
+            subprocess.call(['tmux', 'new-window', '-n', wname, *cmd],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            with self.suspend():
+                print("\n[AutoTmux] Not inside tmux – falling back to direct attach.")
+                time.sleep(1)
+                subprocess.call(cmd)
+
+
+def _daemon_running() -> bool:
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError, FileNotFoundError):
+        return False
+
+
+def _launch_daemon() -> None:
+    """Start the daemon if it isn't already running.
+
+    Prefer the installed `atd` console script; fall back to running the
+    module directly so this works in dev / unusual PATH setups.
+    """
+    if _daemon_running():
+        return
+    atd = shutil.which('atd')
+    cmd = [atd, 'start'] if atd else [sys.executable, '-m', 'autotmux_daemon', 'start']
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _direct_attach(target: str) -> int:
+    """`atmux -a NODE:SESSION` — skip the TUI and attach directly.
+
+    Useful for scripting (`atmux -a holygpu1:train`) and as a hotkey-bind
+    target.  Returns the desired process exit code.
+    """
+    if ':' not in target:
+        sys.stderr.write(f'atmux: --attach expects NODE:SESSION, got {target!r}\n')
+        return 2
+    node, _, session = target.partition(':')
+    if not node or not session:
+        sys.stderr.write(f'atmux: --attach expects NODE:SESSION, got {target!r}\n')
+        return 2
+    _launch_daemon()
+    if node == 'localhost':
+        return subprocess.call(['tmux', 'attach', '-t', session])
+    base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+    return subprocess.call(base + ['tmux', 'attach', '-t', shlex.quote(session)])
+
+
+def _build_argparser():
+    import argparse
+    p = argparse.ArgumentParser(
+        prog='atmux',
+        description='AutoTmux — terminal dashboard for tmux sessions across slurm nodes.',
+    )
+    p.add_argument('--version', action='version', version=f'AutoTmux {__version__}')
+    p.add_argument('-a', '--attach', metavar='NODE:SESSION',
+                   help='Skip the TUI and attach directly to NODE:SESSION.')
+    return p
+
 
 def main():
-    app = AppState()
-    curses.wrapper(lambda stdscr: setup_curses_and_run(stdscr, app))
+    args = _build_argparser().parse_args()
+    if args.attach:
+        sys.exit(_direct_attach(args.attach))
+    _launch_daemon()
+    AutotmuxApp().run()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
