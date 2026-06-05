@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import autotmux_daemon as d
+from autotmux import daemon as d
 
 
 class GoneNodeCleanupTests(unittest.TestCase):

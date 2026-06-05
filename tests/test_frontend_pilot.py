@@ -12,7 +12,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import autotmux
+from autotmux import cli as autotmux
 
 # Synthetic state with a known shape — two alive nodes, one offline.
 SYNTH_STATE = {

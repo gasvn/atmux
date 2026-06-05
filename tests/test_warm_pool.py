@@ -15,7 +15,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import autotmux
+from autotmux import cli as autotmux
 
 
 SSH_STUB = textwrap.dedent('''\
@@ -145,7 +145,7 @@ class SqueueLoopFieldPreservationTests(unittest.TestCase):
     and "?" every cycle.
     """
     def setUp(self):
-        import autotmux_daemon as d
+        from autotmux import daemon as d
         self.d = d
         d._known_nodes_info.clear()
 

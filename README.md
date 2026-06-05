@@ -9,7 +9,7 @@ preview, and attach to remote tmux sessions from a single TUI.
 
 AutoTmux is split into two pieces:
 
-- **`atd`** — a small background daemon (`autotmux_daemon.py`) that:
+- **`atd`** — a small background daemon (`src/autotmux/daemon.py`) that:
   - Polls `squeue -u $USER` every 30 s to discover allocated nodes.
   - Maintains a long-lived SSH ControlMaster connection per node so subsequent
     `ssh`/`tmux attach` calls return instantly without re-authenticating.
@@ -27,7 +27,7 @@ AutoTmux is split into two pieces:
     `/tmp/autotmux_daemon_<uid>.json` and `~/.autotmux_snapshots.json`.
   - Always includes `localhost` as a node so local tmux sessions show up.
 
-- **`atmux`** — the foreground Textual TUI (`autotmux.py`). It is **purely
+- **`atmux`** — the foreground Textual TUI (`src/autotmux/cli.py`). It is **purely
   passive**: it reads the daemon's JSON state file (a few ms, no network)
   and renders it. The only network calls the frontend ever makes are
   `tmux capture-pane` for the live preview and the actual `ssh` you trigger
@@ -137,8 +137,8 @@ CI runs the unit tests on every push (`.github/workflows/test.yml`).
 
 ## Notes on v0.4.0
 
-This is an in-flight refactor of the previous monolithic curses app. A
-number of v0.3.x features (notes, watch mode, Slack alerts, search,
-in-UI session creation/kill) are not yet ported to the new architecture.
-The previous curses implementation is preserved as
-`autotmux_curses_backup.py` for reference.
+This is a refactor of the previous monolithic curses app. A number of
+v0.3.x features (notes, watch mode, Slack alerts, search, in-UI session
+creation/kill) are not yet ported to the new architecture. The previous
+curses implementation remains available in the git history (commits prior
+to the v0.4.0 daemon split) for reference.

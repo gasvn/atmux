@@ -4,22 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autotmux"
-version = "0.4.0"
+dynamic = ["version"]
 description = "Terminal dashboard for managing tmux sessions across slurm compute nodes."
 readme = "README.md"
-requires-python = ">=3.8"
+# The daemon uses PEP 604 (`int | None`) annotations evaluated at import
+# time, so 3.10 is the real floor.
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Shanghua Gao" }]
 keywords = ["tmux", "slurm", "ssh", "hpc", "terminal", "tui"]
 classifiers = [
     "Development Status :: 4 - Beta",
-    "Environment :: Console :: Curses",
+    "Environment :: Console",
     "Intended Audience :: System Administrators",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: System :: Clustering",
     "Topic :: Terminals",
 ]
@@ -29,8 +34,12 @@ dependencies = [
 ]
 
 [project.scripts]
-atmux = "autotmux:main"
-atd = "autotmux_daemon:main_entry"
+atmux = "autotmux.cli:main"
+atd = "autotmux.daemon:main_entry"
 
 [tool.setuptools]
-py-modules = ["autotmux", "autotmux_daemon"]
+package-dir = { "" = "src" }
+packages = ["autotmux"]
+
+[tool.setuptools.dynamic]
+version = { attr = "autotmux.__version__" }

@@ -34,7 +34,7 @@ from textual.reactive import reactive
 from textual.widgets import DataTable, Footer, Header, Static
 import rich.text
 
-__version__ = '0.4.0'
+from autotmux import __version__
 
 _UID = os.getuid()
 STATE_FILE = f'/tmp/autotmux_daemon_{_UID}.json'
@@ -126,7 +126,7 @@ class WarmSlavePool:
                     os.execvp('ssh', [
                         'ssh',
                         '-o', f'ControlPath={ctl}',
-                        '-o', 'StrictHostKeyChecking=no',
+                        '-o', 'StrictHostKeyChecking=accept-new',
                         '-o', 'ServerAliveInterval=30',
                         '-o', 'ServerAliveCountMax=3',
                         '-tt', node,
@@ -690,7 +690,7 @@ class AutotmuxApp(App):
                 else:
                     ctl = _get_ssh_args(node)
                     proc = await asyncio.create_subprocess_exec(
-                        'ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
+                        'ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
                         *ctl, node,
                         f"tmux capture-pane -p -e -t {shlex.quote(sess)}",
                         stdout=asyncio.subprocess.PIPE,
@@ -748,7 +748,7 @@ class AutotmuxApp(App):
             elif sess == '<Start Shell>':
                 sys.stdout.write(f"\n[atmux] connecting to {node}…\n")
                 sys.stdout.flush()
-                base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+                base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node]
                 subprocess.call(base)
             else:
                 # Try the pre-warmed ssh slave first — instant if available.
@@ -756,7 +756,7 @@ class AutotmuxApp(App):
                 if not used_warm:
                     sys.stdout.write(f"\n[atmux] connecting to {node}:{sess}…\n")
                     sys.stdout.flush()
-                    base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+                    base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node]
                     subprocess.call(base + ['tmux', 'attach', '-t', shlex.quote(sess)])
         # Replace the (now-consumed) warm slave so the next attach is fast too.
         if node != 'localhost' and sess not in ('<Start Shell>',):
@@ -772,7 +772,7 @@ class AutotmuxApp(App):
             else:
                 sys.stdout.write(f"\n[atmux] connecting to {node}…\n")
                 sys.stdout.flush()
-                base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+                base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node]
                 subprocess.call(base)
 
     async def action_local_shell(self) -> None:
@@ -793,7 +793,7 @@ class AutotmuxApp(App):
         if node == 'localhost':
             cmd = [os.environ.get('SHELL', '/bin/bash')] if sess == '<Start Shell>' else ['tmux', 'attach', '-t', sess]
         else:
-            base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+            base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node]
             cmd = base if sess == '<Start Shell>' else base + ['tmux', 'attach', '-t', shlex.quote(sess)]
 
         if os.environ.get('TMUX'):
@@ -826,7 +826,7 @@ def _launch_daemon() -> None:
     if _daemon_running():
         return
     atd = shutil.which('atd')
-    cmd = [atd, 'start'] if atd else [sys.executable, '-m', 'autotmux_daemon', 'start']
+    cmd = [atd, 'start'] if atd else [sys.executable, '-m', 'autotmux.daemon', 'start']
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -849,7 +849,7 @@ def _direct_attach(target: str) -> int:
     _launch_daemon()
     if node == 'localhost':
         return subprocess.call(['tmux', 'attach', '-t', session])
-    base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=no', '-t', node]
+    base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node]
     return subprocess.call(base + ['tmux', 'attach', '-t', shlex.quote(session)])
 
 

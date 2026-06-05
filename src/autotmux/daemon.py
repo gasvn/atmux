@@ -32,7 +32,7 @@ from logging.handlers import RotatingFileHandler
 _UID = os.getuid()
 _USER = os.environ.get('USER', str(_UID))
 
-__version__ = '0.4.0'
+from autotmux import __version__
 
 CTL_DIR   = f'/tmp/autotmux_ctl_{_UID}'
 PID_FILE  = f'/tmp/autotmux_daemon_{_UID}.pid'
@@ -309,7 +309,7 @@ def _start_master_unsafe(node: str) -> bool:
         proc = subprocess.Popen(
             ['ssh', '-N',
              '-o', 'BatchMode=yes',
-             '-o', 'StrictHostKeyChecking=no',
+             '-o', 'StrictHostKeyChecking=accept-new',
              '-o', f'ConnectTimeout={CONNECT_TIMEOUT}',
              '-o', 'ControlMaster=yes',
              '-o', f'ControlPath={ctl}',
@@ -679,7 +679,7 @@ def _capture_pane(node: str, session: str) -> str | None:
             # ssh ships remaining args as a single string to the remote shell;
             # quote the session in case it contains spaces / metacharacters.
             cmd = ['ssh', '-o', f'ControlPath={_ctl_path(node)}',
-                   '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
+                   '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
                    node, f'tmux capture-pane -p -e -t {shlex.quote(session)}']
         out = subprocess.check_output(
             cmd, universal_newlines=True, timeout=8,
@@ -888,7 +888,7 @@ def _session_loop():
                         cmd = ['sh', '-c', remote_script]
                     else:
                         cmd = ['ssh', '-o', f'ControlPath={_ctl_path(node)}',
-                               '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
+                               '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
                                '-o', 'ConnectTimeout=5', node, remote_script]
                     out = subprocess.check_output(
                         cmd, universal_newlines=True, timeout=10,
