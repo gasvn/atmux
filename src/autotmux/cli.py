@@ -36,11 +36,12 @@ import rich.text
 
 from autotmux import __version__
 
-_UID = os.getuid()
-STATE_FILE = f'/tmp/autotmux_daemon_{_UID}.json'
-CTL_DIR = f'/tmp/autotmux_ctl_{_UID}'
-PID_FILE = f'/tmp/autotmux_daemon_{_UID}.pid'
-SNAPSHOT_FILE = f'/tmp/autotmux_snapshots_{_UID}.json'
+from autotmux import paths
+
+STATE_FILE = paths.STATE_FILE
+CTL_DIR = paths.CTL_DIR
+PID_FILE = paths.PID_FILE
+SNAPSHOT_FILE = paths.SNAPSHOT_FILE
 
 
 def _ctl_path(node: str) -> str:
