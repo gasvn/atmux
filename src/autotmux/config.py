@@ -7,7 +7,7 @@ warning). The AUTOTMUX_CONFIG env var overrides the path (used by tests).
 import os
 import logging
 
-log = logging.getLogger('autotmux.config')
+log = logging.getLogger('autotmux_daemon.config')
 
 CONFIG_PATH = os.environ.get(
     'AUTOTMUX_CONFIG',
