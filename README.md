@@ -74,6 +74,37 @@ State / log locations (per UID):
 | `/tmp/autotmux_ctl_<uid>/cm_<node>` | One ControlMaster socket per node. |
 | `/tmp/autotmux_snapshots_<uid>.json` | Per-(node,session) tmux pane snapshots. Local fs (not NFS) for snappy reads. |
 
+## Configuration
+
+Daemon timings can be tuned via `~/.config/autotmux/config.toml` (optional —
+sane defaults apply if absent). Either a `[daemon]` table or flat keys work:
+
+```toml
+[daemon]
+squeue_interval   = 60     # seconds between squeue polls (default 30)
+session_interval  = 15     # seconds between tmux list-sessions polls
+snapshot_interval = 120    # seconds between pane-capture snapshots
+health_interval   = 30     # seconds between ControlMaster health checks
+connect_timeout   = 8      # ssh ConnectTimeout
+backoff_base      = 30     # initial retry delay after a failed master start
+backoff_cap       = 600    # max retry delay
+```
+
+Unknown or non-numeric keys are ignored with a warning in the daemon log.
+Restart the daemon to apply changes: `atd restart`.
+
+### Runtime files & paths
+
+Runtime state (pid, log, state JSON, snapshots, and ControlMaster sockets)
+lives under `$XDG_RUNTIME_DIR/autotmux/` when available (e.g.
+`/run/user/<uid>/autotmux/`), falling back to `/tmp/autotmux_<uid>/`.
+`$XDG_RUNTIME_DIR` is preferred because it is node-local tmpfs with short
+paths — required for SSH ControlMaster sockets to work reliably.
+
+**Upgrading from a pre-XDG version:** run `atd restart` once after upgrading.
+`atd start` automatically stops any old daemon still running under the legacy
+`/tmp` pid file so you don't end up with two daemons.
+
 ## Dashboard layout
 
 ```
