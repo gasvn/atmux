@@ -546,9 +546,14 @@ class AutotmuxApp(App):
             self._crash_looping = False
             return
         now = time.monotonic()
+        # Drop attempts older than the guard window so the list can't grow
+        # unbounded over a long-lived session.
+        self._restart_attempts = [t for t in self._restart_attempts
+                                  if now - t < _RESTART_WINDOW]
         if not _should_restart(self._restart_attempts, now):
             self._crash_looping = True
             return
+        self._crash_looping = False
         self._restart_attempts.append(now)
         self.notify('daemon down — restarting…', severity='warning', timeout=4)
         self._dispatch_restart()
@@ -843,8 +848,12 @@ def _daemon_running() -> bool:
         return False
 
 
-def _should_restart(attempts, now: float, window: float = 60.0,
-                    limit: int = 3) -> bool:
+_RESTART_WINDOW = 60.0   # seconds — loop-guard window for daemon restarts
+_RESTART_LIMIT = 3       # max restarts allowed within the window
+
+
+def _should_restart(attempts, now: float, window: float = _RESTART_WINDOW,
+                    limit: int = _RESTART_LIMIT) -> bool:
     """Loop guard: allow a daemon restart only if fewer than `limit`
     restarts happened in the last `window` seconds. `attempts` is a list of
     time.monotonic() timestamps of prior restarts."""

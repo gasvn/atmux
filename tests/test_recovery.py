@@ -31,7 +31,8 @@ class MaybeRecoverTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._saved_running = cli._daemon_running
         self._saved_launch = cli._launch_daemon
-        cli._launch_daemon = lambda: None  # never spawn a real daemon in tests
+        cli._daemon_running = lambda: False  # isolate from real system state
+        cli._launch_daemon = lambda: None    # never spawn a real daemon in tests
 
     def tearDown(self):
         cli._daemon_running = self._saved_running
@@ -60,6 +61,7 @@ class MaybeRecoverTests(unittest.IsolatedAsyncioTestCase):
             app._maybe_recover_daemon()
             self.assertEqual(len(calls), 1)
             self.assertEqual(len(app._restart_attempts), 1)
+            self.assertFalse(app._crash_looping)
 
     async def test_stops_after_loop_guard_and_sets_banner(self):
         app = cli.AutotmuxApp()
