@@ -36,11 +36,12 @@ import rich.text
 
 from autotmux import __version__
 
-_UID = os.getuid()
-STATE_FILE = f'/tmp/autotmux_daemon_{_UID}.json'
-CTL_DIR = f'/tmp/autotmux_ctl_{_UID}'
-PID_FILE = f'/tmp/autotmux_daemon_{_UID}.pid'
-SNAPSHOT_FILE = f'/tmp/autotmux_snapshots_{_UID}.json'
+from autotmux import paths
+
+STATE_FILE = paths.STATE_FILE
+CTL_DIR = paths.CTL_DIR
+PID_FILE = paths.PID_FILE
+SNAPSHOT_FILE = paths.SNAPSHOT_FILE
 
 
 def _ctl_path(node: str) -> str:
@@ -435,6 +436,11 @@ class AutotmuxApp(App):
     title = reactive(f"AutoTmux v{__version__}")
     sub_title = reactive("")
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._restart_attempts = []   # time.monotonic() of recent daemon restarts
+        self._crash_looping = False
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="upper"):
@@ -482,6 +488,7 @@ class AutotmuxApp(App):
     # ── table refresh (pure local file read, <1ms) ───────────────────────────
 
     def _refresh_table(self) -> None:
+        self._maybe_recover_daemon()
         state = read_state()
         rows = build_session_rows(state)
         updated = state.get('updated', '?')
@@ -490,10 +497,7 @@ class AutotmuxApp(App):
         if sig == self._last_rows_sig:
             # Hot path — rows haven't changed, skip the expensive rebuild
             # (every clear+add_row triggers RowHighlighted churn).
-            if not state.get('nodes'):
-                self.sub_title = "waiting for daemon… (run `atd status` to inspect)"
-            else:
-                self.sub_title = f"{len(rows)} sessions · updated {updated}"
+            self.sub_title = self._status_subtitle(state, rows, updated)
             return
         self._last_rows_sig = sig
 
@@ -514,14 +518,7 @@ class AutotmuxApp(App):
                     break
             self.table.move_cursor(row=new_idx)
 
-        if not state.get('nodes'):
-            self.sub_title = "waiting for daemon… (run `atd status` to inspect)"
-        else:
-            stale = self._daemon_age_seconds(updated)
-            if stale is not None and stale > 30:
-                self.sub_title = f"⚠ daemon stale ({stale:.0f}s old) · run `atd status`"
-            else:
-                self.sub_title = f"{len(rows)} sessions · updated {updated}"
+        self.sub_title = self._status_subtitle(state, rows, updated)
         # Keep an idle ssh slave warm for every node we know about — but
         # do the pty.fork off the main thread so it never blocks the UI.
         # exclusive=True ensures back-to-back refreshes don't dispatch
@@ -543,6 +540,43 @@ class AutotmuxApp(App):
             return (datetime.now() - t).total_seconds()
         except Exception:
             return None
+
+    def _maybe_recover_daemon(self) -> None:
+        """Auto-restart a PID-dead daemon (with loop guard); banner-only for a
+        hung-but-alive one (the existing stale subtitle covers that, and we
+        never auto-kill a daemon that's merely slow)."""
+        if _daemon_running():
+            self._crash_looping = False
+            return
+        now = time.monotonic()
+        # Drop attempts older than the guard window so the list can't grow
+        # unbounded over a long-lived session.
+        self._restart_attempts = [t for t in self._restart_attempts
+                                  if now - t < _RESTART_WINDOW]
+        if not _should_restart(self._restart_attempts, now):
+            self._crash_looping = True
+            return
+        self._crash_looping = False
+        self._restart_attempts.append(now)
+        self.notify('daemon down — restarting…', severity='warning', timeout=4)
+        self._dispatch_restart()
+
+    def _dispatch_restart(self) -> None:
+        self.run_worker(self._restart_daemon_async(),
+                        exclusive=True, group='recovery')
+
+    async def _restart_daemon_async(self) -> None:
+        await asyncio.to_thread(_launch_daemon)
+
+    def _status_subtitle(self, state, rows, updated) -> str:
+        if self._crash_looping:
+            return "⚠ daemon crash-looping — run `atd status`"
+        if not state.get('nodes'):
+            return "waiting for daemon… (run `atd status` to inspect)"
+        stale = self._daemon_age_seconds(updated)
+        if stale is not None and stale > 30:
+            return f"⚠ daemon stale ({stale:.0f}s old) · run `atd status`"
+        return f"{len(rows)} sessions · updated {updated}"
 
     async def _warm_pool_warm_all_async(self, nodes) -> None:
         """pty.fork can be ~10–50ms on a busy login node; off the event loop."""
@@ -815,6 +849,19 @@ def _daemon_running() -> bool:
         return True
     except (OSError, ValueError, FileNotFoundError):
         return False
+
+
+_RESTART_WINDOW = 60.0   # seconds — loop-guard window for daemon restarts
+_RESTART_LIMIT = 3       # max restarts allowed within the window
+
+
+def _should_restart(attempts, now: float, window: float = _RESTART_WINDOW,
+                    limit: int = _RESTART_LIMIT) -> bool:
+    """Loop guard: allow a daemon restart only if fewer than `limit`
+    restarts happened in the last `window` seconds. `attempts` is a list of
+    time.monotonic() timestamps of prior restarts."""
+    recent = [t for t in attempts if now - t < window]
+    return len(recent) < limit
 
 
 def _launch_daemon() -> None:

@@ -61,6 +61,13 @@ def _setup_state(tmpdir):
 
 
 class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved_launch = autotmux._launch_daemon
+        autotmux._launch_daemon = lambda: None
+
+    def tearDown(self):
+        autotmux._launch_daemon = self._saved_launch
+
     async def test_app_starts_and_renders_table(self):
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)

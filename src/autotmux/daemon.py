@@ -28,38 +28,20 @@ import re
 import logging
 from logging.handlers import RotatingFileHandler
 
-# ── paths (all in /tmp so they survive NFS issues) ──────────────────────────
+# ── paths (XDG-aware, see autotmux.paths) ───────────────────────────────────
 _UID = os.getuid()
 _USER = os.environ.get('USER', str(_UID))
 
-from autotmux import __version__
+from autotmux import __version__, config, paths
 
-CTL_DIR   = f'/tmp/autotmux_ctl_{_UID}'
-PID_FILE  = f'/tmp/autotmux_daemon_{_UID}.pid'
-LOG_FILE  = f'/tmp/autotmux_daemon_{_UID}.log'
-STAT_FILE = f'/tmp/autotmux_daemon_{_UID}.json'  # status snapshot for `status` cmd
-SNAPSHOT_FILE = f'/tmp/autotmux_snapshots_{_UID}.json'
+CTL_DIR   = paths.CTL_DIR
+PID_FILE  = paths.PID_FILE
+LOG_FILE  = paths.LOG_FILE
+STAT_FILE = paths.STATE_FILE  # status snapshot for `status` cmd
+SNAPSHOT_FILE = paths.SNAPSHOT_FILE
 
-# ── tunables ─────────────────────────────────────────────────────────────────
-SQUEUE_INTERVAL   = 30    # seconds between squeue polls
-HEALTH_INTERVAL   = 30    # seconds between master health checks
-DEEP_PROBE_TIMEOUT = 8    # seconds for `ssh true` deep probe through master
-CONNECT_TIMEOUT   = 8     # ssh ConnectTimeout for master
-CTL_PERSIST       = 3600  # ControlPersist in seconds (1 hour)
-SQUEUE_TIMEOUT    = 15
-SNAPSHOT_INTERVAL = 120   # seconds between full preview snapshot refreshes
-SESSION_INTERVAL  = 15    # seconds between tmux list-sessions polls per node
-SERVER_ALIVE_INT  = 30    # ssh ServerAliveInterval — keepalive against
-                          # idle TCP NAT/firewall drops. Without this an
-                          # idle plain-bash slave silently disconnects.
-SERVER_ALIVE_MAX  = 3     # missed keepalives before declaring dead
-GONE_NODE_THRESHOLD = 2   # consecutive squeue misses before cleanup_gone_node
-SHALLOW_CHECK_TIMEOUT = 8 # seconds for `ssh -O check` — generous enough to
-                          # tolerate a busy login node where subprocess fork
-                          # itself can take 1-2 s
-HOST_EXPR_RE      = re.compile(r'^[A-Za-z0-9._\-\[\],]+$')
-
-os.makedirs(CTL_DIR, mode=0o700, exist_ok=True)
+# Legacy pre-XDG pid file — used by migration to stop an old daemon (Task 5).
+LEGACY_PID_FILE = f'/tmp/autotmux_daemon_{_UID}.pid'
 
 # ── logging ──────────────────────────────────────────────────────────────────
 log = logging.getLogger('autotmux_daemon')
@@ -72,6 +54,25 @@ if not log.handlers:
         datefmt='%Y-%m-%d %H:%M:%S',
     ))
     log.addHandler(_handler)
+
+_cfg = config.load()
+
+# ── tunables (overridable via ~/.config/autotmux/config.toml) ───────────────
+SQUEUE_INTERVAL       = _cfg['squeue_interval']
+HEALTH_INTERVAL       = _cfg['health_interval']
+DEEP_PROBE_TIMEOUT    = _cfg['deep_probe_timeout']
+CONNECT_TIMEOUT       = _cfg['connect_timeout']
+CTL_PERSIST           = _cfg['ctl_persist']
+SQUEUE_TIMEOUT        = _cfg['squeue_timeout']
+SNAPSHOT_INTERVAL     = _cfg['snapshot_interval']
+SESSION_INTERVAL      = _cfg['session_interval']
+SERVER_ALIVE_INT      = _cfg['server_alive_int']
+SERVER_ALIVE_MAX      = _cfg['server_alive_max']
+GONE_NODE_THRESHOLD   = _cfg['gone_node_threshold']
+SHALLOW_CHECK_TIMEOUT = _cfg['shallow_check_timeout']
+HOST_EXPR_RE      = re.compile(r'^[A-Za-z0-9._\-\[\],]+$')
+
+os.makedirs(CTL_DIR, mode=0o700, exist_ok=True)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -484,8 +485,8 @@ def _node_master_lock(node: str) -> threading.Lock:
                 _node_master_locks[node] = lock
     return lock
 
-BACKOFF_BASE  = 30   # seconds — initial retry delay after a master start fails
-BACKOFF_CAP   = 600  # seconds — max retry delay (10 min)
+BACKOFF_BASE  = _cfg['backoff_base']  # initial retry delay after a master start fails
+BACKOFF_CAP   = _cfg['backoff_cap']   # max retry delay
 HEALTH_FAIL_THRESHOLD = 5    # consecutive shallow-check failures before kill+restart
 
 
@@ -952,6 +953,31 @@ def _session_loop():
             return
 
 
+def _stop_legacy_daemon() -> None:
+    """Stop a pre-XDG daemon still running under the old /tmp pid file.
+
+    Without this, after upgrading to XDG paths the new frontend wouldn't see
+    the old daemon (different pid-file location) and would start a second one,
+    leaving two daemons fighting over the same ControlMaster sockets.
+    """
+    if LEGACY_PID_FILE == PID_FILE:
+        return  # paths resolved to /tmp anyway; nothing to migrate
+    try:
+        with open(LEGACY_PID_FILE) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    if pid == os.getpid() or not _pid_running(pid):
+        return
+    log.info(f'migrated: stopping legacy daemon (pid={pid})')
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # already gone between the probe and the kill — fine
+    except OSError as e:
+        log.warning(f'migrated: could not signal legacy daemon (pid={pid}): {e}')
+
+
 def cmd_start():
     pid = _read_pid()
     if pid and _pid_running(pid):
@@ -962,6 +988,7 @@ def cmd_start():
     # Install signal handlers FIRST so we don't have a window where a
     # stray SIGTERM kills the daemon without graceful shutdown.
     _install_signal_handlers()
+    _stop_legacy_daemon()
     _write_pid()
     log.info(f'Daemon started (pid={os.getpid()}, version={__version__})')
     # Cleanup runs in a background thread — it does deep ssh probes per

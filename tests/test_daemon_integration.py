@@ -17,11 +17,12 @@ import unittest
 
 
 UID = os.getuid()
-PID_FILE = f'/tmp/autotmux_daemon_{UID}.pid'
-STATE_FILE = f'/tmp/autotmux_daemon_{UID}.json'
-SNAPSHOT_FILE = f'/tmp/autotmux_snapshots_{UID}.json'
-LOG_FILE = f'/tmp/autotmux_daemon_{UID}.log'
-CTL_DIR = f'/tmp/autotmux_ctl_{UID}'
+from autotmux import paths
+PID_FILE = paths.PID_FILE
+STATE_FILE = paths.STATE_FILE
+SNAPSHOT_FILE = paths.SNAPSHOT_FILE
+LOG_FILE = paths.LOG_FILE
+CTL_DIR = paths.CTL_DIR
 
 ATD = shutil.which('atd') or 'atd'
 
