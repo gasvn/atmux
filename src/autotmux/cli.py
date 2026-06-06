@@ -436,6 +436,11 @@ class AutotmuxApp(App):
     title = reactive(f"AutoTmux v{__version__}")
     sub_title = reactive("")
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._restart_attempts = []   # time.monotonic() of recent daemon restarts
+        self._crash_looping = False
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="upper"):
@@ -469,8 +474,6 @@ class AutotmuxApp(App):
         self._selection_changed_at = 0.0
         # Pool of pre-warmed ssh slaves — see WarmSlavePool docstring.
         self._warm_pool = WarmSlavePool()
-        self._restart_attempts = []   # time.monotonic() of recent daemon restarts
-        self._crash_looping = False
 
         # Populate immediately, then keep refreshing
         self._refresh_table()

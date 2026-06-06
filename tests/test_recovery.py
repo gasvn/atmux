@@ -1,6 +1,7 @@
 """Tests for crash-recovery logic in autotmux.cli."""
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,6 +76,38 @@ class MaybeRecoverTests(unittest.IsolatedAsyncioTestCase):
                 app._maybe_recover_daemon()
             self.assertEqual(len(calls), 3)       # capped at limit=3
             self.assertTrue(app._crash_looping)
+
+
+class StatusSubtitleTests(unittest.TestCase):
+    def _app(self):
+        app = cli.AutotmuxApp()
+        app._crash_looping = False
+        return app
+
+    def test_crash_loop_banner(self):
+        app = self._app()
+        app._crash_looping = True
+        out = app._status_subtitle({'nodes': {'n': {}}}, [('n', 's')],
+                                   '2024-01-01 00:00:00')
+        self.assertIn('crash-looping', out)
+
+    def test_no_nodes_shows_waiting(self):
+        app = self._app()
+        out = app._status_subtitle({}, [], '?')
+        self.assertIn('waiting for daemon', out)
+
+    def test_hung_but_alive_shows_stale_banner(self):
+        app = self._app()
+        # a very old 'updated' timestamp → age > 30s → stale banner
+        out = app._status_subtitle({'nodes': {'n': {}}}, [('n', 's')],
+                                   '2000-01-01 00:00:00')
+        self.assertIn('stale', out)
+
+    def test_fresh_update_shows_session_count(self):
+        app = self._app()
+        now = time.strftime('%Y-%m-%d %H:%M:%S')
+        out = app._status_subtitle({'nodes': {'n': {}}}, [('n', 's')], now)
+        self.assertIn('session', out)
 
 
 if __name__ == '__main__':
