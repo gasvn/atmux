@@ -818,6 +818,15 @@ def _daemon_running() -> bool:
         return False
 
 
+def _should_restart(attempts, now: float, window: float = 60.0,
+                    limit: int = 3) -> bool:
+    """Loop guard: allow a daemon restart only if fewer than `limit`
+    restarts happened in the last `window` seconds. `attempts` is a list of
+    time.monotonic() timestamps of prior restarts."""
+    recent = [t for t in attempts if now - t < window]
+    return len(recent) < limit
+
+
 def _launch_daemon() -> None:
     """Start the daemon if it isn't already running.
 
