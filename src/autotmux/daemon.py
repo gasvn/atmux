@@ -43,6 +43,18 @@ SNAPSHOT_FILE = paths.SNAPSHOT_FILE
 # Legacy pre-XDG pid file — used by migration to stop an old daemon (Task 5).
 LEGACY_PID_FILE = f'/tmp/autotmux_daemon_{_UID}.pid'
 
+# ── logging ──────────────────────────────────────────────────────────────────
+log = logging.getLogger('autotmux_daemon')
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3)
+    _handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    log.addHandler(_handler)
+
 _cfg = config.load()
 
 # ── tunables (overridable via ~/.config/autotmux/config.toml) ───────────────
@@ -61,18 +73,6 @@ SHALLOW_CHECK_TIMEOUT = _cfg['shallow_check_timeout']
 HOST_EXPR_RE      = re.compile(r'^[A-Za-z0-9._\-\[\],]+$')
 
 os.makedirs(CTL_DIR, mode=0o700, exist_ok=True)
-
-# ── logging ──────────────────────────────────────────────────────────────────
-log = logging.getLogger('autotmux_daemon')
-log.setLevel(logging.INFO)
-log.propagate = False
-if not log.handlers:
-    _handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3)
-    _handler.setFormatter(logging.Formatter(
-        '%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-    ))
-    log.addHandler(_handler)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
