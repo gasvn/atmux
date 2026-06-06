@@ -27,5 +27,53 @@ class ShouldRestartTests(unittest.TestCase):
         self.assertTrue(cli._should_restart([10.0, 70.0, 80.0], now=100.0))
 
 
+class MaybeRecoverTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved_running = cli._daemon_running
+        self._saved_launch = cli._launch_daemon
+        cli._launch_daemon = lambda: None  # never spawn a real daemon in tests
+
+    def tearDown(self):
+        cli._daemon_running = self._saved_running
+        cli._launch_daemon = self._saved_launch
+
+    async def test_no_recovery_when_daemon_alive(self):
+        app = cli.AutotmuxApp()
+        async with app.run_test():
+            calls = []
+            app._dispatch_restart = lambda: calls.append(1)
+            app._restart_attempts = []
+            app._crash_looping = True
+            cli._daemon_running = lambda: True
+            app._maybe_recover_daemon()
+            self.assertEqual(calls, [])
+            self.assertFalse(app._crash_looping)
+
+    async def test_restart_dispatched_when_dead(self):
+        app = cli.AutotmuxApp()
+        async with app.run_test():
+            calls = []
+            app._dispatch_restart = lambda: calls.append(1)
+            app._restart_attempts = []
+            app._crash_looping = False
+            cli._daemon_running = lambda: False
+            app._maybe_recover_daemon()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(app._restart_attempts), 1)
+
+    async def test_stops_after_loop_guard_and_sets_banner(self):
+        app = cli.AutotmuxApp()
+        async with app.run_test():
+            calls = []
+            app._dispatch_restart = lambda: calls.append(1)
+            app._restart_attempts = []
+            app._crash_looping = False
+            cli._daemon_running = lambda: False
+            for _ in range(5):
+                app._maybe_recover_daemon()
+            self.assertEqual(len(calls), 3)       # capped at limit=3
+            self.assertTrue(app._crash_looping)
+
+
 if __name__ == '__main__':
     unittest.main()
