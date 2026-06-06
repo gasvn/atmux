@@ -953,6 +953,29 @@ def _session_loop():
             return
 
 
+def _stop_legacy_daemon() -> None:
+    """Stop a pre-XDG daemon still running under the old /tmp pid file.
+
+    Without this, after upgrading to XDG paths the new frontend wouldn't see
+    the old daemon (different pid-file location) and would start a second one,
+    leaving two daemons fighting over the same ControlMaster sockets.
+    """
+    if LEGACY_PID_FILE == PID_FILE:
+        return  # paths resolved to /tmp anyway; nothing to migrate
+    try:
+        with open(LEGACY_PID_FILE) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    if pid == os.getpid() or not _pid_running(pid):
+        return
+    log.info(f'migrated: stopping legacy daemon (pid={pid})')
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
 def cmd_start():
     pid = _read_pid()
     if pid and _pid_running(pid):
@@ -963,6 +986,7 @@ def cmd_start():
     # Install signal handlers FIRST so we don't have a window where a
     # stray SIGTERM kills the daemon without graceful shutdown.
     _install_signal_handlers()
+    _stop_legacy_daemon()
     _write_pid()
     log.info(f'Daemon started (pid={os.getpid()}, version={__version__})')
     # Cleanup runs in a background thread — it does deep ssh probes per
