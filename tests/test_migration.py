@@ -54,6 +54,15 @@ class StopLegacyDaemonTests(unittest.TestCase):
             d.PID_FILE = os.path.join(td, 'new.pid')
             d._stop_legacy_daemon()  # no file → return cleanly
 
+    def test_dead_pid_in_legacy_file_is_noop(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy = os.path.join(td, 'legacy.pid')
+            with open(legacy, 'w') as f:
+                f.write('999999999')  # a pid extremely unlikely to exist
+            d.LEGACY_PID_FILE = legacy
+            d.PID_FILE = os.path.join(td, 'new.pid')
+            d._stop_legacy_daemon()  # dead pid → noop, no exception
+
 
 if __name__ == '__main__':
     unittest.main()

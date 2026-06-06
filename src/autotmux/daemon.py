@@ -972,8 +972,10 @@ def _stop_legacy_daemon() -> None:
     log.info(f'migrated: stopping legacy daemon (pid={pid})')
     try:
         os.kill(pid, signal.SIGTERM)
-    except OSError:
-        pass
+    except ProcessLookupError:
+        pass  # already gone between the probe and the kill — fine
+    except OSError as e:
+        log.warning(f'migrated: could not signal legacy daemon (pid={pid}): {e}')
 
 
 def cmd_start():
