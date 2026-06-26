@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -133,6 +134,75 @@ class AtomicWriteTests(unittest.TestCase):
                 d._atomic_write_json(p, {'bad': NotJSON()})
             tmps = [n for n in os.listdir(td) if '.tmp' in n]
             self.assertEqual(tmps, [], "tmp file leaked after serialization error")
+
+
+class AtomicWriteUniqueTmpTests(unittest.TestCase):
+    """Each write must use a distinct tmp path so the three daemon loop
+    threads writing the same state file can't truncate each other's tmp."""
+
+    def test_each_write_uses_a_distinct_tmp_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, 'out.json')
+            seen = []
+            real_replace = os.replace
+
+            def rec_replace(src, dst):
+                seen.append(src)
+                return real_replace(src, dst)
+
+            with mock.patch('autotmux.daemon.os.replace', rec_replace):
+                d._atomic_write_json(p, {'a': 1})
+                d._atomic_write_json(p, {'a': 2})
+            self.assertEqual(len(seen), 2)
+            self.assertNotEqual(
+                seen[0], seen[1],
+                "each write must use a unique tmp path (concurrent writers collide otherwise)")
+
+
+class GetNodesAliasingTests(unittest.TestCase):
+    """A multi-node job (`node[01-02]`) must expand into independent info
+    dicts — sharing one dict makes per-node sessions/load overwrite siblings."""
+
+    def test_expanded_range_nodes_are_independent_dicts(self):
+        def fake_check_output(cmd, *a, **k):
+            if cmd[0] == 'squeue':
+                return ('node[01-02]|1:00|job|123|part|user|RUNNING|0:30|2|reason\n')
+            if cmd[0] == 'scontrol':
+                return 'node01\nnode02\n'
+            return ''
+
+        with mock.patch('autotmux.daemon.subprocess.check_output', fake_check_output):
+            nodes = d._get_nodes()
+        self.assertIn('node01', nodes)
+        self.assertIn('node02', nodes)
+        self.assertIsNot(nodes['node01'], nodes['node02'],
+                         "expanded range nodes must not share a single info dict")
+        nodes['node01']['sessions'] = ['only-node01']
+        self.assertNotIn('sessions', nodes['node02'],
+                         "mutating one expanded node bled into its sibling")
+
+
+class DaemonSingletonLockTests(unittest.TestCase):
+    """The daemon must hold an exclusive lock so two `atd start` races can't
+    both spawn a daemon."""
+
+    def tearDown(self):
+        fd = getattr(d, '_singleton_lock_fd', None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            d._singleton_lock_fd = None
+
+    def test_second_acquire_fails_while_held(self):
+        with tempfile.TemporaryDirectory() as td:
+            lockfile = os.path.join(td, 'daemon.pid.lock')
+            with mock.patch.object(d, 'LOCK_FILE', lockfile):
+                self.assertTrue(d._acquire_singleton_lock(),
+                                "first acquire should succeed")
+                self.assertFalse(d._acquire_singleton_lock(),
+                                 "second acquire must fail while the lock is held")
 
 
 class DaemonBookkeepingTests(unittest.TestCase):

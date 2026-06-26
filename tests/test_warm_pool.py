@@ -6,6 +6,7 @@ sends, simulating the bash-prompt-then-exec flow).
 """
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -136,6 +137,52 @@ class WarmSlavePoolTests(unittest.TestCase):
             time.sleep(0.05)
         else:
             self.fail("shutdown() did not kill the slave process")
+
+
+class WarmSlaveFdLeakTests(unittest.TestCase):
+    """When a warm slave silently dies, the detector must close its pty
+    master fd — otherwise every dead slave leaks one fd until EMFILE."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.ctl_dir = os.path.join(self.tmpdir, 'ctl')
+        os.makedirs(self.ctl_dir, exist_ok=True)
+        self.fake_node = 'fake-node-fd'
+        open(os.path.join(self.ctl_dir, f'cm_{self.fake_node}'), 'w').close()
+        self._original_ctl_path = autotmux._ctl_path
+        autotmux._ctl_path = lambda node: os.path.join(self.ctl_dir, f'cm_{node}')
+        self._old_path = os.environ['PATH']
+        bin_dir = _install_ssh_stub(self.tmpdir)
+        os.environ['PATH'] = bin_dir + os.pathsep + os.environ['PATH']
+
+    def tearDown(self):
+        autotmux._ctl_path = self._original_ctl_path
+        os.environ['PATH'] = self._old_path
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_dead_slave_master_fd_is_closed(self):
+        pool = autotmux.WarmSlavePool()
+        pool.warm(self.fake_node)
+        pid, fd = pool._slaves[self.fake_node]
+        # Kill the slave so the next liveness check observes it dead.
+        os.kill(pid, signal.SIGKILL)
+        for _ in range(40):
+            if not pool._still_alive(self.fake_node):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("slave was never detected as dead")
+        # The master fd must have been closed, not leaked.
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+
+    def test_warm_after_shutdown_is_noop(self):
+        pool = autotmux.WarmSlavePool()
+        pool.warm(self.fake_node)
+        pool.shutdown()
+        pool.warm(self.fake_node)
+        self.assertNotIn(self.fake_node, pool._slaves,
+                         "warm() after shutdown must not spawn a new slave")
 
 
 class SqueueLoopFieldPreservationTests(unittest.TestCase):

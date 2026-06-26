@@ -120,6 +120,76 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 # Should be a no-op rather than raising.
                 await app.action_attach_session()
 
+    async def test_single_click_on_row_triggers_attach(self):
+        """A single mouse click on a session row must attach to THAT row.
+
+        Regression: Textual's DataTable only emits RowSelected on a
+        *redundant* click of the cell already under the cursor, so a first
+        click on a different row merely highlighted it and the attach never
+        ran ("click does nothing"). A single click on any row must attach.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                attached = []
+
+                async def fake_attach():
+                    attached.append((app.selected_node, app.selected_session))
+
+                app.action_attach_session = fake_attach
+                # Cursor starts on row 0; click a *different* row (index 1).
+                # Header occupies y=0, so data row 1 is at y=2.
+                await pilot.click(app.table, offset=(3, 2))
+                await pilot.pause()
+
+                self.assertEqual(len(attached), 1,
+                                 "a single click on a row should attach exactly once")
+                node, sess = attached[0]
+                self.assertIn((node, sess),
+                              [(r[0], r[1]) for r in app.all_sessions])
+
+    async def test_enter_key_triggers_attach(self):
+        """Pressing Enter on the highlighted row must still attach (the
+        click fix also routes through on_data_table_row_selected)."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                attached = []
+
+                async def fake_attach():
+                    attached.append((app.selected_node, app.selected_session))
+
+                app.action_attach_session = fake_attach
+                app.table.focus()
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertEqual(len(attached), 1,
+                                 "Enter on a row should attach exactly once")
+
+    async def test_load_change_updates_cell_in_place(self):
+        """When only a volatile field (load average) changes, the table is
+        updated in place — the LOAD cell reflects the new value and no full
+        structural rebuild happens (keeps the 5s tick smooth)."""
+        from textual.coordinate import Coordinate
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                sig_before = app._last_structural_sig
+                new_state = json.loads(json.dumps(SYNTH_STATE))
+                new_state['nodes']['gpu1']['info']['load'] = '7.77'
+                app._refresh_table(new_state)
+                await pilot.pause()
+                # LOAD is display column index 5; row 0 is a gpu1 row.
+                self.assertEqual(str(app.table.get_cell_at(Coordinate(0, 5))), '7.77')
+                self.assertEqual(app._last_structural_sig, sig_before,
+                                 "load-only change must not trigger a structural rebuild")
+
     async def test_missing_state_file_doesnt_crash(self):
         with tempfile.TemporaryDirectory() as td:
             autotmux.STATE_FILE = os.path.join(td, 'missing.json')

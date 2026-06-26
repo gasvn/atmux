@@ -25,6 +25,9 @@ import subprocess
 import threading
 import json
 import re
+import glob
+import fcntl
+import uuid
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -39,6 +42,9 @@ PID_FILE  = paths.PID_FILE
 LOG_FILE  = paths.LOG_FILE
 STAT_FILE = paths.STATE_FILE  # status snapshot for `status` cmd
 SNAPSHOT_FILE = paths.SNAPSHOT_FILE
+# Exclusive singleton lock — held for the daemon's whole lifetime so two
+# concurrent `atd start` invocations can't both spawn a daemon.
+LOCK_FILE = PID_FILE + '.lock'
 
 # Legacy pre-XDG pid file — used by migration to stop an old daemon (Task 5).
 LEGACY_PID_FILE = f'/tmp/autotmux_daemon_{_UID}.pid'
@@ -78,15 +84,22 @@ os.makedirs(CTL_DIR, mode=0o700, exist_ok=True)
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _atomic_write_json(path: str, data) -> None:
-    """Write JSON atomically — write to a tmp file, then os.replace.
+    """Write JSON atomically — write to a unique tmp file, fsync, then
+    os.replace.
 
     Without this, a frontend polling the state file can read a half-written
-    document and bail with a JSON error.
+    document and bail with a JSON error. The tmp name must be unique per
+    call (not just per-pid): three daemon loop threads write the same state
+    file, and a shared tmp path would let them truncate each other's
+    in-flight write. The fsync makes the data durable before the rename so a
+    crash can't leave a zero-length file behind the atomic swap.
     """
-    tmp = f'{path}.tmp.{os.getpid()}'
+    tmp = f'{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}'
     try:
         with open(tmp, 'w') as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except Exception:
         try:
@@ -94,6 +107,17 @@ def _atomic_write_json(path: str, data) -> None:
         except OSError:
             pass
         raise
+
+
+def _sweep_stale_tmp() -> None:
+    """Remove leftover `*.tmp.*` files from a previously-crashed daemon so
+    they don't accumulate in the runtime dir across restarts."""
+    for base in (STAT_FILE, SNAPSHOT_FILE):
+        for stale in glob.glob(f'{base}.tmp.*'):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
 
 
 # ── ControlMaster helpers ────────────────────────────────────────────────────
@@ -355,22 +379,43 @@ def _record_error(node: str, err: str | None) -> None:
             info['last_error'] = err[:200]
 
 
+# Guards _master_backoff and _master_failure_streak — both are read-modify-
+# written from the squeue ensure-threads and the health thread concurrently.
+_backoff_lock = threading.Lock()
+
+
 def _backoff_should_skip(node: str) -> bool:
-    bk = _master_backoff.get(node)
-    return bool(bk and time.time() < bk['next_try'])
+    with _backoff_lock:
+        bk = _master_backoff.get(node)
+        return bool(bk and time.time() < bk['next_try'])
 
 
 def _backoff_record_failure(node: str) -> float:
-    bk = _master_backoff.get(node, {'next_try': 0.0, 'fails': 0})
-    bk['fails'] += 1
-    delay = min(BACKOFF_BASE * (2 ** (bk['fails'] - 1)), BACKOFF_CAP)
-    bk['next_try'] = time.time() + delay
-    _master_backoff[node] = bk
-    return delay
+    with _backoff_lock:
+        bk = _master_backoff.get(node, {'next_try': 0.0, 'fails': 0})
+        bk['fails'] += 1
+        delay = min(BACKOFF_BASE * (2 ** (bk['fails'] - 1)), BACKOFF_CAP)
+        bk['next_try'] = time.time() + delay
+        _master_backoff[node] = bk
+        return delay
 
 
 def _backoff_clear(node: str) -> None:
-    _master_backoff.pop(node, None)
+    with _backoff_lock:
+        _master_backoff.pop(node, None)
+
+
+def _streak_bump(node: str) -> int:
+    """Increment and return the consecutive-failure streak for `node`."""
+    with _backoff_lock:
+        n = _master_failure_streak.get(node, 0) + 1
+        _master_failure_streak[node] = n
+        return n
+
+
+def _streak_clear(node: str) -> None:
+    with _backoff_lock:
+        _master_failure_streak.pop(node, None)
 
 
 def _cleanup_gone_node(node: str) -> None:
@@ -383,7 +428,7 @@ def _cleanup_gone_node(node: str) -> None:
     if node == 'localhost':
         return
     _backoff_clear(node)
-    _master_failure_streak.pop(node, None)
+    _streak_clear(node)
     _kill_master(node)  # also wipes _master_procs entry via _kill_orphan_master_proc
 
 
@@ -434,7 +479,10 @@ def _get_nodes() -> dict:
                     )
                     for n in expanded.splitlines():
                         if n.strip():
-                            nodes[n.strip()] = info
+                            # Each expanded host needs its OWN info dict —
+                            # sharing one object makes the session loop's
+                            # per-node sessions/load overwrite every sibling.
+                            nodes[n.strip()] = dict(info)
                 except Exception:
                     nodes[node_part] = info
             else:
@@ -590,7 +638,7 @@ def _squeue_loop():
             # bounded concurrency so we don't burst-fork on clusters with
             # many nodes, and the process can still exit cleanly.
             threads = [_bounded_daemon_thread(_ensure_master, (n,),
-                                              _session_semaphore,
+                                              _ensure_semaphore,
                                               f'ensure-{n}')
                        for n in node_infos.keys()]
             for t in threads:
@@ -632,17 +680,16 @@ def _health_check_node(node: str) -> str:
     if _backoff_should_skip(node):
         return 'skip-backoff'
     if _master_alive(node):
-        _master_failure_streak.pop(node, None)
+        _streak_clear(node)
         _backoff_clear(node)
         return 'alive'
-    streak = _master_failure_streak.get(node, 0) + 1
-    _master_failure_streak[node] = streak
+    streak = _streak_bump(node)
     if streak < HEALTH_FAIL_THRESHOLD:
         log.info(f'Master for {node} not responding ({streak}/{HEALTH_FAIL_THRESHOLD})')
         return 'transient-failure'
     log.info(f'Master for {node} unresponsive after {streak} checks, restarting...')
     _kill_master(node)
-    _master_failure_streak.pop(node, None)
+    _streak_clear(node)
     if _start_master(node):
         log.info(f'Master for {node} restarted')
         _backoff_clear(node)
@@ -792,6 +839,10 @@ def run_foreground():
     """Run the daemon loops in the foreground (useful for debugging)."""
     log.info(f'autotmux_daemon starting (pid={os.getpid()}, user={_USER})')
     print(f'[autotmux_daemon] Running in foreground. Logs: {LOG_FILE}')
+    if not _acquire_singleton_lock():
+        print('[autotmux_daemon] Another daemon is already running — refusing to start.')
+        return
+    _sweep_stale_tmp()
     _install_signal_handlers()
     _cleanup_orphan_sockets()
     threading.Thread(target=_squeue_loop, daemon=True).start()
@@ -826,6 +877,36 @@ def _daemonize():
     os.dup2(devnull.fileno(), sys.stdin.fileno())
     os.dup2(devnull.fileno(), sys.stdout.fileno())
     os.dup2(devnull.fileno(), sys.stderr.fileno())
+    # Close the extra handle now that 0/1/2 are dup'd onto it — otherwise the
+    # original fd leaks for the daemon's lifetime.
+    if devnull.fileno() > 2:
+        try:
+            devnull.close()
+        except OSError:
+            pass
+
+
+_singleton_lock_fd = None  # kept open for the daemon's lifetime; never GC'd
+
+
+def _acquire_singleton_lock() -> bool:
+    """Take an exclusive, non-blocking flock the daemon holds for its whole
+    lifetime. Returns False if another daemon already holds it.
+
+    flock is tied to the open file description, so it survives the
+    double-fork (inherited fds keep it held) and the kernel auto-releases it
+    when the last holder exits — even on SIGKILL. This is the authoritative
+    guard against two daemons; the pid file is only advisory.
+    """
+    global _singleton_lock_fd
+    fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _singleton_lock_fd = fd  # hold a reference so it isn't closed/GC'd
+    return True
 
 
 def _write_pid():
@@ -850,6 +931,10 @@ def _pid_running(pid: int) -> bool:
 
 
 _session_semaphore = threading.Semaphore(12)
+# A SEPARATE pool for the squeue loop's master-spawn threads, so a slow batch
+# of _ensure_master calls can't hold every permit and starve _session_loop
+# (and vice-versa) on clusters with many nodes.
+_ensure_semaphore = threading.Semaphore(12)
 
 
 def _bounded_daemon_thread(target, args, sem: threading.Semaphore, name: str):
@@ -983,6 +1068,12 @@ def cmd_start():
     if pid and _pid_running(pid):
         print(f'[autotmux_daemon] Already running (pid={pid})')
         return
+    # Authoritative guard against a concurrent `start`/`restart` racing us:
+    # grab the singleton lock BEFORE forking so the daemon inherits it.
+    if not _acquire_singleton_lock():
+        print('[autotmux_daemon] Already running (another instance holds the lock)')
+        return
+    _sweep_stale_tmp()
     print(f'[autotmux_daemon] Starting daemon... (log: {LOG_FILE})')
     _daemonize()
     # Install signal handlers FIRST so we don't have a window where a

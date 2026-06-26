@@ -27,9 +27,11 @@ import threading
 import time
 import tty
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
+from textual.coordinate import Coordinate
 from textual.reactive import reactive
 from textual.widgets import DataTable, Footer, Header, Static
 import rich.text
@@ -103,6 +105,9 @@ class WarmSlavePool:
         # back-to-back _refresh_table workers) can't both fork for the
         # same node, leaking one slave.
         self._lock = threading.Lock()
+        # Set by shutdown() so a warm worker still in flight can't spawn a
+        # new slave after we've torn everything down (would orphan an ssh).
+        self._closed = False
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
@@ -115,6 +120,8 @@ class WarmSlavePool:
         if not os.path.exists(ctl):
             return
         with self._lock:
+            if self._closed:
+                return
             if self._still_alive_locked(node):
                 return
             try:
@@ -132,8 +139,11 @@ class WarmSlavePool:
                         '-o', 'ServerAliveCountMax=3',
                         '-tt', node,
                     ])
-                except Exception:
-                    os._exit(127)
+                except BaseException:
+                    pass
+                # Belt-and-suspenders: the child must NEVER fall through into
+                # parent (Textual) code, whatever execvp raises.
+                os._exit(127)
             # parent — make the master fd close-on-exec so child processes don't
             # accidentally inherit it.
             try:
@@ -158,8 +168,15 @@ class WarmSlavePool:
             self.warm(n)
 
     def shutdown(self) -> None:
-        """Tear down every warm slave. Called from on_unmount."""
-        for node in list(self._slaves):
+        """Tear down every warm slave. Called from on_unmount.
+
+        Sets _closed under the lock (so an in-flight warm() either finished
+        before us — and is in the snapshot we clean up — or will see _closed
+        and bail), then cleans up the snapshot."""
+        with self._lock:
+            self._closed = True
+            nodes = list(self._slaves)
+        for node in nodes:
             self._cleanup(node)
 
     # ── attach path ─────────────────────────────────────────────────────────
@@ -223,15 +240,20 @@ class WarmSlavePool:
         slave = self._slaves.get(node)
         if not slave:
             return False
-        pid, _ = slave
+        pid, fd = slave
         try:
             wpid, _ = os.waitpid(pid, os.WNOHANG)
             if wpid == 0:
                 return True
         except OSError:
             pass
-        # Process gone — drop without re-locking.
+        # Process gone — drop it AND close its pty master fd. Forgetting the
+        # close here leaks one fd per silently-dead slave until EMFILE.
         self._slaves.pop(node, None)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         return False
 
     def _take(self, node: str):
@@ -333,22 +355,16 @@ class WarmSlavePool:
                     except OSError:
                         break
                     if not data:
+                        # pty EOF — the ssh slave (and its tmux) have exited.
                         break
-                    os.write(1, data)
-                # Has the ssh process exited?
-                try:
-                    pid, _ = os.waitpid(child_pid, os.WNOHANG)
-                    if pid != 0:
-                        # Drain any final output before we leave.
-                        try:
-                            data = os.read(master_fd, 8192)
-                            if data:
-                                os.write(1, data)
-                        except OSError:
-                            pass
+                    try:
+                        os.write(1, data)
+                    except OSError:
                         break
-                except OSError:
-                    break
+                # NOTE: we deliberately do NOT waitpid(child_pid) here. The
+                # caller's finally → _reap_child is the single owner of the
+                # reap; reaping in two places let a recycled PID get signalled.
+                # The pty EOF above is our reliable exit signal.
         finally:
             try:
                 signal.signal(signal.SIGWINCH, old_winch)
@@ -390,6 +406,37 @@ def build_session_rows(state: dict) -> list:
             rows.append((node, '<Start Shell>', '-', time_left, 'No sessions', cpu, load))
     rows.sort(key=lambda r: (r[0], r[1]))
     return rows
+
+
+class ClickToAttachDataTable(DataTable):
+    """A DataTable where a *single* mouse click selects the clicked row.
+
+    Upstream Textual (8.x) only emits ``RowSelected`` when you click the
+    cell already under the cursor — a first click on a *different* row just
+    moves the cursor and is otherwise swallowed. With our single-click-to-
+    attach UX that made clicks intermittently "do nothing": whether a click
+    attached depended on it landing on the exact cell already under the
+    cursor.
+
+    Textual invokes *every* ``_on_click`` along the MRO, most-derived first,
+    so we can't simply post the selection here (upstream's handler would
+    then see the cursor already on the cell and post a *second* one). Instead
+    we just pre-position the cursor onto the clicked cell; the upstream
+    handler that runs next then treats it as a redundant click and emits
+    exactly one ``RowSelected`` — on the very first click. Header / row-label
+    clicks (row/column index -1) are left untouched for upstream to handle.
+    """
+
+    async def _on_click(self, event: events.Click) -> None:
+        meta = event.style.meta
+        if "row" not in meta or "column" not in meta:
+            return
+        row_index = meta["row"]
+        column_index = meta["column"]
+        if row_index < 0 or column_index < 0:
+            return
+        if self.show_cursor and self.cursor_type != "none":
+            self.cursor_coordinate = Coordinate(row_index, column_index)
 
 
 class AutotmuxApp(App):
@@ -444,7 +491,7 @@ class AutotmuxApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="upper"):
-            yield DataTable(id="left_pane")
+            yield ClickToAttachDataTable(id="left_pane")
             with VerticalScroll(id="right_pane_scroll"):
                 yield Static("", id="right_pane")
         yield Static("(loading squeue...)", id="jobs_panel")
@@ -468,6 +515,9 @@ class AutotmuxApp(App):
         # the same row is essentially free.
         self._rendered_cache: dict = {}
         self._last_rows_sig: tuple | None = None
+        # Identity of the displayed rows (node, session) in order. When only
+        # this is unchanged we update cells in place instead of rebuilding.
+        self._last_structural_sig: tuple | None = None
         # Lightweight debounce so a fast burst of ↑↓ doesn't queue up
         # a render per keystroke.
         self._preview_render_timer = None
@@ -475,35 +525,84 @@ class AutotmuxApp(App):
         # Pool of pre-warmed ssh slaves — see WarmSlavePool docstring.
         self._warm_pool = WarmSlavePool()
 
-        # Populate immediately, then keep refreshing
-        self._refresh_table()
-        self._refresh_jobs()
-        self.set_interval(5, self._refresh_table)
-        self.set_interval(10, self._refresh_jobs)
+        # Populate immediately (one synchronous read at startup), then keep
+        # refreshing on a timer that reads state OFF the event loop.
+        initial = read_state()
+        self._refresh_table(initial)
+        self._refresh_jobs(initial)
+        self.set_interval(5, self._refresh_async)
         # Snapshot reload runs in a worker thread to avoid blocking the
         # event loop on filesystem hiccups.
         self.set_interval(30, self._reload_snapshots_async)
         self.run_worker(self._preview_loop(), exclusive=True)
 
-    # ── table refresh (pure local file read, <1ms) ───────────────────────────
+    # ── table refresh ─────────────────────────────────────────────────────────
 
-    def _refresh_table(self) -> None:
+    async def _refresh_async(self) -> None:
+        """Timer entry point: read daemon state OFF the event loop, then
+        render. Keeps the 5s tick from freezing the UI on a slow / NFS /
+        mid-write state-file read."""
+        try:
+            state = await asyncio.to_thread(read_state)
+        except Exception:
+            state = {}
+        self._refresh_table(state)
+        self._refresh_jobs(state)
+
+    def _update_row_cells(self, i: int, r) -> None:
+        """Update only the volatile cells of row i in place. Display columns
+        are NODE0 SESSION1 WIN2 TIME3 CPU4 LOAD5 STATUS6, mapped from the row
+        tuple (node, session, wins, time, status, cpu, load)."""
+        for col, val in ((2, r[2]), (3, r[3]), (4, r[5]), (5, r[6]), (6, r[4])):
+            coord = Coordinate(i, col)
+            try:
+                if self.table.get_cell_at(coord) != val:
+                    self.table.update_cell_at(coord, val)
+            except Exception:
+                pass
+
+    def _dispatch_warm(self, rows) -> None:
+        # Keep an idle ssh slave warm for every node in view — pty.fork off
+        # the main thread so it never blocks the UI. exclusive=True stops
+        # back-to-back refreshes dispatching parallel warm-alls.
+        nodes_in_view = {r[0] for r in rows} - {'localhost'}
+        self.run_worker(
+            self._warm_pool_warm_all_async(nodes_in_view),
+            exclusive=True, group='warm-pool',
+        )
+
+    def _refresh_table(self, state=None) -> None:
         self._maybe_recover_daemon()
-        state = read_state()
+        if state is None:
+            state = read_state()
         rows = build_session_rows(state)
         updated = state.get('updated', '?')
 
         sig = tuple(rows)
         if sig == self._last_rows_sig:
-            # Hot path — rows haven't changed, skip the expensive rebuild
-            # (every clear+add_row triggers RowHighlighted churn).
+            # Nothing changed at all — just refresh the subtitle.
             self.sub_title = self._status_subtitle(state, rows, updated)
             return
         self._last_rows_sig = sig
 
-        # Restore by (node, session) so the cursor sticks even if rows reorder.
-        previous = (self.selected_node, self.selected_session)
+        structural = tuple((r[0], r[1]) for r in rows)
+        if (structural == self._last_structural_sig
+                and len(rows) == self.table.row_count):
+            # Same (node, session) rows in the same order; only volatile cells
+            # (time/cpu/load/win/status) changed. Update them in place instead
+            # of clear()+add_row — the latter resets the cursor and churns
+            # RowHighlighted every 5s because the load average ticks constantly.
+            self.all_sessions = rows
+            for i, r in enumerate(rows):
+                self._update_row_cells(i, r)
+            self.sub_title = self._status_subtitle(state, rows, updated)
+            self._dispatch_warm(rows)
+            return
+        self._last_structural_sig = structural
 
+        # Structural change — full rebuild. Restore the cursor by
+        # (node, session) so it sticks even if rows reorder.
+        previous = (self.selected_node, self.selected_session)
         self.all_sessions = rows
         self.table.clear()
         for r in rows:
@@ -519,16 +618,7 @@ class AutotmuxApp(App):
             self.table.move_cursor(row=new_idx)
 
         self.sub_title = self._status_subtitle(state, rows, updated)
-        # Keep an idle ssh slave warm for every node we know about — but
-        # do the pty.fork off the main thread so it never blocks the UI.
-        # exclusive=True ensures back-to-back refreshes don't dispatch
-        # parallel warm-alls (which could race even with the per-pool lock
-        # by re-spawning slaves between checks).
-        nodes_in_view = {r[0] for r in rows} - {'localhost'}
-        self.run_worker(
-            self._warm_pool_warm_all_async(nodes_in_view),
-            exclusive=True, group='warm-pool',
-        )
+        self._dispatch_warm(rows)
 
     @staticmethod
     def _daemon_age_seconds(updated: str):
@@ -583,14 +673,14 @@ class AutotmuxApp(App):
         await asyncio.to_thread(self._warm_pool.warm_all, nodes)
 
     async def action_refresh_table(self) -> None:
-        self._refresh_table()
-        self._refresh_jobs()
+        await self._refresh_async()
         self._reload_snapshots()
 
     # ── jobs panel (bottom) ──────────────────────────────────────────────────
 
-    def _refresh_jobs(self) -> None:
-        state = read_state()
+    def _refresh_jobs(self, state=None) -> None:
+        if state is None:
+            state = read_state()
         if self.jobs_view_mode == 'pending':
             text = state.get('squeue_pending', '')
             title = '── PENDING JOBS (squeue --start)  [j: switch view] ──'
@@ -642,17 +732,24 @@ class AutotmuxApp(App):
 
     # ── row selection ────────────────────────────────────────────────────────
 
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        if event.row_key is None:
-            return
+    def _row_target(self, row_key):
+        """(node, session) for a DataTable row_key, or None if it can't be
+        resolved (stale key mid-refresh, header, out-of-range, etc.)."""
+        if row_key is None:
+            return None
         try:
-            idx = self.table.get_row_index(event.row_key)
+            idx = self.table.get_row_index(row_key)
         except Exception:
-            return
+            return None
         if not (0 <= idx < len(self.all_sessions)):
+            return None
+        return self.all_sessions[idx][0], self.all_sessions[idx][1]
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        target = self._row_target(event.row_key)
+        if target is None:
             return
-        new_node = self.all_sessions[idx][0]
-        new_sess = self.all_sessions[idx][1]
+        new_node, new_sess = target
         # Skip when the highlight event is just from a refresh that landed
         # on the same row — clearing here is what caused the 5s preview flicker.
         if (new_node, new_sess) == (self.selected_node, self.selected_session):
@@ -678,7 +775,12 @@ class AutotmuxApp(App):
             self.log_view.update(f"Loading preview  {node}:{sess} …")
 
     async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        # DataTable owns Enter and emits this; route to attach.
+        # Emitted by Enter and by a single mouse click (see
+        # ClickToAttachDataTable). Resolve the target straight from the event
+        # so the attach can't race a not-yet-processed RowHighlighted.
+        target = self._row_target(event.row_key)
+        if target is not None:
+            self.selected_node, self.selected_session = target
         await self.action_attach_session()
 
     # ── live preview (the ONLY network call in the frontend) ─────────────────
@@ -700,71 +802,86 @@ class AutotmuxApp(App):
         backoff_until: dict = {}
         import time as _time
         while True:
-            await asyncio.sleep(1.0)
-            node = self.selected_node
-            sess = self.selected_session
-            if not node or not sess or sess in ('<Start Shell>', '<offline>'):
-                continue
-            # Skip if the user is still navigating quickly.
-            if _time.monotonic() - getattr(self, '_selection_changed_at', 0) < 0.5:
-                continue
-            key = f"{node}:{sess}"
-            # Honor per-session backoff after repeated timeouts.
-            if backoff_until.get(key, 0) > _time.monotonic():
-                continue
-
-            proc = None
+            # Outer guard: one bad iteration (anything outside the fetch
+            # block too) must never kill the preview worker for the rest of
+            # the session — Textual does not restart a dead worker.
             try:
-                if node == 'localhost':
-                    proc = await asyncio.create_subprocess_exec(
-                        'tmux', 'capture-pane', '-p', '-e', '-t', sess,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                else:
-                    ctl = _get_ssh_args(node)
-                    proc = await asyncio.create_subprocess_exec(
-                        'ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
-                        *ctl, node,
-                        f"tmux capture-pane -p -e -t {shlex.quote(sess)}",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=4)
-                content = stdout.decode(errors='replace')
-                # Successful fetch — reset failure counter for this session.
-                timeout_counts.pop(key, None)
-                backoff_until.pop(key, None)
+                await asyncio.sleep(1.0)
+                node = self.selected_node
+                sess = self.selected_session
+                if not node or not sess or sess in ('<Start Shell>', '<offline>'):
+                    continue
+                # Skip if the user is still navigating quickly.
+                if _time.monotonic() - getattr(self, '_selection_changed_at', 0) < 0.5:
+                    continue
+                key = f"{node}:{sess}"
+                # Honor per-session backoff after repeated timeouts.
+                if backoff_until.get(key, 0) > _time.monotonic():
+                    continue
 
-                if (node, sess) != (self.selected_node, self.selected_session):
-                    continue
-                h = hashlib.md5(content.encode()).hexdigest()
-                if key == last_key and h == last_hash:
-                    continue
-                last_key, last_hash = key, h
-                self.log_view.update(rich.text.Text.from_ansi(content))
-            except asyncio.TimeoutError:
-                # Reap the runaway ssh — otherwise it accumulates as a
-                # zombie eating CPU on the login node.
-                if proc is not None:
-                    try:
-                        proc.kill()
-                        await proc.wait()
-                    except Exception:
-                        pass
-                n = timeout_counts.get(key, 0) + 1
-                timeout_counts[key] = n
-                # After 2 consecutive timeouts, stop probing this session
-                # for 60s — the remote is too overloaded to be useful.
-                if n >= 2:
-                    backoff_until[key] = _time.monotonic() + 60
+                proc = None
+                try:
+                    if node == 'localhost':
+                        proc = await asyncio.create_subprocess_exec(
+                            'tmux', 'capture-pane', '-p', '-e', '-t', sess,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                    else:
+                        ctl = _get_ssh_args(node)
+                        proc = await asyncio.create_subprocess_exec(
+                            'ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
+                            *ctl, node,
+                            f"tmux capture-pane -p -e -t {shlex.quote(sess)}",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=4)
+                    content = stdout.decode(errors='replace')
+                    # Successful fetch — reset failure counter for this session.
+                    timeout_counts.pop(key, None)
+                    backoff_until.pop(key, None)
+
+                    if (node, sess) != (self.selected_node, self.selected_session):
+                        continue
+                    h = hashlib.md5(content.encode()).hexdigest()
+                    if key == last_key and h == last_hash:
+                        continue
+                    last_key, last_hash = key, h
+                    self.log_view.update(rich.text.Text.from_ansi(content))
+                except asyncio.TimeoutError:
+                    # Reap the runaway ssh — otherwise it accumulates as a
+                    # zombie eating CPU on the login node.
+                    if proc is not None:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except Exception:
+                            pass
+                    n = timeout_counts.get(key, 0) + 1
+                    timeout_counts[key] = n
+                    # After 2 consecutive timeouts, stop probing this session
+                    # for 60s — the remote is too overloaded to be useful.
+                    if n >= 2:
+                        backoff_until[key] = _time.monotonic() + 60
+                except Exception:
+                    # ssh missing, decode error, etc. Reap and back this
+                    # session off too, so a persistently-failing fetch isn't
+                    # respawned every second with no feedback.
+                    if proc is not None:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except Exception:
+                            pass
+                    n = timeout_counts.get(key, 0) + 1
+                    timeout_counts[key] = n
+                    if n >= 2:
+                        backoff_until[key] = _time.monotonic() + 60
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                if proc is not None:
-                    try:
-                        proc.kill()
-                        await proc.wait()
-                    except Exception:
-                        pass
+                continue
 
     # ── interactive actions ──────────────────────────────────────────────────
 
