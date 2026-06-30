@@ -181,14 +181,23 @@ class WarmSlavePool:
 
     # ── attach path ─────────────────────────────────────────────────────────
 
+    # A proxy that returns faster than this almost certainly means the warm
+    # slave was stale (local ssh alive, but its channel / remote shell had
+    # quietly died) — not a real attach the user interacted with. Treat it as
+    # a failure so the caller falls back to a fresh cold attach instead of
+    # popping the user straight back out.
+    _MIN_PROXY_SECONDS = 0.5
+
     def attach(self, node: str, session: str) -> bool:
-        """Try to attach using a warm slave. Returns True if the proxy ran
-        (the user's terminal was handed over and they've now detached);
-        False if no warm slave was available — caller should fall back."""
+        """Try to attach using a warm slave. Returns True if the proxy ran a
+        real session (the user's terminal was handed over and they've now
+        detached); False if no warm slave was available OR the slave turned
+        out to be stale — caller should fall back to a cold attach."""
         slave = self._take(node)
         if not slave:
             return False
         pid, master_fd = slave
+        ran_real_session = False
         try:
             # Drain whatever the remote bash already printed (welcome
             # banner, prompt, etc.) so the user sees a clean tmux paint.
@@ -198,14 +207,16 @@ class WarmSlavePool:
                 os.write(master_fd, cmd.encode())
             except OSError:
                 return False
+            start = time.monotonic()
             self._proxy(master_fd, pid)
+            ran_real_session = (time.monotonic() - start) >= self._MIN_PROXY_SECONDS
         finally:
             self._reap_child(pid)
             try:
                 os.close(master_fd)
             except OSError:
                 pass
-        return True
+        return ran_real_session
 
     @staticmethod
     def _reap_child(pid: int) -> None:

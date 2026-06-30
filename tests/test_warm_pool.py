@@ -256,11 +256,12 @@ class WarmSlaveAttachReapsChildTests(unittest.TestCase):
         # Replace _proxy with a no-op so we don't actually try to read
         # from fd 0 in the test environment.
         original_proxy = autotmux.WarmSlavePool._proxy
-        autotmux.WarmSlavePool._proxy = staticmethod(lambda fd, child_pid: None)
+        # Simulate a real (non-instant) session so attach reports success;
+        # an instant return now signals a stale slave (see
+        # WarmSlaveStaleFallbackTests).
+        autotmux.WarmSlavePool._proxy = staticmethod(
+            lambda fd, child_pid: time.sleep(0.6))
         try:
-            # The fake ssh stub will exec `cat` after reading our exec line;
-            # we send EOF by writing nothing. Easier: just call attach and
-            # let the stub run.
             ok = pool.attach(self.fake_node, 'whatever')
             self.assertTrue(ok)
         finally:
@@ -275,6 +276,49 @@ class WarmSlaveAttachReapsChildTests(unittest.TestCase):
                 content = f.read()
             self.assertNotIn('zombie', content.lower(),
                              f'attach left zombie process pid={pid}')
+
+
+class WarmSlaveStaleFallbackTests(unittest.TestCase):
+    """A warm slave can pass the local liveness check yet have a dead remote
+    channel. Using it pops the user straight back out. attach() must detect
+    the instant proxy exit and report failure so the caller cold-attaches."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.ctl_dir = os.path.join(self.tmpdir, 'ctl')
+        os.makedirs(self.ctl_dir, exist_ok=True)
+        self.fake_node = 'fake-node-stale'
+        open(os.path.join(self.ctl_dir, f'cm_{self.fake_node}'), 'w').close()
+        self._original_ctl_path = autotmux._ctl_path
+        autotmux._ctl_path = lambda node: os.path.join(self.ctl_dir, f'cm_{node}')
+        self._old_path = os.environ['PATH']
+        bin_dir = _install_ssh_stub(self.tmpdir)
+        os.environ['PATH'] = bin_dir + os.pathsep + os.environ['PATH']
+        self._orig_proxy = autotmux.WarmSlavePool._proxy
+
+    def tearDown(self):
+        autotmux.WarmSlavePool._proxy = self._orig_proxy
+        autotmux._ctl_path = self._original_ctl_path
+        os.environ['PATH'] = self._old_path
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_attach_reports_failure_on_instant_proxy_exit(self):
+        pool = autotmux.WarmSlavePool()
+        pool.warm(self.fake_node)
+        # Dead slave → proxy returns immediately.
+        autotmux.WarmSlavePool._proxy = staticmethod(lambda fd, child_pid: None)
+        self.assertFalse(
+            pool.attach(self.fake_node, 'sess'),
+            "an instant proxy exit must report failure so caller falls back to cold attach")
+
+    def test_attach_reports_success_when_proxy_runs(self):
+        pool = autotmux.WarmSlavePool()
+        pool.warm(self.fake_node)
+        # Live session → proxy runs for a real interval before detach.
+        autotmux.WarmSlavePool._proxy = staticmethod(lambda fd, child_pid: time.sleep(0.6))
+        self.assertTrue(
+            pool.attach(self.fake_node, 'sess'),
+            "a proxy that ran for a real session must report success (no double attach)")
 
 
 class BuildRowsWithLoadTests(unittest.TestCase):
