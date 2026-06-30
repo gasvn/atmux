@@ -489,7 +489,11 @@ class AutotmuxApp(App):
         self._crash_looping = False
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        # No clock: HeaderClock repaints the header every second, which over a
+        # remote/SSH terminal is a constant trickle of redraws even while the
+        # app is idle. Keeping the header static makes an idle atmux silent on
+        # the wire.
+        yield Header()
         with Horizontal(id="upper"):
             yield ClickToAttachDataTable(id="left_pane")
             with VerticalScroll(id="right_pane_scroll"):
@@ -757,11 +761,14 @@ class AutotmuxApp(App):
         self.selected_node = new_node
         self.selected_session = new_sess
         self._selection_changed_at = time.monotonic()
-        # Coalesce bursts of ↑/↓ into a single repaint. The cursor itself
-        # moves immediately; only the right-pane preview waits 30 ms.
+        # Coalesce bursts of ↑/↓ into a single repaint. The cursor moves
+        # immediately (a tiny redraw); the right-pane preview — a whole
+        # screenful of text, expensive to ship over a remote terminal — is
+        # deferred until navigation settles, so holding ↓ doesn't repaint the
+        # preview pane on every step.
         if self._preview_render_timer is not None:
             self._preview_render_timer.stop()
-        self._preview_render_timer = self.set_timer(0.03, self._render_preview_now)
+        self._preview_render_timer = self.set_timer(0.2, self._render_preview_now)
 
     def _render_preview_now(self) -> None:
         self._preview_render_timer = None
