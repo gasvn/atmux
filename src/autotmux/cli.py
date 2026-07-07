@@ -520,6 +520,15 @@ class AutotmuxApp(App):
         self.log_view = self.query_one("#right_pane", Static)
         self.jobs_view = self.query_one("#jobs_panel", Static)
 
+        # The preview pane is a focusable VerticalScroll by default. Take it
+        # OUT of the focus chain so the DataTable is the ONLY focus target:
+        # otherwise a stray click on the (large) right pane, or a Tab, moves
+        # focus there and the arrow keys scroll the preview instead of moving
+        # the session cursor — i.e. "can't move up/down". Mouse-wheel scroll
+        # of the preview still works without focus.
+        self.query_one("#right_pane_scroll").can_focus = False
+        self.table.focus()
+
         self.all_sessions: list = []
         self.selected_node = ""
         self.selected_session = ""

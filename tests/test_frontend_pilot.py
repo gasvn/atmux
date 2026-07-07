@@ -190,6 +190,27 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app._last_structural_sig, sig_before,
                                  "load-only change must not trigger a structural rebuild")
 
+    async def test_preview_pane_not_focusable_so_arrows_always_move_table(self):
+        """The preview pane must stay out of the focus chain. Otherwise a
+        stray click/Tab moves focus there and up/down scroll the preview
+        instead of moving the session cursor ("can't move up/down")."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                chain = [w.id for w in app.screen.focus_chain]
+                self.assertEqual(chain, ['left_pane'],
+                                 "only the DataTable should be focusable")
+                # Even after trying to focus the preview pane, arrows move the table.
+                app.set_focus(app.query_one("#right_pane_scroll"))
+                await pilot.pause()
+                before = app.selected_session
+                await pilot.press("down")
+                await pilot.pause()
+                self.assertNotEqual(app.selected_session, before,
+                                    "down must still move the table cursor")
+
     async def test_missing_state_file_doesnt_crash(self):
         with tempfile.TemporaryDirectory() as td:
             autotmux.STATE_FILE = os.path.join(td, 'missing.json')
