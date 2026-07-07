@@ -60,6 +60,27 @@ def _setup_state(tmpdir):
     return state_path, snap_path
 
 
+class MouseMotionTrackingTests(unittest.TestCase):
+    """Any-motion mouse tracking (1003h) reports an escape sequence per mouse
+    move, which floods a slow/remote (SSH) terminal's input and buries
+    keystrokes — arrow keys feel dead. atmux needs only clicks, so the driver
+    must NOT enable 1003h."""
+
+    def test_driver_omits_any_motion_mouse_tracking(self):
+        app = autotmux.AutotmuxApp()
+        cls = app.get_driver_class()
+        writes = []
+        inst = cls.__new__(cls)          # bypass __init__ (needs a real app/tty)
+        inst._mouse = True
+        inst.write = lambda s: writes.append(s)
+        inst.flush = lambda: None
+        inst._enable_mouse_support()
+        joined = ''.join(writes)
+        self.assertIn('\x1b[?1000h', joined, "click tracking should stay enabled")
+        self.assertNotIn('\x1b[?1003h', joined,
+                         "any-motion mouse tracking must be disabled (it floods SSH input)")
+
+
 class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._saved_launch = autotmux._launch_daemon

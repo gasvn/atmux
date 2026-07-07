@@ -450,7 +450,37 @@ class ClickToAttachDataTable(DataTable):
             self.cursor_coordinate = Coordinate(row_index, column_index)
 
 
+def _make_no_motion_driver(base_cls):
+    """Subclass the platform driver to enable mouse CLICK tracking but NOT
+    any-motion tracking (1003h).
+
+    1003h ("any event mouse") reports an escape sequence for every mouse
+    movement. Over a slow/remote SSH terminal that becomes a torrent of input
+    that buries keystrokes — the classic "arrow keys feel dead / the TUI looks
+    frozen" symptom. atmux only needs clicks (for attach), never hover/motion,
+    so we drop 1003h while keeping 1000h/1006h.
+    """
+    class _NoMotionDriver(base_cls):
+        def _enable_mouse_support(self) -> None:
+            if not getattr(self, '_mouse', True):
+                return
+            write = self.write
+            write("\x1b[?1000h")  # SET_VT200_MOUSE — button press/release
+            write("\x1b[?1015h")  # urxvt extended coordinates
+            write("\x1b[?1006h")  # SGR extended coordinates
+            # Deliberately NOT 1003h (any-motion) — see docstring.
+            self.flush()
+    return _NoMotionDriver
+
+
 class AutotmuxApp(App):
+    def get_driver_class(self):
+        base = super().get_driver_class()
+        try:
+            return _make_no_motion_driver(base)
+        except Exception:
+            return base
+
     CSS = """
     Screen {
         layout: vertical;
@@ -1053,6 +1083,9 @@ def _build_argparser():
     p.add_argument('--version', action='version', version=f'AutoTmux {__version__}')
     p.add_argument('-a', '--attach', metavar='NODE:SESSION',
                    help='Skip the TUI and attach directly to NODE:SESSION.')
+    p.add_argument('--no-mouse', action='store_true',
+                   help='Disable mouse support entirely (keyboard-only). Use '
+                        'over a laggy SSH link if keys still feel unresponsive.')
     return p
 
 
@@ -1061,7 +1094,7 @@ def main():
     if args.attach:
         sys.exit(_direct_attach(args.attach))
     _launch_daemon()
-    AutotmuxApp().run()
+    AutotmuxApp().run(mouse=not args.no_mouse)
 
 
 if __name__ == "__main__":
