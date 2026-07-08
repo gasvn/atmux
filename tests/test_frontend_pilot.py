@@ -232,6 +232,36 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(app.selected_session, before,
                                     "down must still move the table cursor")
 
+    async def test_preview_capture_does_not_steal_terminal_stdin(self):
+        """The live-preview subprocess must NOT inherit the terminal stdin.
+        `ssh host cmd` reads local stdin by default, which eats the user's
+        keystrokes — you have to press keys several times to move."""
+        import asyncio as _a
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                rec = {}
+
+                async def fake_exec(*args, **kwargs):
+                    rec['args'] = args
+                    rec['kwargs'] = kwargs
+                    return object()
+
+                orig = autotmux.asyncio.create_subprocess_exec
+                autotmux.asyncio.create_subprocess_exec = fake_exec
+                try:
+                    await app._spawn_preview_capture('gpu1', 'train')      # remote
+                    self.assertEqual(rec['kwargs'].get('stdin'), _a.subprocess.DEVNULL,
+                                     "remote preview must not read the terminal stdin")
+                    self.assertIn('-n', rec['args'], "ssh -n prevents reading stdin")
+                    await app._spawn_preview_capture('localhost', 'main')  # local
+                    self.assertEqual(rec['kwargs'].get('stdin'), _a.subprocess.DEVNULL,
+                                     "local preview must not read the terminal stdin either")
+                finally:
+                    autotmux.asyncio.create_subprocess_exec = orig
+
     async def test_missing_state_file_doesnt_crash(self):
         with tempfile.TemporaryDirectory() as td:
             autotmux.STATE_FILE = os.path.join(td, 'missing.json')

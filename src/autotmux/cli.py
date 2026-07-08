@@ -842,6 +842,32 @@ class AutotmuxApp(App):
 
     # ── live preview (the ONLY network call in the frontend) ─────────────────
 
+    async def _spawn_preview_capture(self, node: str, sess: str):
+        """Spawn the `tmux capture-pane` fetch for the preview pane.
+
+        CRITICAL: stdin MUST be DEVNULL (and ssh gets -n). `ssh host cmd`
+        reads local stdin by default and forwards it to the remote command,
+        so an inherited terminal stdin makes every 1s preview ssh *eat the
+        user's keystrokes* — you have to press a key several times before one
+        reaches the TUI. DEVNULL/-n keeps the terminal input for the app.
+        """
+        if node == 'localhost':
+            return await asyncio.create_subprocess_exec(
+                'tmux', 'capture-pane', '-p', '-e', '-t', sess,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        ctl = _get_ssh_args(node)
+        return await asyncio.create_subprocess_exec(
+            'ssh', '-n', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
+            *ctl, node,
+            f"tmux capture-pane -p -e -t {shlex.quote(sess)}",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
     async def _preview_loop(self) -> None:
         """Spawn `tmux capture-pane` for the highlighted row.
 
@@ -878,21 +904,7 @@ class AutotmuxApp(App):
 
                 proc = None
                 try:
-                    if node == 'localhost':
-                        proc = await asyncio.create_subprocess_exec(
-                            'tmux', 'capture-pane', '-p', '-e', '-t', sess,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                    else:
-                        ctl = _get_ssh_args(node)
-                        proc = await asyncio.create_subprocess_exec(
-                            'ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
-                            *ctl, node,
-                            f"tmux capture-pane -p -e -t {shlex.quote(sess)}",
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
+                    proc = await self._spawn_preview_capture(node, sess)
                     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=4)
                     content = stdout.decode(errors='replace')
                     # Successful fetch — reset failure counter for this session.
