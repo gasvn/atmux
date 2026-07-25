@@ -166,7 +166,9 @@ class GetNodesAliasingTests(unittest.TestCase):
     def test_expanded_range_nodes_are_independent_dicts(self):
         def fake_check_output(cmd, *a, **k):
             if cmd[0] == 'squeue':
-                return ('node[01-02]|1:00|job|123|part|user|RUNNING|0:30|2|reason\n')
+                # daemon parses on \x1f (a '|' can appear in a job name/reason)
+                return ('node[01-02]\x1f1:00\x1fjob\x1f123\x1fpart\x1fuser'
+                        '\x1fRUNNING\x1f0:30\x1f2\x1freason\n')
             if cmd[0] == 'scontrol':
                 return 'node01\nnode02\n'
             return ''
@@ -180,6 +182,21 @@ class GetNodesAliasingTests(unittest.TestCase):
         nodes['node01']['sessions'] = ['only-node01']
         self.assertNotIn('sessions', nodes['node02'],
                          "mutating one expanded node bled into its sibling")
+
+    def test_pipe_in_job_name_does_not_corrupt_fields(self):
+        # A '|' inside the job name must not shift STATE/job_id (the reason we
+        # switched the squeue delimiter to \x1f).
+        def fake_check_output(cmd, *a, **k):
+            if cmd[0] == 'squeue':
+                return ('node9\x1f1:00\x1fmy|weird|job\x1f123\x1fpart\x1fuser'
+                        '\x1fRUNNING\x1f0:30\x1f1\x1freason\n')
+            return ''
+        with mock.patch('autotmux.daemon.subprocess.check_output', fake_check_output):
+            nodes = d._get_nodes()
+        self.assertIn('node9', nodes)
+        self.assertEqual(nodes['node9']['job_name'], 'my|weird|job')
+        self.assertEqual(nodes['node9']['job_id'], '123')
+        self.assertEqual(nodes['node9']['state'], 'RUNNING')
 
 
 class DaemonSingletonLockTests(unittest.TestCase):

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import pty
+import re
 import select
 import shlex
 import shutil
@@ -38,7 +39,7 @@ import rich.text
 
 from autotmux import __version__
 
-from autotmux import paths
+from autotmux import config, keepalive, paths
 
 STATE_FILE = paths.STATE_FILE
 CTL_DIR = paths.CTL_DIR
@@ -61,6 +62,77 @@ def _get_ssh_args(node: str) -> list:
     if os.path.exists(ctl):
         args += ['-o', f'ControlPath={ctl}']
     return args
+
+
+# ── nested-tmux prefix handling ──────────────────────────────────────────────
+#
+# When atmux itself runs inside tmux and the user attaches ANOTHER tmux session
+# (local or remote), the two servers nest in one terminal. The OUTER tmux eats
+# the prefix (C-b) before the inner one ever sees it, so the inner session's key
+# bindings appear dead while ordinary typing still works. The canonical fix is
+# to make the outer tmux transparent for the duration of the nested attach —
+# prefix None, key-table off, status hidden — so every key (C-b included) flows
+# straight to the inner tmux, with F12 toggling the outer back and forth.
+
+def _tmux(*args) -> None:
+    """Run one tmux control command against the OUTER server (the one named in
+    $TMUX), swallowing all output/errors. No-op when not inside tmux."""
+    tmux_env = os.environ.get('TMUX', '')
+    if not tmux_env:
+        return
+    sock = tmux_env.split(',', 1)[0]
+    try:
+        subprocess.call(['tmux', '-S', sock, *args],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _tmux_step_aside() -> None:
+    """Make the OUTER tmux transparent so a nested tmux we're about to attach
+    receives every key, including the C-b prefix. Also binds F12 (in both the
+    root and the `off` key-tables) to toggle the outer tmux in and out of this
+    transparent state — which doubles as a crash-safety net: even if atmux dies
+    before _tmux_restore() runs, F12 always brings the outer tmux back.
+
+    The `'\\;'` argv tokens are literal escaped semicolons: that is the one form
+    that makes tmux 2.7 bind the whole command list to the key (a bare ';' token
+    ends the bind-key command instead). Verified on tmux 2.7."""
+    S = '\\;'
+    _tmux('bind-key', '-T', 'root', 'F12',
+          'set', 'prefix', 'None', S,
+          'set', 'key-table', 'off', S,
+          'set', 'status', 'off', S,
+          'refresh-client', '-S')
+    _tmux('bind-key', '-T', 'off', 'F12',
+          'set', '-u', 'prefix', S,
+          'set', '-u', 'key-table', S,
+          'set', '-u', 'status', S,
+          'refresh-client', '-S')
+    # Engage transparent mode now.
+    _tmux('set', 'prefix', 'None')
+    _tmux('set', 'key-table', 'off')
+    _tmux('set', 'status', 'off')
+    _tmux('refresh-client', '-S')
+
+
+def _tmux_restore() -> None:
+    """Undo _tmux_step_aside(): hand the outer tmux back its prefix, key-table
+    and status, and drop the F12 toggle bindings. Safe to call redundantly (the
+    user may have already toggled back with F12)."""
+    _tmux('set', '-u', 'prefix')
+    _tmux('set', '-u', 'key-table')
+    _tmux('set', '-u', 'status')
+    _tmux('unbind-key', '-T', 'root', 'F12')
+    _tmux('unbind-key', '-T', 'off', 'F12')
+    _tmux('refresh-client', '-S')
+
+
+def _will_nest_tmux(sess: str) -> bool:
+    """True when attaching `sess` from our current context will nest a tmux
+    inside the outer tmux — i.e. we're inside tmux and the target is a real
+    tmux session (not a plain shell or an offline placeholder)."""
+    return bool(os.environ.get('TMUX')) and sess not in ('<Start Shell>', '<offline>')
 
 
 def read_state() -> dict:
@@ -236,9 +308,19 @@ class WarmSlavePool:
             time.sleep(0.05)
         try:
             os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
         except OSError:
-            pass
+            return
+        # Bounded reap: SIGKILL normally reaps within ms, but a child wedged in
+        # uninterruptible sleep (D-state on a hung NFS/network mount) can't be
+        # reaped even by SIGKILL — never block the caller (which may be the TUI
+        # event loop during attach, or on_unmount at exit) waiting on it.
+        for _ in range(20):
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                    return
+            except OSError:
+                return
+            time.sleep(0.05)
 
     # ── internals ───────────────────────────────────────────────────────────
 
@@ -299,15 +381,28 @@ class WarmSlavePool:
             time.sleep(0.05)
         try:
             os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
         except OSError:
-            pass
+            return
+        # Bounded reap: SIGKILL normally reaps within ms, but a child wedged in
+        # uninterruptible sleep (D-state on a hung NFS/network mount) can't be
+        # reaped even by SIGKILL — never block the caller (which may be the TUI
+        # event loop during attach, or on_unmount at exit) waiting on it.
+        for _ in range(20):
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                    return
+            except OSError:
+                return
+            time.sleep(0.05)
 
     @staticmethod
     def _drain(master_fd: int) -> None:
-        """Read and discard whatever the slave already produced."""
+        """Read and discard whatever the slave already produced. Capped at 2s of
+        wall-clock so a remote that streams output with sub-50ms gaps (tail -f,
+        a chatty login profile) can't loop here forever and hang the attach."""
+        deadline = time.monotonic() + 2.0
         try:
-            while True:
+            while time.monotonic() < deadline:
                 r, _, _ = select.select([master_fd], [], [], 0.05)
                 if master_fd not in r:
                     return
@@ -518,6 +613,7 @@ class AutotmuxApp(App):
         Binding("s", "open_shell", "Shell"),
         Binding("t", "local_shell", "Local Shell"),
         Binding("o", "new_window", "New Window"),
+        Binding("k", "toggle_keepalive", "Keep-alive"),
         Binding("j", "toggle_jobs_view", "Jobs view"),
     ]
 
@@ -562,6 +658,18 @@ class AutotmuxApp(App):
         self.all_sessions: list = []
         self.selected_node = ""
         self.selected_session = ""
+        # Latest daemon state (kept so the keep-alive toggle can look up the
+        # highlighted row's job id/name without another read).
+        self._last_state: dict = {}
+        # (stat-sig, names) cache so we don't re-parse the registry every 5s
+        # refresh (it sits on NFS ~/.config). None sig = file absent.
+        self._ka_reg_cache = (None, set())
+        # Enabled keep-alive job names, refreshed OFF the event loop (the file
+        # is on NFS). _decorate_keepalive reads this stash, never the disk.
+        self._ka_names: set = set()
+        # Job names whose keep-alive enable is mid-flight (scontrol running),
+        # so a double 'k' press can't spawn two conflicting toggles.
+        self._ka_inflight: set = set()
         # Two views: 'long' (squeue -l) and 'pending' (squeue -l --start).
         self.jobs_view_mode = 'long'
         self.snapshots: dict = read_snapshots()
@@ -600,28 +708,51 @@ class AutotmuxApp(App):
             state = await asyncio.to_thread(read_state)
         except Exception:
             state = {}
+        # Refresh the keep-alive name stash OFF the loop too — the registry file
+        # is on NFS ~/.config and _decorate_keepalive must not stat/read it on
+        # the event-loop thread.
+        try:
+            self._ka_names = await asyncio.to_thread(self._ka_registry_names)
+        except Exception:
+            pass
         self._refresh_table(state)
         self._refresh_jobs(state)
 
-    def _update_row_cells(self, i: int, r) -> None:
+    def _update_row_cells(self, i: int, r) -> bool:
         """Update only the volatile cells of row i in place. Display columns
         are NODE0 SESSION1 WIN2 TIME3 CPU4 LOAD5 STATUS6, mapped from the row
-        tuple (node, session, wins, time, status, cpu, load)."""
+        tuple (node, session, wins, time, status, cpu, load). Returns False if
+        any cell write raised (so the caller can avoid caching a sig that
+        doesn't match what's actually on screen)."""
+        ok = True
         for col, val in ((2, r[2]), (3, r[3]), (4, r[5]), (5, r[6]), (6, r[4])):
             coord = Coordinate(i, col)
             try:
                 if self.table.get_cell_at(coord) != val:
                     self.table.update_cell_at(coord, val)
             except Exception:
-                pass
+                ok = False
+        return ok
+
+    # Cap on pre-warmed ssh slaves. Each slave is a persistent `ssh -tt` plus a
+    # held pty master fd, so warming EVERY node in a big allocation (100+ nodes)
+    # would exhaust file descriptors (EMFILE) and put an idle-shell load on every
+    # node. We warm at most this many, always including the selected node.
+    _MAX_WARM = 12
 
     def _dispatch_warm(self, rows) -> None:
-        # Keep an idle ssh slave warm for every node in view — pty.fork off
-        # the main thread so it never blocks the UI. exclusive=True stops
-        # back-to-back refreshes dispatching parallel warm-alls.
-        nodes_in_view = {r[0] for r in rows} - {'localhost'}
+        # Keep an idle ssh slave warm for the nodes most likely to be attached —
+        # pty.fork off the main thread so it never blocks the UI. exclusive=True
+        # stops back-to-back refreshes dispatching parallel warm-alls.
+        nodes_in_view = [r[0] for r in rows if r[0] != 'localhost']
+        # Dedup preserving order; prioritise the currently-selected node.
+        ordered = ([self.selected_node] if self.selected_node in nodes_in_view else [])
+        for n in nodes_in_view:
+            if n not in ordered:
+                ordered.append(n)
+        wanted = set(ordered[:self._MAX_WARM])
         self.run_worker(
-            self._warm_pool_warm_all_async(nodes_in_view),
+            self._warm_pool_warm_all_async(wanted),
             exclusive=True, group='warm-pool',
         )
 
@@ -629,7 +760,9 @@ class AutotmuxApp(App):
         self._maybe_recover_daemon()
         if state is None:
             state = read_state()
+        self._last_state = state
         rows = build_session_rows(state)
+        rows = self._decorate_keepalive(rows, state)
         updated = state.get('updated', '?')
 
         sig = tuple(rows)
@@ -637,7 +770,6 @@ class AutotmuxApp(App):
             # Nothing changed at all — just refresh the subtitle.
             self.sub_title = self._status_subtitle(state, rows, updated)
             return
-        self._last_rows_sig = sig
 
         structural = tuple((r[0], r[1]) for r in rows)
         if (structural == self._last_structural_sig
@@ -647,11 +779,17 @@ class AutotmuxApp(App):
             # of clear()+add_row — the latter resets the cursor and churns
             # RowHighlighted every 5s because the load average ticks constantly.
             self.all_sessions = rows
+            ok = True
             for i, r in enumerate(rows):
-                self._update_row_cells(i, r)
+                ok = self._update_row_cells(i, r) and ok
+            # Only cache the sig if the screen actually matches it — otherwise a
+            # swallowed cell-write failure would stick a stale cell until the
+            # next structural change.
+            self._last_rows_sig = sig if ok else None
             self.sub_title = self._status_subtitle(state, rows, updated)
             self._dispatch_warm(rows)
             return
+        self._last_rows_sig = sig
         self._last_structural_sig = structural
 
         # Structural change — full rebuild. Restore the cursor by
@@ -670,9 +808,68 @@ class AutotmuxApp(App):
                     new_idx = i
                     break
             self.table.move_cursor(row=new_idx)
+            # Reconcile the tracked selection with the row the cursor actually
+            # landed on. move_cursor() emits no RowHighlighted when the numeric
+            # row is unchanged (e.g. the selected session vanished and the
+            # cursor falls back to row 0), which would otherwise leave
+            # selected_node/session pointing at a gone row — so `k`/attach/preview
+            # would act on the wrong job.
+            self.selected_node, self.selected_session = rows[new_idx][0], rows[new_idx][1]
 
         self.sub_title = self._status_subtitle(state, rows, updated)
         self._dispatch_warm(rows)
+
+    # ── keep-alive display ───────────────────────────────────────────────────
+
+    def _ka_registry_names(self) -> set:
+        """Set of job names the user has enabled for keep-alive (from the
+        frontend-owned registry file). Cached on the file's (mtime,size) so an
+        idle TUI doesn't re-parse it on every 5s refresh over NFS."""
+        try:
+            st = os.stat(config.KEEPALIVE_PATH)
+            sig = (st.st_mtime, st.st_size)
+        except OSError:
+            sig = None
+        cached_sig, cached_names = self._ka_reg_cache
+        if sig == cached_sig:
+            return cached_names
+        names = {e.get('job_name') for e in keepalive.load_registry(config.KEEPALIVE_PATH)
+                 if isinstance(e, dict) and e.get('enabled') and e.get('job_name')}
+        self._ka_reg_cache = (sig, names)
+        return names
+
+    @staticmethod
+    def _ka_suffix(ka_state: dict) -> str:
+        """Status text appended to a registered row's STATUS cell."""
+        st = (ka_state or {}).get('state', 'healthy')
+        if st == 'paused':
+            n = (ka_state or {}).get('attempts', 0)
+            return f' · ⚠ keep-alive PAUSED ✕{n}'
+        if st == 'renewing':
+            return ' · ⟳ renewing…'
+        return ' · ⟳ keep-alive'
+
+    def _decorate_keepalive(self, rows, state):
+        """Fold keep-alive marker/status into the STATUS cell of rows whose
+        job is registered. Membership comes from the off-loop name stash
+        (`_ka_names`); live status from the daemon-published `keepalive` block."""
+        reg = self._ka_names
+        if not reg:
+            return rows
+        ka_status = state.get('keepalive', {}) or {}
+        nodes = state.get('nodes', {}) or {}
+        node_job = {n: (nd.get('info', {}) or {}).get('job_name')
+                    for n, nd in nodes.items()}
+        out = []
+        for r in rows:
+            jn = node_job.get(r[0])
+            # Skip placeholder rows — a "OFFLINE · keep-alive" cell would read
+            # as if renewal were happening on an unreachable node.
+            if jn and jn in reg and r[1] not in ('<offline>', '<Start Shell>'):
+                suffix = self._ka_suffix(ka_status.get(jn))
+                r = (r[0], r[1], r[2], r[3], r[4] + suffix, r[5], r[6])
+            out.append(r)
+        return out
 
     @staticmethod
     def _daemon_age_seconds(updated: str):
@@ -720,7 +917,19 @@ class AutotmuxApp(App):
         stale = self._daemon_age_seconds(updated)
         if stale is not None and stale > 30:
             return f"⚠ daemon stale ({stale:.0f}s old) · run `atd status`"
-        return f"{len(rows)} sessions · updated {updated}"
+        # Count real sessions, not <offline>/<Start Shell> placeholder rows.
+        real = sum(1 for r in rows if r[1] not in ('<offline>', '<Start Shell>'))
+        # Surface keep-alive renew/pause here too — during the renewal gap the
+        # job has no node row, so the per-row marker isn't visible.
+        ka = state.get('keepalive', {}) or {}
+        paused = [n for n, s in ka.items() if (s or {}).get('state') == 'paused']
+        renewing = [n for n, s in ka.items() if (s or {}).get('state') == 'renewing']
+        extra = ''
+        if paused:
+            extra = f" · ⚠ keep-alive PAUSED: {', '.join(sorted(paused))}"
+        elif renewing:
+            extra = f" · ⟳ renewing: {', '.join(sorted(renewing))}"
+        return f"{real} sessions · updated {updated}{extra}"
 
     async def _warm_pool_warm_all_async(self, nodes) -> None:
         """pty.fork can be ~10–50ms on a busy login node; off the event loop."""
@@ -890,6 +1099,13 @@ class AutotmuxApp(App):
             # the session — Textual does not restart a dead worker.
             try:
                 await asyncio.sleep(1.0)
+                # Drop expired backoff so the dicts can't grow without bound over
+                # a long session AND a reused (node,sess) name doesn't inherit a
+                # stale 60s backoff from a since-departed job.
+                _now = _time.monotonic()
+                for k in [k for k, t in backoff_until.items() if t <= _now]:
+                    backoff_until.pop(k, None)
+                    timeout_counts.pop(k, None)
                 node = self.selected_node
                 sess = self.selected_session
                 if not node or not sess or sess in ('<Start Shell>', '<offline>'):
@@ -924,7 +1140,10 @@ class AutotmuxApp(App):
                     if proc is not None:
                         try:
                             proc.kill()
-                            await proc.wait()
+                            # Bound the reap: a killed ssh stuck in D-state (hung
+                            # remote NFS/network) would otherwise never return and
+                            # permanently stall this exclusive preview worker.
+                            await asyncio.wait_for(proc.wait(), timeout=2)
                         except Exception:
                             pass
                     n = timeout_counts.get(key, 0) + 1
@@ -940,7 +1159,10 @@ class AutotmuxApp(App):
                     if proc is not None:
                         try:
                             proc.kill()
-                            await proc.wait()
+                            # Bound the reap: a killed ssh stuck in D-state (hung
+                            # remote NFS/network) would otherwise never return and
+                            # permanently stall this exclusive preview worker.
+                            await asyncio.wait_for(proc.wait(), timeout=2)
                         except Exception:
                             pass
                     n = timeout_counts.get(key, 0) + 1
@@ -959,25 +1181,38 @@ class AutotmuxApp(App):
         if not node or not sess or sess == '<offline>':
             return
         used_warm = False
+        # If we're inside tmux and about to nest another tmux (any real session,
+        # local or remote), step the outer tmux aside for the duration of the
+        # attach so the INNER session receives the C-b prefix instead of the
+        # outer one swallowing it (see _tmux_step_aside). The user toggles the
+        # outer tmux back with F12. The restore lives in `finally` so we always
+        # hand the prefix back even if the attach raises or the proxy dies.
+        nest = _will_nest_tmux(sess)
         with self.suspend():
-            if node == 'localhost':
-                if sess == '<Start Shell>':
-                    subprocess.call([os.environ.get('SHELL', '/bin/bash')])
-                else:
-                    subprocess.call(['tmux', 'attach', '-t', sess])
-            elif sess == '<Start Shell>':
-                sys.stdout.write(f"\n[atmux] connecting to {node}…\n")
-                sys.stdout.flush()
-                base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node]
-                subprocess.call(base)
-            else:
-                # Try the pre-warmed ssh slave first — instant if available.
-                used_warm = self._warm_pool.attach(node, sess)
-                if not used_warm:
-                    sys.stdout.write(f"\n[atmux] connecting to {node}:{sess}…\n")
+            if nest:
+                _tmux_step_aside()
+            try:
+                if node == 'localhost':
+                    if sess == '<Start Shell>':
+                        subprocess.call([os.environ.get('SHELL', '/bin/bash')])
+                    else:
+                        subprocess.call(['tmux', 'attach', '-t', sess])
+                elif sess == '<Start Shell>':
+                    sys.stdout.write(f"\n[atmux] connecting to {node}…\n")
                     sys.stdout.flush()
                     base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node]
-                    subprocess.call(base + ['tmux', 'attach', '-t', shlex.quote(sess)])
+                    subprocess.call(base)
+                else:
+                    # Try the pre-warmed ssh slave first — instant if available.
+                    used_warm = self._warm_pool.attach(node, sess)
+                    if not used_warm:
+                        sys.stdout.write(f"\n[atmux] connecting to {node}:{sess}…\n")
+                        sys.stdout.flush()
+                        base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node]
+                        subprocess.call(base + ['tmux', 'attach', '-t', shlex.quote(sess)])
+            finally:
+                if nest:
+                    _tmux_restore()
         # Replace the (now-consumed) warm slave so the next attach is fast too.
         if node != 'localhost' and sess not in ('<Start Shell>',):
             self._warm_pool.warm(node)
@@ -996,8 +1231,90 @@ class AutotmuxApp(App):
                 subprocess.call(base)
 
     async def action_local_shell(self) -> None:
+        # 'autotmux_local' is a tmux session, so inside tmux this nests too.
+        nest = bool(os.environ.get('TMUX'))
         with self.suspend():
-            subprocess.call(['tmux', 'new-session', '-A', '-s', 'autotmux_local'])
+            if nest:
+                _tmux_step_aside()
+            try:
+                subprocess.call(['tmux', 'new-session', '-A', '-s', 'autotmux_local'])
+            finally:
+                if nest:
+                    _tmux_restore()
+
+    async def action_toggle_keepalive(self) -> None:
+        """Toggle keep-alive auto-renew on the highlighted job. One keystroke,
+        zero input: the launch script is auto-detected from `scontrol show job`.
+        Toggling an already-registered job off just removes it."""
+        node, sess = self.selected_node, self.selected_session
+        if not node or node == 'localhost' or sess in ('<Start Shell>', '<offline>'):
+            self.notify('keep-alive needs a remote SLURM session', severity='warning', timeout=4)
+            return
+        info = ((self._last_state.get('nodes', {}) or {}).get(node, {}) or {}).get('info', {}) or {}
+        job_name = info.get('job_name')
+        job_id = info.get('job_id')
+        if not job_name or not job_id or job_id == '-':
+            self.notify('no SLURM job found for this row', severity='warning', timeout=4)
+            return
+        # A detection is already running for this job — ignore the repeat press
+        # so two workers can't race to add-then-remove the same entry.
+        if job_name in self._ka_inflight:
+            return
+        # Read membership fresh off the loop (the stash may still be empty in the
+        # first few seconds after launch, before the timer fills it).
+        self._ka_names = await asyncio.to_thread(self._ka_registry_names)
+        # Already registered → toggle off (no scontrol needed). Registry write
+        # is on NFS, so keep it off the event loop.
+        if job_name in self._ka_names:
+            await asyncio.to_thread(keepalive.toggle_entry,
+                                    config.KEEPALIVE_PATH, job_name, '', '')
+            self._ka_names = await asyncio.to_thread(self._ka_registry_names)
+            self.notify(f'keep-alive OFF · {job_name}', timeout=4)
+            self._refresh_table(self._last_state)
+            return
+        # Detect the launch script off the event loop (scontrol can be slow).
+        self._ka_inflight.add(job_name)
+        self.run_worker(self._enable_keepalive_async(node, job_id, job_name),
+                        exclusive=False, group='keepalive')
+
+    async def _enable_keepalive_async(self, node: str, job_id: str, job_name: str) -> None:
+        try:
+            info = await asyncio.to_thread(self._scontrol_job, job_id)
+            if info is None:
+                self.notify(f'could not read job {job_id} (scontrol)', severity='warning', timeout=4)
+                return
+            cmd = (info.get('command') or '').strip()
+            # '(null)' is what scontrol reports for `sbatch --wrap` jobs (no
+            # script to resubmit); reject rather than register something that
+            # can only ever fail and then pause.
+            if not info.get('batch') or not cmd or cmd == '(null)':
+                self.notify('no batch script for this job — can’t keep alive',
+                            severity='warning', timeout=5)
+                return
+            await asyncio.to_thread(keepalive.toggle_entry, config.KEEPALIVE_PATH,
+                                    job_name, info['command'], info.get('workdir') or '')
+            self._ka_names = await asyncio.to_thread(self._ka_registry_names)
+            self.notify(f'✓ keep-alive ON · {job_name} · will re-run {info["command"]}',
+                        timeout=6)
+            self._refresh_table(self._last_state)
+        finally:
+            self._ka_inflight.discard(job_name)
+
+    @staticmethod
+    def _scontrol_job(job_id: str):
+        """Run `scontrol show job <id>` and parse it. None on failure."""
+        # Only real SLURM job ids: '123', array '123_4', array-range '123_[5-9]'.
+        # Guards against a crafted state value like '-Q' being taken by scontrol
+        # as an option (argv injection) rather than a job id.
+        if not re.match(r'^\d+(_\d+|_\[[0-9,\-]+\])?$', str(job_id)):
+            return None
+        try:
+            out = subprocess.check_output(
+                ['scontrol', 'show', 'job', str(job_id)],
+                universal_newlines=True, stderr=subprocess.DEVNULL, timeout=8)
+        except Exception:
+            return None
+        return keepalive.parse_scontrol(out)
 
     async def on_unmount(self) -> None:
         # Tear down warm slaves so we don't leave orphan ssh processes.
@@ -1017,6 +1334,11 @@ class AutotmuxApp(App):
             cmd = base if sess == '<Start Shell>' else base + ['tmux', 'attach', '-t', shlex.quote(sess)]
 
         if os.environ.get('TMUX'):
+            # Deliberately NOT stepping the outer tmux aside here (unlike
+            # action_attach_session): new-window keeps atmux alive in its own
+            # sibling window, and the transparent-outer trick is session-wide —
+            # it would blank atmux's own window and hide the status bar globally.
+            # A nested session opened this way still needs C-b C-b for its prefix.
             wname = f"{node}-{sess}" if sess != '<Start Shell>' else f"{node}-shell"
             subprocess.call(['tmux', 'new-window', '-n', wname, *cmd],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -14,6 +14,22 @@ CONFIG_PATH = os.environ.get(
     os.path.expanduser('~/.config/autotmux/config.toml'),
 )
 
+# The keep-alive intent registry (written by the TUI, read by the daemon).
+# Persistent, sits next to config.toml. Env override is for tests.
+KEEPALIVE_PATH = os.environ.get(
+    'AUTOTMUX_KEEPALIVE',
+    os.path.expanduser('~/.config/autotmux/keepalive.json'),
+)
+
+# Keep-alive auto-renew tunables (the [keepalive] table).
+KEEPALIVE_DEFAULTS = {
+    'enabled': True,        # master switch for the whole feature
+    'lead_time': 900,       # seconds before expiry to submit the replacement
+    'cooldown': 600,        # seconds to suppress re-submit after a submit
+    'max_failures': 3,      # consecutive failed submits before pausing an entry
+    'submit_timeout': 60,   # seconds to wait for sbatch to return
+}
+
 # Defaults mirror the current daemon.py constants exactly.
 DEFAULTS = {
     'squeue_interval': 30,
@@ -60,4 +76,41 @@ def load() -> dict:
             cfg[k] = v
         else:
             log.warning(f'ignoring unknown/invalid config key: {k!r}')
+    return cfg
+
+
+def load_keepalive() -> dict:
+    """Return KEEPALIVE_DEFAULTS merged with the [keepalive] table from
+    CONFIG_PATH. Never raises. `enabled` is a bool; the rest are numeric."""
+    cfg = dict(KEEPALIVE_DEFAULTS)
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            return cfg
+    if not os.path.exists(CONFIG_PATH):
+        return cfg
+    try:
+        with open(CONFIG_PATH, 'rb') as f:
+            data = tomllib.load(f)
+    except Exception as e:
+        log.warning(f'failed to parse {CONFIG_PATH}: {e}; using keepalive defaults')
+        return cfg
+    section = data.get('keepalive', {})
+    for k, v in section.items():
+        if k == 'enabled' and isinstance(v, bool):
+            cfg[k] = v
+        elif k in cfg and k != 'enabled' and isinstance(v, (int, float)) and not isinstance(v, bool):
+            cfg[k] = v
+        else:
+            log.warning(f'ignoring unknown/invalid keepalive key: {k!r}')
+    # Sanity floors: a typo must not turn keep-alive into a runaway submitter or
+    # a dead-on-arrival entry. max_failures>=1 (0 would pause before ever
+    # submitting); submit_timeout>=1; the rest just can't be negative.
+    cfg['max_failures'] = max(1, int(cfg['max_failures']))
+    cfg['submit_timeout'] = max(1, int(cfg['submit_timeout']))
+    cfg['cooldown'] = max(0, int(cfg['cooldown']))
+    cfg['lead_time'] = max(0, int(cfg['lead_time']))
     return cfg

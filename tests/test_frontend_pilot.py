@@ -328,5 +328,91 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLessEqual(len(app._rendered_cache), 64)
 
 
+KA_STATE = {
+    'updated': '2026-01-01 00:00:00',
+    'nodes': {
+        'gpu1': {
+            'alive': True,
+            'socket': '/tmp/whatever',
+            'info': {'time': '1-00:00:00', 'state': 'RUNNING',
+                     'job_name': 'train_job', 'job_id': '999'},
+            'sessions': [['train', '1']],
+            'last_error': '',
+        },
+    },
+    'keepalive': {},
+}
+
+
+class KeepAliveToggleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved_launch = autotmux._launch_daemon
+        autotmux._launch_daemon = lambda: None
+        self._saved_ka_path = autotmux.config.KEEPALIVE_PATH
+
+    def tearDown(self):
+        autotmux._launch_daemon = self._saved_launch
+        autotmux.config.KEEPALIVE_PATH = self._saved_ka_path
+
+    async def test_k_toggles_registry_and_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_path = os.path.join(td, 'state.json')
+            with open(state_path, 'w') as f:
+                json.dump(KA_STATE, f)
+            autotmux.STATE_FILE = state_path
+            autotmux.SNAPSHOT_FILE = os.path.join(td, 'snap.json')
+            with open(autotmux.SNAPSHOT_FILE, 'w') as f:
+                json.dump({}, f)
+            ka_path = os.path.join(td, 'keepalive.json')
+            autotmux.config.KEEPALIVE_PATH = ka_path
+
+            app = autotmux.AutotmuxApp()
+            # Avoid real scontrol — pretend it's a batch job.
+            app._scontrol_job = lambda jid: {
+                'batch': True, 'command': '/home/x/train_job',
+                'workdir': '/home/x', 'job_name': 'train_job'}
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertEqual(app.selected_node, 'gpu1')
+                # Toggle ON
+                await pilot.press('k')
+                for _ in range(20):
+                    await pilot.pause()
+                    if autotmux.keepalive.load_registry(ka_path):
+                        break
+                entries = autotmux.keepalive.load_registry(ka_path)
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]['job_name'], 'train_job')
+                self.assertEqual(entries[0]['command'], '/home/x/train_job')
+                # Marker shows in the decorated STATUS cell.
+                row = [r for r in app.all_sessions if r[1] == 'train'][0]
+                self.assertIn('keep-alive', row[4])
+                # Toggle OFF
+                await pilot.press('k')
+                await pilot.pause()
+                self.assertEqual(autotmux.keepalive.load_registry(ka_path), [])
+
+    async def test_k_on_localhost_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_path = os.path.join(td, 'state.json')
+            with open(state_path, 'w') as f:
+                json.dump(SYNTH_STATE, f)
+            autotmux.STATE_FILE = state_path
+            autotmux.SNAPSHOT_FILE = os.path.join(td, 'snap.json')
+            with open(autotmux.SNAPSHOT_FILE, 'w') as f:
+                json.dump({}, f)
+            ka_path = os.path.join(td, 'keepalive.json')
+            autotmux.config.KEEPALIVE_PATH = ka_path
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                # Move to the localhost row and press k — must not register.
+                app.selected_node = 'localhost'
+                app.selected_session = 'main'
+                await app.action_toggle_keepalive()
+                await pilot.pause()
+                self.assertEqual(autotmux.keepalive.load_registry(ka_path), [])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
