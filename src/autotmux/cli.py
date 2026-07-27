@@ -1350,6 +1350,33 @@ class AutotmuxApp(App):
 
 
 def _daemon_running() -> bool:
+    """Is a daemon alive?
+
+    Authoritative check first: the daemon holds an exclusive flock on
+    PID_FILE+'.lock' for its whole lifetime. The pid file itself is only
+    advisory and can vanish while the daemon still runs — systemd wipes
+    XDG_RUNTIME_DIR when the last login session ends, but the daemon is
+    reparented to init and survives. Trusting only the pid file made the
+    frontend declare a live daemon dead and enter an unwinnable restart loop
+    (the singleton lock blocks the new start), stalling the UI. If we cannot
+    take the lock, a daemon holds it → alive."""
+    lock_file = PID_FILE + '.lock'
+    if os.path.exists(lock_file):
+        try:
+            fd = os.open(lock_file, os.O_RDWR)
+        except OSError:
+            fd = None
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # We took it → nobody holds it. Release and fall through to the
+                # advisory pid-file check.
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                return True          # someone holds the lock → daemon alive
+            finally:
+                os.close(fd)
+    # Lock free or absent — fall back to the advisory pid file.
     try:
         with open(PID_FILE) as f:
             pid = int(f.read().strip())
@@ -1383,7 +1410,11 @@ def _launch_daemon() -> None:
     atd = shutil.which('atd')
     cmd = [atd, 'start'] if atd else [sys.executable, '-m', 'autotmux.daemon', 'start']
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # `atd start` daemonizes and returns promptly; the timeout is a safety
+        # net so a wedged start can never hang the recovery worker (and with it
+        # the UI). Timed-out/failed launches just retry on the next tick.
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=15)
     except Exception:
         pass
 

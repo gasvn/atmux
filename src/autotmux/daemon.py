@@ -981,6 +981,26 @@ def _acquire_singleton_lock() -> bool:
     return True
 
 
+def _lock_held() -> bool:
+    """True if a live daemon holds the singleton flock. Authoritative even when
+    the advisory pid file has vanished (systemd cleaning XDG_RUNTIME_DIR between
+    logins while the daemon, reparented to init, keeps running)."""
+    if not os.path.exists(LOCK_FILE):
+        return False
+    try:
+        fd = os.open(LOCK_FILE, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False   # we took it → nobody holds it
+    except OSError:
+        return True    # held by a live daemon
+    finally:
+        os.close(fd)
+
+
 def _write_pid():
     with open(PID_FILE, 'w') as f:
         f.write(str(os.getpid()))
@@ -1223,7 +1243,9 @@ def cmd_stop():
 
 def cmd_status(as_json: bool = False):
     pid = _read_pid()
-    running = pid is not None and _pid_running(pid)
+    # The flock is authoritative; the pid file is advisory and may be missing
+    # under a live daemon (see _lock_held).
+    running = _lock_held() or (pid is not None and _pid_running(pid))
 
     if as_json:
         # Re-emit the daemon's state file, plus our own running/pid state.
