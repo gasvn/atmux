@@ -35,7 +35,7 @@ from logging.handlers import RotatingFileHandler
 _UID = os.getuid()
 _USER = os.environ.get('USER', str(_UID))
 
-from autotmux import __version__, config, paths
+from autotmux import __version__, config, keepalive, paths
 
 CTL_DIR   = paths.CTL_DIR
 PID_FILE  = paths.PID_FILE
@@ -62,6 +62,11 @@ if not log.handlers:
     log.addHandler(_handler)
 
 _cfg = config.load()
+
+# Keep-alive auto-renew: reads the TUI-written registry, resubmits `占坑`
+# batch scripts before their allocation expires. Driven from _squeue_loop.
+_keepalive_mgr = keepalive.KeepAliveManager(config.KEEPALIVE_PATH,
+                                            config.load_keepalive())
 
 # ── tunables (overridable via ~/.config/autotmux/config.toml) ───────────────
 SQUEUE_INTERVAL       = _cfg['squeue_interval']
@@ -430,6 +435,11 @@ def _cleanup_gone_node(node: str) -> None:
     _backoff_clear(node)
     _streak_clear(node)
     _kill_master(node)  # also wipes _master_procs entry via _kill_orphan_master_proc
+    # Drop the per-node master lock too, else _node_master_locks grows one entry
+    # per distinct node ever seen and never shrinks (a slow leak on a cluster
+    # where jobs churn across many hosts over days).
+    with _lock:
+        _node_master_locks.pop(node, None)
 
 
 # ── node discovery ────────────────────────────────────────────────────────────
@@ -449,15 +459,20 @@ def _get_nodes() -> dict:
         }
     }
     try:
+        # \x1f (ASCII unit separator) delimits fields — a plain '|' can appear
+        # inside a job name (%j) or reason (%R) and would shift every later
+        # field (e.g. STATUS would show the username). Job names can't contain
+        # control chars, so \x1f is collision-proof.
         out = subprocess.check_output(
-            ['squeue', '-u', _USER, '-h', '-o', '%N|%L|%j|%i|%P|%u|%T|%M|%D|%R'],
+            ['squeue', '-u', _USER, '-h', '-o',
+             '%N\x1f%L\x1f%j\x1f%i\x1f%P\x1f%u\x1f%T\x1f%M\x1f%D\x1f%R'],
             universal_newlines=True, timeout=SQUEUE_TIMEOUT,
         )
         for line in out.splitlines():
             line = line.strip()
             if not line:
                 continue
-            parts = line.split('|', 9)
+            parts = line.split('\x1f', 9)
             if len(parts) < 10:
                 continue
             node_part = parts[0]
@@ -484,8 +499,12 @@ def _get_nodes() -> dict:
                             # per-node sessions/load overwrite every sibling.
                             nodes[n.strip()] = dict(info)
                 except Exception:
-                    nodes[node_part] = info
-            else:
+                    # scontrol unavailable — don't insert the raw bracket/comma
+                    # expression as a "node": it can never be ssh'd or probed,
+                    # so it would sit on the dashboard as a permanent phantom
+                    # offline node masking the real hosts. Drop it instead.
+                    log.warning(f'could not expand nodelist {node_part!r}; skipping')
+            elif HOST_EXPR_RE.match(node_part):
                 nodes[node_part] = info
     except Exception as e:
         log.warning(f'squeue error: {e}')
@@ -600,9 +619,14 @@ def _squeue_loop():
             with _lock:
                 # Preserve fields that come from _session_loop (sessions,
                 # nproc, load, last_error) — squeue doesn't know about them
-                # and we don't want to wipe them every 30 s.
+                # and we don't want to wipe them every 30 s. But ONLY when the
+                # same job still holds the node: if a node name is reused by a
+                # NEW job (job_id changed), carrying the old job's sessions/load
+                # would show another job's data until the next session pass.
                 for node, info in node_infos.items():
                     old = _known_nodes_info.get(node, {})
+                    if old.get('job_id') != info.get('job_id'):
+                        continue
                     for key in ('sessions', 'nproc', 'load', 'last_error'):
                         if key in old:
                             info[key] = old[key]
@@ -650,6 +674,9 @@ def _squeue_loop():
                 _squeue_text['long'] = long_text
                 _squeue_text['pending'] = pending_text
                 _squeue_text['updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            # Keep-alive: resubmit expiring `占坑` scripts. Runs outside _lock;
+            # submits are threaded so a slow sbatch never stalls polling.
+            _drive_keepalive()
             _write_status()
         except Exception:
             log.exception('squeue_loop iteration failed')
@@ -796,6 +823,43 @@ def _snapshot_loop():
             return
 
 
+def _keepalive_job_rows() -> list:
+    """Every job for the user (name|state|time_left), INCLUDING pending ones.
+
+    We can't reuse the node map from _get_nodes(): it's keyed by assigned node
+    and drops rows with no nodelist — i.e. every PENDING job. Keep-alive must
+    see pending replacements (a just-submitted job sits queued for minutes),
+    otherwise it can't tell a replacement is already on the way and would
+    resubmit on every poll."""
+    out = subprocess.check_output(
+        ['squeue', '-u', _USER, '-h', '-o', '%i\x1f%j\x1f%T\x1f%L'],
+        universal_newlines=True, timeout=SQUEUE_TIMEOUT,
+    )
+    rows = []
+    for line in out.splitlines():
+        parts = line.split('\x1f')   # \x1f: a '|' can appear inside a job name
+        if len(parts) >= 4:
+            # id/state/time_left never contain the delimiter; only the name
+            # (%j) conceivably could, so anchor on the ends and treat the
+            # middle as the name — a stray delimiter in a name can't shift it.
+            rows.append({'id': parts[0].strip(),
+                         'name': '\x1f'.join(parts[1:-2]).strip(),
+                         'state': parts[-2].strip(),
+                         'time_left': parts[-1].strip()})
+    return rows
+
+
+def _drive_keepalive() -> None:
+    """Feed this poll's jobs to the renewal manager. Only queries squeue when
+    there's actually an enabled entry. Failures must never break polling."""
+    try:
+        if not _keepalive_mgr.poll_needed():
+            return
+        _keepalive_mgr.tick(_keepalive_job_rows())
+    except Exception:
+        log.exception('keep-alive tick failed')
+
+
 def _write_status():
     """Write a JSON status snapshot for the `status` command and the frontend."""
     # Take a deep-ish snapshot under the lock so json.dump can't race with
@@ -812,7 +876,14 @@ def _write_status():
         squeue_long = _squeue_text.get('long', '')
         squeue_pending = _squeue_text.get('pending', '')
         squeue_updated = _squeue_text.get('updated', '')
-    # _master_alive can take seconds (spawns ssh) — do it OUTSIDE the lock.
+    # 'alive' here is a cheap socket-presence check (localhost is always up),
+    # NOT a live `ssh -O check` per node. Doing an ssh probe per node on every
+    # state write — called from three loops — made a large allocation (100+
+    # nodes with wedged sockets) spend minutes here and stall the loops. The
+    # health loop owns real liveness: it deep-probes and unlinks dead sockets,
+    # so socket-presence tracks reality within one HEALTH_INTERVAL.
+    def _alive(n):
+        return n == 'localhost' or os.path.exists(_ctl_path(n))
     status = {
         'pid': os.getpid(),
         'user': _USER,
@@ -822,12 +893,13 @@ def _write_status():
         'squeue_updated': squeue_updated,
         'nodes': {
             n: {
-                'alive': _master_alive(n),
+                'alive': _alive(n),
                 'socket': _ctl_path(n) if n != 'localhost' else '',
                 **snap,
             }
             for n, snap in snapshot.items()
-        }
+        },
+        'keepalive': _keepalive_mgr.status(),
     }
     try:
         _atomic_write_json(STAT_FILE, status)
@@ -909,6 +981,26 @@ def _acquire_singleton_lock() -> bool:
     return True
 
 
+def _lock_held() -> bool:
+    """True if a live daemon holds the singleton flock. Authoritative even when
+    the advisory pid file has vanished (systemd cleaning XDG_RUNTIME_DIR between
+    logins while the daemon, reparented to init, keeps running)."""
+    if not os.path.exists(LOCK_FILE):
+        return False
+    try:
+        fd = os.open(LOCK_FILE, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False   # we took it → nobody holds it
+    except OSError:
+        return True    # held by a live daemon
+    finally:
+        os.close(fd)
+
+
 def _write_pid():
     with open(PID_FILE, 'w') as f:
         f.write(str(os.getpid()))
@@ -928,6 +1020,19 @@ def _pid_running(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _is_our_daemon(pid: int) -> bool:
+    """True only if `pid` looks like an autotmux daemon we own. Guards stop/kill
+    against a stale or attacker-planted PID file (see paths._secure_dir): a
+    reused PID could otherwise make `atd stop` SIGKILL an unrelated process."""
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            cmdline = f.read().replace(b'\x00', b' ')
+    except OSError:
+        # No /proc (non-Linux) — fall back to liveness only.
+        return _pid_running(pid)
+    return b'autotmux.daemon' in cmdline or b'autotmux/daemon' in cmdline or b'atd' in cmdline
 
 
 _session_semaphore = threading.Semaphore(12)
@@ -965,7 +1070,10 @@ def _session_loop():
                 remote_script = (
                     "tmux list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null;"
                     " echo '---NODEINFO---';"
-                    " nproc 2>/dev/null;"
+                    # `|| echo '?'` keeps nproc on its OWN line even when it
+                    # fails, so the positional parse below can't slide the load
+                    # average into the nproc (CPU) slot.
+                    " (nproc 2>/dev/null || echo '?');"
                     " uptime | sed -n 's/.*load average: //p';"
                     " exit 0"
                 )
@@ -1109,6 +1217,16 @@ def cmd_stop():
         except OSError:
             pass
         return
+    if not _is_our_daemon(pid):
+        # PID file points at something that isn't our daemon (stale/reused PID
+        # or a planted file) — refuse to signal it.
+        print(f'[autotmux_daemon] pid {pid} is not an autotmux daemon — '
+              'refusing to kill it; removing stale pid file.')
+        try:
+            os.unlink(PID_FILE)
+        except OSError:
+            pass
+        return
     os.kill(pid, signal.SIGTERM)
     for _ in range(20):
         time.sleep(0.5)
@@ -1125,7 +1243,9 @@ def cmd_stop():
 
 def cmd_status(as_json: bool = False):
     pid = _read_pid()
-    running = pid is not None and _pid_running(pid)
+    # The flock is authoritative; the pid file is advisory and may be missing
+    # under a live daemon (see _lock_held).
+    running = _lock_held() or (pid is not None and _pid_running(pid))
 
     if as_json:
         # Re-emit the daemon's state file, plus our own running/pid state.
