@@ -1449,9 +1449,30 @@ def _build_argparser():
     p.add_argument('-a', '--attach', metavar='NODE:SESSION',
                    help='Skip the TUI and attach directly to NODE:SESSION.')
     p.add_argument('--no-mouse', action='store_true',
-                   help='Disable mouse support entirely (keyboard-only). Use '
-                        'over a laggy SSH link if keys still feel unresponsive.')
+                   help='Force keyboard-only (no mouse tracking). This is the '
+                        'default over SSH.')
+    p.add_argument('--mouse', action='store_true',
+                   help='Force-enable mouse (click-to-attach) even over SSH. '
+                        'Off by default over SSH because mouse-report traffic '
+                        'competes with keystrokes and can make arrow keys feel '
+                        'dead on a remote/loaded terminal.')
     return p
+
+
+def _is_remote_session() -> bool:
+    """True when we're on the far end of an SSH connection. Mouse tracking makes
+    the terminal stream a burst of report bytes on every move/scroll, which over
+    SSH (especially into a loaded login node) buries keystrokes and makes arrow
+    keys feel dead — so we default mouse OFF here."""
+    return bool(os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY'))
+
+
+def _want_mouse(args) -> bool:
+    if args.no_mouse:
+        return False
+    if args.mouse:
+        return True
+    return not _is_remote_session()   # on locally, off over SSH
 
 
 def main():
@@ -1459,7 +1480,7 @@ def main():
     if args.attach:
         sys.exit(_direct_attach(args.attach))
     _launch_daemon()
-    AutotmuxApp().run(mouse=not args.no_mouse)
+    AutotmuxApp().run(mouse=_want_mouse(args))
 
 
 if __name__ == "__main__":
