@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,18 +44,24 @@ class SecureDirTests(unittest.TestCase):
 
 class ScontrolJobIdGuardTests(unittest.TestCase):
     def test_rejects_non_numeric_without_calling_scontrol(self):
-        with mock.patch('autotmux.cli.subprocess.check_output') as m:
+        with mock.patch('autotmux.cli._hard_subprocess_run') as m:
             for bad in ('-Q', '--yaml', 'abc', '1;2', '', '../x'):
                 self.assertIsNone(autotmux.AutotmuxApp._scontrol_job(bad))
             m.assert_not_called()
 
     def test_accepts_valid_ids(self):
         sample = "JobId=5 JobName=j\n   BatchFlag=1\n   Command=/x\n   WorkDir=/w\n"
-        with mock.patch('autotmux.cli.subprocess.check_output', return_value=sample):
+        result = SimpleNamespace(returncode=0, stdout=sample)
+        with mock.patch('autotmux.cli._hard_subprocess_run', return_value=result):
             for good in ('123', '123_4', '123_[5-9]'):
                 r = autotmux.AutotmuxApp._scontrol_job(good)
                 self.assertIsNotNone(r)
                 self.assertEqual(r['command'], '/x')
+
+    def test_nonzero_scontrol_status_is_a_clean_detection_failure(self):
+        result = SimpleNamespace(returncode=1, stdout='')
+        with mock.patch('autotmux.cli._hard_subprocess_run', return_value=result):
+            self.assertIsNone(autotmux.AutotmuxApp._scontrol_job('123'))
 
 
 if __name__ == '__main__':

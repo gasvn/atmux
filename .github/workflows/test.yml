@@ -24,6 +24,6 @@ jobs:
           pip install -e .
       - name: Run unit tests
         # Discovery is scoped to tests/ so stray scratch files at the repo
-        # root can never poison the run. Integration tests skip themselves
-        # when atd/squeue/ssh aren't on PATH.
+        # root can never poison the run. OS-mutating integration tests require
+        # an explicit isolated-runtime opt-in and therefore skip in CI.
         run: python -m unittest discover -s tests -t . -v

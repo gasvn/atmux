@@ -33,13 +33,17 @@ interactive (`salloc`/`srun`, `BatchFlag=0`) jobs.
 
 ## Identity
 
-A keep-alive entry is keyed by **job name** (`squeue %j`, `scontrol JobName=`),
-because JobID and node change on every renewal but the name (set by the user's
-`#SBATCH --job-name`) is stable. The daemon keeps ≥1 live job of that name.
+Each current keep-alive entry has an internal UUID and tracks one concrete
+**Slurm JobID family**. Array elements (`123_4`) and heterogeneous components
+(`123+1`) normalize to their leading allocation family (`123`). Job name is
+display metadata, not identity, so two independent jobs named `h100x2` can be
+enabled, renewed, and disabled independently.
 
-Known limitation: if the user runs several distinct jobs with the *same* name,
-"keep exactly one alive" degrades to "keep at least one alive" — acceptable and
-documented, not solved by per-JobID tracking.
+After a successful submit, the daemon atomically advances that UUID's tracked
+JobID to the replacement returned by `sbatch --parsable`. The UUID stays stable
+across every renewal. Name-only entries written by older releases remain
+supported as a migration fallback; only those legacy entries retain name-wide
+matching until the user toggles them off and on again.
 
 ## Auto-detecting the launch script (zero input)
 
@@ -54,24 +58,37 @@ On toggle, atmux runs `scontrol show job <jobid>` and extracts:
 Both `Command` and `WorkDir` are captured **at toggle time** and stored in the
 registry, so renewal still works after the old job ages out of `scontrol`.
 
-Renewal command: `sbatch <Command...>` run with `cwd=<WorkDir>`. It must be
-`sbatch` (not `bash`) — the script carries `#SBATCH` directives and an
-infinite-loop body; running it directly on the login node would be wrong.
-`Command` is split with `shlex` to preserve any arguments.
+Renewal command: `sbatch --parsable -- <Command...>` run with
+`cwd=<WorkDir>`. The `--` keeps an option-looking script path from being parsed
+as an `sbatch` option. It must be `sbatch` (not `bash`) — the script carries
+`#SBATCH` directives and an infinite-loop body; running it directly on the
+login node would be wrong. `Command` is split with `shlex` to preserve any
+arguments.
 
 ## Architecture & data flow
 
-Two files, no cross-process write races:
+Two files, with registry writers serialized by a bounded cross-process lock:
 
 1. **Intent registry** — `~/.config/autotmux/keepalive.json` (persistent,
    alongside `config.toml`; NFS-safe since it is a plain file, not a socket).
-   **Only the TUI writes it**, atomically. The daemon reads it each `squeue`
-   poll (re-read when mtime changes).
+   The TUI writes opt-in intent; after a successful renewal the daemon updates
+   the same entry's replacement JobID and submit timestamps. Both use atomic
+   replace under the registry lock. The daemon re-reads when file metadata
+   changes.
+
+   Before submitting, a daemon atomically claims that entry with a unique
+   owner token and a bounded lease under the same lock. This is stronger than
+   an in-process `in_flight` bit: two daemons on different login hosts sharing
+   the registry cannot both launch the same replacement. Completion is applied
+   only by the matching claim owner, so a late result cannot overwrite a newer
+   claim.
 
    ```json
    {
      "entries": [
        {
+         "entry_id": "74edecfdcce9492f9a21ee1f41025439",
+         "job_id": "12345678",
          "job_name": "h100x1",
          "command": "/n/home12/shgao/h100x1",
          "workdir": "/n/home12/shgao",
@@ -87,40 +104,53 @@ Two files, no cross-process write races:
 
    ```json
    "keepalive": {
-     "h100x1": {
+     "74edecfdcce9492f9a21ee1f41025439": {
        "state": "healthy | renewing | paused | expiring",
        "attempts": 0,
        "last_submit": "2026-07-22 10:00:00",
-       "last_error": ""
+       "last_error": "",
+       "entry_id": "74edecfdcce9492f9a21ee1f41025439",
+       "job_id": "12345678",
+       "job_name": "h100x1"
      }
    }
    ```
 
-The frontend stays passive: it edits intent and displays status; the daemon
-performs all active work (scontrol/sbatch).
+The frontend edits intent, performs the one explicit `scontrol` lookup on a
+keypress, and displays status. The daemon owns periodic squeue checks and every
+`sbatch` renewal.
 
 ## Daemon renewal logic
 
 Runs inside the existing `_squeue_loop`, after the squeue parse, once per poll.
-For each `enabled` entry `(name N, command C, workdir W)`:
+For each enabled entry `(UUID U, tracked JobID J, name N, command C, workdir W)`:
 
-1. `matching` = squeue jobs with `JobName == N`.
+1. `matching` = squeue jobs in JobID family `J`. A name-only legacy entry uses
+   `JobName == N` instead.
 2. A matching job is **fresh** if its state is `PENDING` **or**
    `time_left_seconds > lead_time`.
 3. If the entry is **paused** (`attempts >= max_failures`): skip until re-armed
    (user toggles off then on).
-4. If any `matching` job is fresh → `state = healthy`, `attempts = 0`, clear
-   cooldown. (A queued replacement counts as fresh — this is what prevents
-   double-submission.)
+4. If any `matching` job is fresh → `state = healthy`, `attempts = 0`. Preserve
+   the cooldown timestamp so a brief controller-visibility flap cannot cause a
+   duplicate submit. A queued replacement counts as fresh.
 5. Else (all matching are `RUNNING` with `time_left <= lead_time`, **or**
    `matching` is empty):
    - If still within `cooldown` of `last_submit` → `state = renewing`, skip.
-   - Otherwise **submit**: `sbatch shlex.split(C)` with `cwd=W`,
-     `timeout=submit_timeout`, output captured to the daemon log. Set
-     `last_submit = now`, `attempts += 1`, `state = renewing`. A non-zero exit,
-     timeout, or unparseable sbatch output counts as a failed attempt (does not
-     reset `attempts`).
-   - When a fresh job subsequently appears → back to `healthy`, `attempts = 0`.
+   - Otherwise atomically acquire the entry's shared submit claim. If another
+     host owns an unexpired claim, persist its defer window locally and skip.
+   - The claim owner **submits** with
+     `sbatch --parsable -- shlex.split(C)`, `cwd=W`, and
+     `timeout=submit_timeout`; output is captured to the daemon log. Set
+     `last_submit = now`, `state = renewing`; a non-zero exit, timeout, or
+     unparseable sbatch output increments `attempts`. Local command-capacity
+     exhaustion is not an attempt and does not start a cooldown.
+   - A timeout or transport/parse ambiguity still persists the cooldown before
+     releasing the claim. `sbatch` may have accepted the job before its reply
+     was lost, so immediate retry would risk a duplicate allocation.
+   - On success, persist the returned replacement JobID and submit timestamps
+     under UUID `U`; this preserves identity and cooldown across daemon restarts.
+   - When that replacement appears → back to `healthy`, `attempts = 0`.
    - When `attempts >= max_failures` with no fresh job → `state = paused` and a
      TUI banner is surfaced.
 
@@ -139,16 +169,16 @@ empty → `None` (skip the entry that poll; can't decide safely).
 - New binding **`k`** = toggle keep-alive on the highlighted session's job.
 - **`k` on an unregistered batch job** → run `scontrol show job`, capture
   `Command`/`WorkDir`/`JobName`, write the entry, footer toast:
-  `✓ keep-alive ON · <name> · will re-run <script> when it expires`.
-- **`k` on a registered job** → remove the entry, toast `keep-alive OFF · <name>`.
-- **`k` on an interactive job** (`BatchFlag=0`) or a row with no job
-  (localhost / `<Start Shell>` / `<offline>`) → toast
+  `✓ keep-alive ON · <name> #<jobid> · will re-run <script> when it expires`.
+- **`k` on a registered job** → remove only that UUID, toast
+  `keep-alive OFF · <name> #<jobid>`.
+- **`k` on an interactive job** (`BatchFlag=0`) or a row with no Slurm job
+  (localhost) → toast
   `no batch script for this job — can't keep alive`; nothing registered.
-- A single-glyph **`⟳`** marker on registered rows; status folded into the
-  STATUS column (`keep-alive`, `renew≤15m`, `PAUSED ✕3`). Glyphs are
-  single-width and render under tmux 2.7; an ASCII fallback (`*` / `!`) is used
-  when `--no-unicode`/non-UTF locale is detected. (Marker/column treatment is
-  cosmetic and easily changed.)
+- `<Start Shell>` and `<offline>` rows still retain their node's Slurm JobID,
+  so they can be toggled even when no tmux session/SSH master is available.
+- A **`⟳`** marker on registered rows; status is folded into the STATUS column
+  (`keep-alive`, `renewing…`, `PAUSED ✕3`).
 - **Paused banner** reuses the existing daemon crash-loop banner mechanism:
   `⚠ keep-alive for '<name>' paused after 3 failed submits — check the daemon
   log, fix the script, press k twice to re-arm.`
@@ -184,16 +214,21 @@ Pure/functional, no live SLURM:
   captured `scontrol show job` text blob (batch and interactive samples).
 - **Registry round-trip** — write via the TUI helper, read back in the daemon
   helper; toggle on/off idempotence.
+- **Cross-host claim** — two independent managers race the same UUID; exactly
+  one calls the submitter, only its matching owner token may complete the
+  claim, and an ambiguous result leaves a persisted cooldown/defer window.
 - **Submit invocation** — `sbatch` stubbed (fake executable on PATH, like the
   existing `ssh` stub in `test_warm_pool.py`); assert `cwd`, argv, and that a
   non-zero/timeout return increments `attempts`.
 
 ## Edge cases
 
-- **Daemon restart** — renewal status resets and is re-derived from squeue on the
-  next poll; intent persists in `keepalive.json`. No harm.
+- **Daemon restart** — runtime status is re-derived from squeue; the tracked
+  replacement JobID and last successful-submit cooldown persist in
+  `keepalive.json`, preventing a duplicate while Slurm visibility catches up.
 - **Deleted script** — `sbatch` fails → failed attempt → pause after
   `max_failures`.
-- **Same-name collision** — see Identity; keeps ≥1 alive.
+- **Same-name collision** — current UUID/JobID entries are independent. Only
+  unmigrated name-only entries retain the old name-wide behavior.
 - **Feature disabled** (`enabled=false`) — daemon ignores the registry entirely;
   the TUI still lets you toggle (intent preserved for when you re-enable).

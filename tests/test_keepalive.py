@@ -5,6 +5,8 @@ import sys
 import tempfile
 import time
 import unittest
+import threading
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,6 +32,20 @@ class TimeLeftParseTests(unittest.TestCase):
         self.assertIsNone(ka.parse_time_left('INVALID'))
         self.assertIsNone(ka.parse_time_left('N/A'))
         self.assertIsNone(ka.parse_time_left('bogus:x'))
+        self.assertIsNone(ka.parse_time_left('-5'))
+        self.assertIsNone(ka.parse_time_left(None))
+
+
+class JobIdentityTests(unittest.TestCase):
+    def test_array_and_heterogeneous_rows_share_their_job_family(self):
+        self.assertEqual(ka.job_family_id('123'), '123')
+        self.assertEqual(ka.job_family_id('123_4'), '123')
+        self.assertEqual(ka.job_family_id('123_[1-8%2]'), '123')
+        self.assertEqual(ka.job_family_id('123+1'), '123')
+
+    def test_option_like_or_malformed_job_ids_are_rejected(self):
+        for value in ('-Q', '123;cancel', '', None, True):
+            self.assertIsNone(ka.job_family_id(value))
 
 
 class ScontrolParseTests(unittest.TestCase):
@@ -86,6 +102,11 @@ class DecideTests(unittest.TestCase):
         rt = self.rt(last_submit=1000)
         self.assertEqual(ka.decide([], rt, 1300, CFG), ('wait', 'renewing'))
 
+    def test_cross_daemon_defer_window_waits_without_counting_failure(self):
+        rt = self.rt(last_submit=None, defer_until=1100)
+        self.assertEqual(ka.decide([], rt, 1000, CFG), ('wait', 'renewing'))
+        self.assertEqual(ka.decide([], rt, 1100, CFG), ('submit', 'renewing'))
+
     def test_after_cooldown_resubmits(self):
         rt = self.rt(last_submit=1000)
         self.assertEqual(ka.decide([], rt, 2000, CFG), ('submit', 'renewing'))
@@ -97,6 +118,12 @@ class DecideTests(unittest.TestCase):
     def test_failure_cap_pauses(self):
         rt = self.rt(attempts=3)
         self.assertEqual(ka.decide([], rt, 5000, CFG), ('paused', 'paused'))
+
+    def test_healthy_job_recovers_a_previously_paused_entry(self):
+        rt = self.rt(attempts=CFG['max_failures'])
+        matching = [{'state': 'RUNNING', 'time_left': 5000}]
+        self.assertEqual(
+            ka.decide(matching, rt, 5000, CFG), ('none', 'healthy'))
 
     def test_unlimited_is_fresh(self):
         m = [{'state': 'RUNNING', 'time_left': math.inf}]
@@ -133,10 +160,163 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(entries[0]['enabled'])
         self.assertEqual(entries[0]['command'], '/x2')
 
+    def test_explicit_enable_is_idempotent_instead_of_toggling_off(self):
+        self.assertTrue(ka.set_entry_enabled(
+            self.path, 'j1', True, '/x/one', '/w'))
+        self.assertTrue(ka.set_entry_enabled(
+            self.path, 'j1', True, '/x/two', '/w2'))
+        entries = ka.load_registry(self.path)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['command'], '/x/two')
+
+    def test_explicit_disable_is_idempotent(self):
+        ka.set_entry_enabled(self.path, 'j1', True, '/x/one', '/w')
+        self.assertFalse(ka.set_entry_enabled(self.path, 'j1', False))
+        self.assertFalse(ka.set_entry_enabled(self.path, 'j1', False))
+        self.assertEqual(ka.load_registry(self.path), [])
+
+    def test_explicit_enable_rejects_empty_command(self):
+        with self.assertRaises(ValueError):
+            ka.set_entry_enabled(self.path, 'j1', True, '', '/w')
+        self.assertEqual(ka.load_registry(self.path), [])
+
+    def test_same_name_jobs_are_independent_when_job_ids_are_present(self):
+        ka.set_entry_enabled(
+            self.path, 'h100x2', True, '/x/a', '/w',
+            job_id='101', entry_id='entry-a')
+        ka.set_entry_enabled(
+            self.path, 'h100x2', True, '/x/b', '/w',
+            job_id='202', entry_id='entry-b')
+        entries = ka.load_registry(self.path)
+        self.assertEqual({e['job_id'] for e in entries}, {'101', '202'})
+
+        ka.set_entry_enabled(
+            self.path, 'h100x2', False,
+            job_id='101', entry_id='entry-a')
+        entries = ka.load_registry(self.path)
+        self.assertEqual([(e['entry_id'], e['job_id']) for e in entries],
+                         [('entry-b', '202')])
+
+    def test_submit_completion_advances_only_the_same_uuid(self):
+        ka.save_registry(self.path, [
+            {'entry_id': 'keep', 'job_id': '101', 'job_name': 'same',
+             'command': '/x/a', 'workdir': '/w', 'enabled': True},
+            {'entry_id': 'other', 'job_id': '202', 'job_name': 'same',
+             'command': '/x/b', 'workdir': '/w', 'enabled': True},
+        ])
+        self.assertTrue(ka.update_entry_after_submit(
+            self.path, 'keep', '303', submitted_at=123.0))
+        entries = {e['entry_id']: e for e in ka.load_registry(self.path)}
+        self.assertEqual(entries['keep']['job_id'], '303')
+        self.assertEqual(entries['keep']['last_submit_at'], 123.0)
+        self.assertEqual(entries['other']['job_id'], '202')
+
+    def test_submit_claim_serializes_hosts_and_preserves_ambiguous_cooldown(self):
+        ka.save_registry(self.path, [{
+            'entry_id': 'tracked', 'job_id': '101', 'job_name': 'same',
+            'command': '/x/a', 'workdir': '/w', 'enabled': True,
+        }])
+        first = ka.claim_entry_for_submit(
+            self.path, 'tracked', '101', owner_id='host-a',
+            cooldown=60, lease_seconds=90, now=100)
+        self.assertTrue(first['token'])
+        second = ka.claim_entry_for_submit(
+            self.path, 'tracked', '101', owner_id='host-b',
+            cooldown=60, lease_seconds=90, now=101)
+        self.assertIsNone(second['token'])
+        self.assertIn('claimed', second['reason'])
+
+        # A timeout/failure can be ambiguous: clear the active lease but retain
+        # a shared cooldown so another host cannot duplicate an accepted job.
+        self.assertTrue(ka.finish_submit_claim(
+            self.path, first['token'], success=False, owner_id='host-a',
+            submitted_at=102, submitted_monotonic=50,
+            clock_id='clock-a', record_cooldown=True))
+        denied = ka.claim_entry_for_submit(
+            self.path, 'tracked', '101', owner_id='host-b',
+            cooldown=60, lease_seconds=90, now=103)
+        self.assertIsNone(denied['token'])
+        self.assertIn('cooldown', denied['reason'])
+        allowed = ka.claim_entry_for_submit(
+            self.path, 'tracked', '101', owner_id='host-b',
+            cooldown=60, lease_seconds=90, now=162)
+        self.assertTrue(allowed['token'])
+
+    def test_successful_claim_advances_id_and_requires_matching_owner(self):
+        ka.save_registry(self.path, [{
+            'entry_id': 'tracked', 'job_id': '101', 'job_name': 'same',
+            'command': '/x/a', 'workdir': '/w', 'enabled': True,
+        }])
+        claim = ka.claim_entry_for_submit(
+            self.path, 'tracked', '101', owner_id='owner',
+            cooldown=60, lease_seconds=90, now=100)
+        self.assertFalse(ka.finish_submit_claim(
+            self.path, claim['token'], success=True, owner_id='wrong',
+            job_id='303', submitted_at=101))
+        self.assertIn('submit_claim', ka.load_registry(self.path)[0])
+        self.assertTrue(ka.finish_submit_claim(
+            self.path, claim['token'], success=True, owner_id='owner',
+            job_id='303', submitted_at=101, submitted_monotonic=77,
+            clock_id='clock'))
+        entry = ka.load_registry(self.path)[0]
+        self.assertNotIn('submit_claim', entry)
+        self.assertEqual(entry['job_id'], '303')
+        self.assertEqual(entry['last_submit_at'], 101.0)
+        self.assertEqual(entry['last_submit_monotonic'], 77.0)
+        self.assertEqual(entry['last_submit_clock_id'], 'clock')
+
+    def test_oversized_registry_is_not_overwritten_as_if_empty(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, 'w') as f:
+            f.write('{"entries": [' + (' ' * 128) + ']}')
+        with mock.patch.object(ka, '_REGISTRY_FILE_LIMIT', 32):
+            self.assertEqual(ka.load_registry(self.path), [])
+            with self.assertRaises(OSError):
+                ka.set_entry_enabled(self.path, 'new', True, '/x', '/w')
+
     def test_bad_file_reads_empty(self):
         with open(self.path.replace('/sub/', '/'), 'w') as f:
             f.write('not json')
         self.assertEqual(ka.load_registry(self.path.replace('/sub/', '/')), [])
+
+    def test_concurrent_distinct_toggles_do_not_lose_entries(self):
+        count = 12
+        barrier = threading.Barrier(count)
+
+        def add(i):
+            barrier.wait()
+            ka.toggle_entry(self.path, f'j{i}', f'/x/{i}', '/x')
+
+        threads = [threading.Thread(target=add, args=(i,)) for i in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual({entry['job_name'] for entry in ka.load_registry(self.path)},
+                         {f'j{i}' for i in range(count)})
+
+    def test_save_supports_relative_path_and_leaves_no_temp(self):
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.tmp)
+            ka.save_registry('keepalive.json', [])
+            self.assertEqual(ka.load_registry('keepalive.json'), [])
+            self.assertEqual(os.stat('keepalive.json').st_mode & 0o777, 0o600)
+            self.assertEqual([name for name in os.listdir('.') if '.tmp.' in name], [])
+        finally:
+            os.chdir(old_cwd)
+
+    def test_toggle_refuses_to_overwrite_corrupt_registry(self):
+        ka.save_registry(self.path, [{'job_name': 'important', 'enabled': True}])
+        with open(self.path, 'w') as f:
+            f.write('{broken json')
+        with open(self.path, 'rb') as f:
+            before = f.read()
+        with self.assertRaises(OSError):
+            ka.toggle_entry(self.path, 'new', '/x', '/w')
+        with open(self.path, 'rb') as f:
+            self.assertEqual(f.read(), before)
 
 
 class ConfigClampTests(unittest.TestCase):
@@ -230,6 +410,22 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.mgr.status()['j1']['state'], 'paused')
         self.assertLessEqual(len(self.submits), CFG['max_failures'])
 
+    def test_paused_entry_auto_recovers_when_job_becomes_healthy(self):
+        self._register()
+        self.mgr.poll_needed()
+        self.mgr._runtime['j1'] = {
+            'attempts': CFG['max_failures'], 'last_submit': 1000,
+            'in_flight': False, 'state': 'paused', 'last_error': 'old failure',
+            'submitted_id': None,
+        }
+        self.mgr.tick([
+            {'name': 'j1', 'state': 'RUNNING', 'time_left': '5:00:00'}
+        ], now=2000)
+        status = self.mgr.status()['j1']
+        self.assertEqual(status['state'], 'healthy')
+        self.assertEqual(status['attempts'], 0)
+        self.assertEqual(status['last_error'], '')
+
     def test_unregister_prunes_status(self):
         self._register()
         self.mgr.tick([{'name': 'j1', 'state': 'RUNNING', 'time_left': '5:00:00'}])
@@ -267,7 +463,8 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(self.mgr.poll_needed())   # no registry file yet
         self._register()
         self.assertTrue(self.mgr.poll_needed())
-        cfg = dict(CFG); cfg['enabled'] = False
+        cfg = dict(CFG)
+        cfg['enabled'] = False
         self.assertFalse(ka.KeepAliveManager(self.path, cfg).poll_needed())
 
     def test_toggle_off_midflight_no_resurrect(self):
@@ -310,6 +507,106 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(mgr.status()['j1']['state'], 'healthy')
         self.assertEqual(mgr.status()['j1']['attempts'], 0)
 
+    def test_unregistered_same_name_job_does_not_mask_tracked_expiry(self):
+        calls = []
+
+        def submit(command, workdir):
+            calls.append((command, workdir))
+            return (True, '', '303')
+
+        ka.save_registry(self.path, [{
+            'entry_id': 'tracked', 'job_id': '101', 'job_name': 'h100x2',
+            'command': '/x/tracked', 'workdir': '/w', 'enabled': True,
+        }])
+        mgr = ka.KeepAliveManager(self.path, dict(CFG), submit_fn=submit)
+        mgr.tick([
+            {'id': '101', 'name': 'h100x2', 'state': 'RUNNING',
+             'time_left': '5:00'},
+            {'id': '202', 'name': 'h100x2', 'state': 'RUNNING',
+             'time_left': '5:00:00'},
+        ], now=1000)
+        end = time.time() + 1
+        while not calls and time.time() < end:
+            time.sleep(0.01)
+        self.assertEqual(calls, [('/x/tracked', '/w')])
+
+    def test_submitted_job_id_and_cooldown_survive_daemon_restart(self):
+        calls = []
+
+        def submit(command, workdir):
+            calls.append((command, workdir))
+            return (True, '', '303')
+
+        ka.save_registry(self.path, [{
+            'entry_id': 'tracked', 'job_id': '101', 'job_name': 'original',
+            'command': '/x/tracked', 'workdir': '/w', 'enabled': True,
+        }])
+        first = ka.KeepAliveManager(self.path, dict(CFG), submit_fn=submit)
+        first.tick([], now=1000)
+        end = time.time() + 1
+        while time.time() < end:
+            entries = ka.load_registry(self.path)
+            if entries and entries[0].get('job_id') == '303':
+                break
+            time.sleep(0.01)
+        self.assertEqual(ka.load_registry(self.path)[0]['job_id'], '303')
+
+        # A fresh manager represents a daemon restart. Before squeue exposes
+        # the replacement, persisted cooldown must prevent a duplicate sbatch.
+        second = ka.KeepAliveManager(self.path, dict(CFG), submit_fn=submit)
+        second.tick([], now=5000)
+        time.sleep(0.1)
+        self.assertEqual(len(calls), 1)
+        # Once visible, the exact replacement ID is healthy even if its name
+        # differs from the original script's JobName.
+        second.tick([{'id': '303', 'name': 'renamed', 'state': 'PENDING',
+                      'time_left': '2-00:00:00'}], now=5010)
+        self.assertEqual(second.status()['tracked']['state'], 'healthy')
+
+    def test_two_managers_cannot_submit_the_same_entry_concurrently(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+
+        def submit(command, workdir):
+            with calls_lock:
+                calls.append((command, workdir))
+            started.set()
+            release.wait(2)
+            return (True, '', '303')
+
+        ka.save_registry(self.path, [{
+            'entry_id': 'tracked', 'job_id': '101', 'job_name': 'same',
+            'command': '/x/a', 'workdir': '/w', 'enabled': True,
+        }])
+        first = ka.KeepAliveManager(self.path, dict(CFG), submit_fn=submit)
+        second = ka.KeepAliveManager(self.path, dict(CFG), submit_fn=submit)
+        first.tick([], now=1000)
+        self.assertTrue(started.wait(1))
+        second.tick([], now=1000)
+        time.sleep(0.2)
+        try:
+            self.assertEqual(calls, [('/x/a', '/w')])
+            self.assertFalse(second._runtime['tracked']['in_flight'])
+            self.assertEqual(second._runtime['tracked']['attempts'], 0)
+            self.assertIn('claimed', second._runtime['tracked']['last_error'])
+        finally:
+            release.set()
+
+    def test_foreign_monotonic_clock_uses_persisted_wall_time(self):
+        entry = {
+            'entry_id': 'tracked', 'job_id': '101', 'job_name': 'same',
+            'command': '/x/a', 'workdir': '/w', 'enabled': True,
+            'last_submit_monotonic': 1999.0,
+            'last_submit_clock_id': 'another-host:another-boot',
+            'last_submit_at': 950.0,
+        }
+        mgr = ka.KeepAliveManager(self.path, dict(CFG), submit_fn=lambda *_: None)
+        with mock.patch.object(ka.time, 'time', return_value=1000.0):
+            rt = mgr._rt('tracked', entry, now=2000.0)
+        self.assertEqual(rt['last_submit'], 1950.0)
+
     def test_success_never_pauses(self):
         # Even if the replacement is never observed, successful submits must not
         # trip the failure cap (attempts counts FAILURES only).
@@ -344,12 +641,107 @@ class ManagerTests(unittest.TestCase):
                          'a raising submit must not latch in_flight True')
 
     def test_disabled_feature_no_submit(self):
-        cfg = dict(CFG); cfg['enabled'] = False
+        cfg = dict(CFG)
+        cfg['enabled'] = False
         mgr = ka.KeepAliveManager(self.path, cfg, submit_fn=lambda c, w: self.submits.append((c, w)) or (True, ''))
         self._register()
         mgr.tick([], now=1000)
         self._wait_submits(1, 0.3)
         self.assertEqual(self.submits, [])
+
+    def test_submit_threads_are_hard_capped(self):
+        release = threading.Event()
+        started = []
+        started_lock = threading.Lock()
+
+        def block(command, workdir):
+            with started_lock:
+                started.append(command)
+            release.wait(2)
+            return (True, '')
+
+        entries = [
+            {'job_name': f'j{i}', 'command': f'/x/{i}',
+             'workdir': '/x', 'enabled': True}
+            for i in range(20)
+        ]
+        ka.save_registry(self.path, entries)
+        mgr = ka.KeepAliveManager(self.path, dict(CFG), submit_fn=block)
+        mgr.tick([], now=1000)
+        deadline = time.time() + 1
+        while len(started) < 4 and time.time() < deadline:
+            time.sleep(0.01)
+        try:
+            self.assertEqual(len(started), 4)
+            self.assertEqual(sum(bool(rt['in_flight']) for rt in mgr._runtime.values()), 4)
+        finally:
+            release.set()
+
+    def test_transient_registry_read_failure_retains_last_good_entries(self):
+        self._register()
+        self.assertTrue(self.mgr.poll_needed())
+        self.mgr._mtime = ('force-reload',)
+        with mock.patch.object(ka, '_load_registry_checked', return_value=(False, [])):
+            self.assertTrue(self.mgr.poll_needed())
+        self.assertIn('j1', self.mgr._entries)
+
+    def test_status_never_waits_forever_for_registry_lock(self):
+        self.mgr._lock.acquire()
+        try:
+            started = time.monotonic()
+            self.assertEqual(self.mgr.status(), {})
+            self.assertLess(time.monotonic() - started, 0.5)
+        finally:
+            self.mgr._lock.release()
+
+    def test_sbatch_hard_deadline_clears_stuck_timeout_cleanup(self):
+        cfg = dict(CFG)
+        cfg['submit_timeout'] = 0.1
+        mgr = ka.KeepAliveManager(self.path, cfg)
+        mgr._command_cleanup_grace = 0.01
+        release = threading.Event()
+
+        def stuck_run(*_args, **_kwargs):
+            release.wait(2)
+            return mock.Mock(returncode=0, stdout='Submitted batch job 1', stderr='')
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(ka.subprocess, 'run', side_effect=stuck_run):
+                ok, error, _job_id = mgr._sbatch('/tmp/job.sh', None)
+            self.assertFalse(ok)
+            self.assertIn('cleanup is stuck', error)
+            self.assertLess(time.monotonic() - started, 0.5)
+        finally:
+            release.set()
+            time.sleep(0.05)
+
+    def test_sbatch_uses_machine_readable_job_id_output(self):
+        mgr = ka.KeepAliveManager(self.path, dict(CFG))
+        result = mock.Mock(returncode=0, stdout='303;primary\n', stderr='')
+        with mock.patch.object(ka.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(mgr._sbatch('/tmp/job.sh --arg x', '/tmp'),
+                             (True, '', '303'))
+        self.assertEqual(
+            run.call_args.args[0],
+            ['sbatch', '--parsable', '--', '/tmp/job.sh', '--arg', 'x'])
+
+    def test_local_command_capacity_does_not_pause_an_unattempted_entry(self):
+        self._register()
+        mgr = ka.KeepAliveManager(self.path, dict(CFG))
+        mgr._command_slots = threading.Semaphore(0)
+        now = 1000
+        for _ in range(CFG['max_failures'] + 2):
+            mgr.tick([], now=now)
+            end = time.time() + 0.5
+            while mgr._runtime.get('j1', {}).get('in_flight') and time.time() < end:
+                time.sleep(0.01)
+            self.assertIsNone(mgr._runtime['j1']['last_submit'])
+            now += 1
+        status = mgr.status()['j1']
+        self.assertEqual(status['attempts'], 0)
+        self.assertEqual(status['state'], 'renewing')
+        self.assertIn('capacity exhausted', status['last_error'])
 
 
 if __name__ == '__main__':

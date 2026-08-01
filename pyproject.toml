@@ -29,7 +29,10 @@ classifiers = [
     "Topic :: Terminals",
 ]
 dependencies = [
-    "textual>=0.40",
+    # The click-to-attach and low-traffic mouse driver intentionally target
+    # Textual 8.x private event/driver hooks. Older accepted versions lack the
+    # App.run(mouse=...) API and install successfully only to crash at launch.
+    "textual>=8.0.1,<9",
     "rich>=13.0",
     "tomli>=2.0; python_version < '3.11'",
 ]
@@ -37,6 +40,7 @@ dependencies = [
 [project.scripts]
 atmux = "autotmux.cli:main"
 atd = "autotmux.daemon:main_entry"
+atmux-daemon = "autotmux.daemon:main_entry"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

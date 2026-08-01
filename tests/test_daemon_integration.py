@@ -4,42 +4,51 @@ These talk to the real OS (write to /tmp, fork ssh masters for any nodes
 in the user's squeue), so they assume the user has at least localhost
 available. Each test stops + restarts the daemon to keep tests isolated.
 
-Skipped automatically when `squeue` / `ssh` / `atd` aren't on PATH —
-keeps unit-test CI green outside HPC clusters.
+Skipped automatically unless explicitly opted in with an isolated runtime and
+`squeue` / `ssh` are on PATH, keeping unit-test CI green outside HPC clusters.
 """
 import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import unittest
 
+from autotmux import paths
 
 UID = os.getuid()
-from autotmux import paths
 PID_FILE = paths.PID_FILE
 STATE_FILE = paths.STATE_FILE
 SNAPSHOT_FILE = paths.SNAPSHOT_FILE
 LOG_FILE = paths.LOG_FILE
 CTL_DIR = paths.CTL_DIR
 
-ATD = shutil.which('atd') or 'atd'
+ATD = [sys.executable, '-m', 'autotmux.daemon']
 
-_HAVE_TOOLS = all(shutil.which(t) for t in ('atd', 'squeue', 'ssh'))
+_HAVE_TOOLS = all(shutil.which(t) for t in ('squeue', 'ssh'))
+_XDG = os.environ.get('XDG_RUNTIME_DIR')
+_INTEGRATION_OPT_IN = (
+    os.environ.get('AUTOTMUX_RUN_INTEGRATION') == '1'
+    and bool(os.environ.get('AUTOTMUX_GUARD_FILE'))
+    and bool(_XDG)
+    and paths.BASE == os.path.join(_XDG, 'autotmux')
+)
 
 
 def requires_cluster_tools(cls):
-    """Class decorator: skip these tests when atd/squeue/ssh aren't all
-    available — typical for unit-only CI environments."""
+    """Skip without cluster tools and an explicitly isolated runtime."""
     return unittest.skipUnless(
-        _HAVE_TOOLS,
-        'integration tests need atd, squeue, and ssh on PATH',
+        _HAVE_TOOLS and _INTEGRATION_OPT_IN,
+        'integration tests require explicit opt-in, an existing isolated '
+        'XDG_RUNTIME_DIR/AUTOTMUX_GUARD_FILE, and cluster tools',
     )(cls)
 
 
 def _atd(*args, timeout=20):
-    return subprocess.run([ATD, *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run([*ATD, *args], capture_output=True, text=True,
+                          timeout=timeout)
 
 
 def _pid_alive(pid):
@@ -75,7 +84,7 @@ class DaemonLifecycleTests(unittest.TestCase):
         self.assertTrue(_pid_alive(pid))
 
     def test_double_start_is_idempotent(self):
-        r1 = _atd('start')
+        _atd('start')
         time.sleep(2)
         pid1 = _read_pid()
         r2 = _atd('start')
@@ -132,11 +141,11 @@ class DaemonLifecycleTests(unittest.TestCase):
         _atd('start')
         time.sleep(35)  # several state writes
         leftovers = []
-        for parent in ['/tmp']:
-            for fn in os.listdir(parent):
-                if fn.startswith(f'autotmux_daemon_{UID}.json.tmp') or \
-                   fn.startswith(f'autotmux_snapshots_{UID}.json.tmp'):
-                    leftovers.append(os.path.join(parent, fn))
+        for path in (STATE_FILE, SNAPSHOT_FILE, PID_FILE):
+            parent, base = os.path.dirname(path), os.path.basename(path)
+            leftovers.extend(
+                os.path.join(parent, fn) for fn in os.listdir(parent)
+                if fn.startswith(base + '.tmp.'))
         self.assertEqual(leftovers, [],
                          f"atomic write should not leave .tmp files: {leftovers}")
 
@@ -163,13 +172,10 @@ class SshLeakTests(unittest.TestCase):
 
     def setUp(self):
         _atd('stop')
-        # Sweep prior zombies
-        subprocess.run(['pkill', '-f', f'ControlPath={CTL_DIR}'],
-                       capture_output=True)
         time.sleep(1)
 
     def tearDown(self):
-        pass  # leave daemon running for final test
+        _atd('stop')
 
     def _count_daemon_ssh(self):
         r = subprocess.run(

@@ -4,7 +4,9 @@ terminal (atmux's primary use is over SSH into a cluster). Locally it stays on
 for click-to-attach. --mouse / --no-mouse force either way."""
 import os
 import sys
+import io
 import unittest
+from contextlib import redirect_stderr
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,7 +20,8 @@ def _args(no_mouse=False, mouse=False):
 class WantMouseTests(unittest.TestCase):
     def setUp(self):
         self._saved = {k: os.environ.get(k)
-                       for k in ('SSH_CONNECTION', 'SSH_TTY', 'SSH_CLIENT')}
+                       for k in ('SSH_CONNECTION', 'SSH_TTY', 'SSH_CLIENT',
+                                 'MOSH_CONNECTION', 'MOSH_IP')}
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -28,7 +31,8 @@ class WantMouseTests(unittest.TestCase):
                 os.environ[k] = v
 
     def _set_ssh(self, on):
-        for k in ('SSH_CONNECTION', 'SSH_TTY', 'SSH_CLIENT'):
+        for k in ('SSH_CONNECTION', 'SSH_TTY', 'SSH_CLIENT',
+                  'MOSH_CONNECTION', 'MOSH_IP'):
             os.environ.pop(k, None)
         if on:
             os.environ['SSH_CONNECTION'] = '10.0.0.1 22 10.0.0.2 22'
@@ -47,6 +51,16 @@ class WantMouseTests(unittest.TestCase):
         self._set_ssh(True)
         self.assertTrue(cli._want_mouse(_args(mouse=True)))
 
+    def test_ssh_client_only_and_mosh_are_still_remote(self):
+        self._set_ssh(False)
+        os.environ['SSH_CLIENT'] = '10.0.0.1 12345 22'
+        self.assertTrue(cli._is_remote_session())
+        self.assertFalse(cli._want_mouse(_args()))
+        os.environ.pop('SSH_CLIENT')
+        os.environ['MOSH_CONNECTION'] = '10.0.0.1 60000 10.0.0.2 60001'
+        self.assertTrue(cli._is_remote_session())
+        self.assertFalse(cli._want_mouse(_args()))
+
     def test_no_mouse_wins_locally(self):
         self._set_ssh(False)
         self.assertFalse(cli._want_mouse(_args(no_mouse=True)))
@@ -55,6 +69,12 @@ class WantMouseTests(unittest.TestCase):
         # --no-mouse takes precedence if both somehow given.
         self._set_ssh(False)
         self.assertFalse(cli._want_mouse(_args(no_mouse=True, mouse=True)))
+
+    def test_cli_rejects_conflicting_mouse_flags(self):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                cli._build_argparser().parse_args(['--mouse', '--no-mouse'])
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == '__main__':

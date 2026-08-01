@@ -5,6 +5,7 @@ import time
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -35,7 +36,8 @@ class StopLegacyDaemonTests(unittest.TestCase):
                     f.write(str(proc.pid))
                 d.LEGACY_PID_FILE = legacy
                 d.PID_FILE = os.path.join(td, 'new.pid')
-                d._stop_legacy_daemon()
+                with mock.patch.object(d, '_is_our_daemon', return_value=True):
+                    d._stop_legacy_daemon()
                 # poll up to 5s for SIGTERM to take effect
                 for _ in range(50):
                     if proc.poll() is not None:
@@ -62,6 +64,42 @@ class StopLegacyDaemonTests(unittest.TestCase):
             d.LEGACY_PID_FILE = legacy
             d.PID_FILE = os.path.join(td, 'new.pid')
             d._stop_legacy_daemon()  # dead pid → noop, no exception
+
+    def test_legacy_pid_symlink_is_never_followed(self):
+        proc = subprocess.Popen(['sleep', '30'])
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                target = os.path.join(td, 'target.pid')
+                legacy = os.path.join(td, 'legacy.pid')
+                with open(target, 'w') as f:
+                    f.write(str(proc.pid))
+                os.symlink(target, legacy)
+                d.LEGACY_PID_FILE = legacy
+                d.PID_FILE = os.path.join(td, 'new.pid')
+                with mock.patch.object(d, '_is_our_daemon', return_value=True):
+                    d._stop_legacy_daemon()
+                self.assertIsNone(proc.poll())
+                self.assertTrue(os.path.islink(legacy))
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
+
+    def test_unrelated_live_pid_is_not_signalled(self):
+        proc = subprocess.Popen(['sleep', '30'])
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                legacy = os.path.join(td, 'legacy.pid')
+                with open(legacy, 'w') as f:
+                    f.write(str(proc.pid))
+                d.LEGACY_PID_FILE = legacy
+                d.PID_FILE = os.path.join(td, 'new.pid')
+                d._stop_legacy_daemon()
+                self.assertIsNone(proc.poll())
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
 
 
 if __name__ == '__main__':
