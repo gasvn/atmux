@@ -14,6 +14,7 @@ import json
 import math
 import os
 import pty
+import queue
 import re
 import select
 import shlex
@@ -39,7 +40,10 @@ import rich.text
 
 from autotmux import __version__
 
-from autotmux import config, ipc, keepalive, lifecycle, paths, warm_registry
+from autotmux import (
+    config, gateway as gateway_client, ipc, keepalive, lifecycle, paths,
+    warm_registry,
+)
 
 STATE_FILE = paths.STATE_FILE
 CTL_DIR = paths.CTL_DIR
@@ -96,6 +100,42 @@ _SSH_SETTINGS = {
     'server_alive_int': int(config.DEFAULTS['server_alive_int']),
     'server_alive_max': int(config.DEFAULTS['server_alive_max']),
 }
+_GATEWAY_POOL: gateway_client.GatewayPool | None = None
+_CLIENT_CONFIG_TIMEOUT = 2.5
+
+
+def _gateway_mode() -> bool:
+    return _GATEWAY_POOL is not None
+
+
+def _operation_timeout(native: float) -> float:
+    """Bound one operation across all gateways, not once per gateway."""
+    if _GATEWAY_POOL is None:
+        return float(native)
+    return max(float(native),
+               float(_GATEWAY_POOL.settings['state_timeout']) + 1.0)
+
+
+def _load_client_config_bounded(timeout: float = _CLIENT_CONFIG_TIMEOUT):
+    """Read optional client config without letting a stuck home mount freeze UI."""
+    result: queue.Queue = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            value = (True, config.load_client())
+        except Exception:
+            value = (False, None)
+        try:
+            result.put(value, block=False)
+        except queue.Full:
+            pass
+
+    threading.Thread(target=worker, daemon=True,
+                     name='atmux-client-config').start()
+    try:
+        return result.get(timeout=max(0.01, float(timeout)))
+    except queue.Empty:
+        return False, None
 
 
 def _next_preview_cadence(unchanged: bool,
@@ -1047,6 +1087,11 @@ def _report_network_event(node: str, outcome: str, reason: str,
     """Best-effort publication of an interactive result to the shared breaker."""
     if node == 'localhost' or outcome not in {'success', 'failure'}:
         return
+    if _GATEWAY_POOL is not None:
+        # The remote interactive agent reports the compute transport result to
+        # its daemon, while GatewayPool records the outer login transport.  A
+        # second RPC here would duplicate both signals after every detach.
+        return
     try:
         ipc.request(PREVIEW_SOCKET, {
             'action': 'report', 'node': node, 'outcome': outcome,
@@ -1059,6 +1104,10 @@ def _report_network_event(node: str, outcome: str, reason: str,
 def _run_remote_user_command(node: str, remote_args: list[str] | None,
                              *, direct: bool = False) -> tuple[int, str, bool]:
     """Run SSH and retry rc=255 once while explicitly bypassing a bad mux."""
+    if _GATEWAY_POOL is not None:
+        return _GATEWAY_POOL.run_interactive(
+            node, remote_args, direct=direct)
+
     def argv(use_direct: bool) -> list[str]:
         base = (['ssh'] + _get_ssh_args(node, direct=use_direct)
                 + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node])
@@ -1090,6 +1139,17 @@ def _publish_remote_command_result(node: str, returncode: int, error: str,
         # Remote command exit codes still prove that SSH transported it. A
         # local exec failure is the one case which says nothing about network.
         _report_network_event(node, 'success', '', source)
+
+
+def _set_keepalive_enabled(path: str, job_name: str, enabled: bool,
+                           command: str = '', workdir: str = '', **kwargs) -> bool:
+    """Write keep-alive intent on the host which owns Slurm state."""
+    if _GATEWAY_POOL is not None:
+        return _GATEWAY_POOL.set_keepalive(
+            job_name, enabled, command, workdir,
+            job_id=kwargs.get('job_id'), entry_id=kwargs.get('entry_id'))
+    return keepalive.set_entry_enabled(
+        path, job_name, enabled, command, workdir, **kwargs)
 
 
 def _read_json_dict_checked(path: str, max_bytes: int) -> tuple[bool, dict]:
@@ -1129,6 +1189,8 @@ def _read_json_dict_checked(path: str, max_bytes: int) -> tuple[bool, dict]:
 
 
 def _read_state_checked() -> tuple[bool, dict]:
+    if _GATEWAY_POOL is not None:
+        return _GATEWAY_POOL.fetch_state()
     return _read_json_dict_checked(STATE_FILE, _STATE_FILE_LIMIT)
 
 
@@ -1138,6 +1200,8 @@ def read_state() -> dict:
 
 
 def _read_snapshots_checked() -> tuple[bool, dict]:
+    if _GATEWAY_POOL is not None:
+        return _GATEWAY_POOL.read_snapshots()
     return _read_json_dict_checked(SNAPSHOT_FILE, _SNAPSHOT_FILE_LIMIT)
 
 
@@ -2292,10 +2356,13 @@ class AutotmuxApp(App):
         """Timer entry point: read daemon state OFF the event loop, then
         render. Keeps the 5s tick from freezing the UI on a slow / NFS /
         mid-write state-file read."""
-        _sync_active_runtime_paths()
+        if not _gateway_mode():
+            _sync_active_runtime_paths()
         try:
+            timeout = (_UI_FILE_READ_TIMEOUT if _GATEWAY_POOL is None else
+                       float(_GATEWAY_POOL.settings['state_timeout']) + 1.0)
             state_ok, state = await _offload_for(
-                _UI_FILE_READ_TIMEOUT, _read_state_checked)
+                timeout, _read_state_checked)
         except Exception:
             state_ok, state = False, {}
         if not state_ok:
@@ -2317,7 +2384,8 @@ class AutotmuxApp(App):
         # the event-loop thread.
         try:
             new_entries = await _offload_for(
-                _UI_FILE_READ_TIMEOUT, self._ka_registry_entries)
+                _operation_timeout(_UI_FILE_READ_TIMEOUT),
+                self._ka_registry_entries)
         except Exception:
             return
         if new_entries != self._ka_entries:
@@ -2353,6 +2421,9 @@ class AutotmuxApp(App):
     _MAX_WARM = 12
 
     def _dispatch_warm(self, rows) -> None:
+        if _gateway_mode():
+            # Compute-node warming remains owned by the login-node daemon.
+            return
         # Keep an idle ssh slave warm for the nodes most likely to be attached —
         # Spawn off the main thread so it never blocks the UI. exclusive=True
         # stops back-to-back refreshes dispatching parallel warm-alls.
@@ -2499,6 +2570,21 @@ class AutotmuxApp(App):
             cached = self._ka_reg_cache[1]
             return [dict(entry) for entry in cached if isinstance(entry, dict)]
         try:
+            if _GATEWAY_POOL is not None:
+                try:
+                    entries = _GATEWAY_POOL.keepalive_entries(require_fresh)
+                except Exception:
+                    if require_fresh:
+                        raise
+                    cached = self._ka_reg_cache[1]
+                    return [dict(entry) for entry in cached
+                            if isinstance(entry, dict)]
+                enabled = tuple(
+                    dict(entry) for entry in entries
+                    if isinstance(entry, dict) and entry.get('enabled'))
+                self._ka_reg_cache = (
+                    ('gateway', _GATEWAY_POOL.active_gateway), enabled)
+                return [dict(entry) for entry in enabled]
             cached_sig, cached_entries = self._ka_reg_cache
             try:
                 st = os.stat(config.KEEPALIVE_PATH)
@@ -2651,6 +2737,14 @@ class AutotmuxApp(App):
         if not isinstance(incoming, dict) or not isinstance(current, dict):
             return False
 
+        incoming_sequence = incoming.get('gateway_sequence')
+        current_sequence = current.get('gateway_sequence')
+        if (isinstance(incoming_sequence, int)
+                and not isinstance(incoming_sequence, bool)
+                and isinstance(current_sequence, int)
+                and not isinstance(current_sequence, bool)):
+            return incoming_sequence < current_sequence
+
         def monotonic_value(state):
             value = state.get('updated_monotonic')
             if (isinstance(value, (int, float))
@@ -2690,7 +2784,7 @@ class AutotmuxApp(App):
         """Auto-restart a PID-dead daemon (with loop guard); banner-only for a
         hung-but-alive one (the existing stale subtitle covers that, and we
         never auto-kill a daemon that's merely slow)."""
-        if _daemon_running():
+        if _gateway_mode() or _daemon_running():
             self._crash_looping = False
             self._recovery_inflight = False
             return
@@ -2730,9 +2824,19 @@ class AutotmuxApp(App):
             self._recovery_inflight = False
 
     def _status_subtitle(self, state, rows, updated) -> str:
+        gateway_info = state.get('gateway') if isinstance(state, dict) else None
+        gateway_active = (gateway_info.get('active')
+                          if isinstance(gateway_info, dict) else '')
+        gateway_mode = (isinstance(gateway_info, dict)
+                        and gateway_info.get('mode') == 'gateway')
         if self._crash_looping:
             return "⚠ daemon crash-looping — run `atd status`"
         if not state.get('nodes'):
+            if gateway_mode:
+                reason = ' '.join(str(
+                    gateway_info.get('last_error') or
+                    'no login gateway is reachable').split())[:100]
+                return f"⚠ gateway unavailable · {reason}"
             if self._recovery_inflight:
                 return "starting daemon…"
             return "waiting for daemon… (run `atd status` to inspect)"
@@ -2740,8 +2844,14 @@ class AutotmuxApp(App):
             updated, state.get('updated_monotonic'),
             state.get('monotonic_clock_id'))
         if stale is None:
+            if gateway_mode:
+                return "⚠ remote daemon state timestamp unavailable"
             return "⚠ daemon state timestamp unavailable · run `atd status`"
         if stale is not None and stale > 30:
+            if gateway_mode:
+                cached = ' · cached' if gateway_info.get('cached') else ''
+                via = f' via {gateway_active}' if gateway_active else ''
+                return f"⚠ remote daemon stale ({stale:.0f}s){via}{cached}"
             return f"⚠ daemon stale ({stale:.0f}s old) · run `atd status`"
         # Count real sessions, not offline/start-shell placeholder rows.
         real = sum(1 for r in rows if r[1] not in (
@@ -2809,10 +2919,36 @@ class AutotmuxApp(App):
                 recovering.append(f'{node}({max(0, int(math.ceil(retry)))}s)')
         if recovering:
             extra += f" · ⚠ network recovery: {', '.join(sorted(recovering))}"
+        if gateway_mode:
+            total = gateway_info.get('total', 0)
+            healthy = gateway_info.get('healthy', 0)
+            via = gateway_active or 'selecting…'
+            gateway_items = gateway_info.get('items', [])
+            if not isinstance(gateway_items, list):
+                gateway_items = []
+            item = next((entry for entry in gateway_items
+                         if isinstance(entry, dict)
+                         and entry.get('name') == gateway_active), {})
+            latency = item.get('latency_ms') if isinstance(item, dict) else None
+            latency_text = (f' {float(latency):.0f}ms'
+                            if isinstance(latency, (int, float)) else '')
+            extra += f" · gateway {via}{latency_text} · {healthy}/{total} healthy"
+            agent_version = gateway_info.get('agent_version')
+            if (isinstance(agent_version, str) and agent_version
+                    and agent_version != __version__):
+                extra += (f" · ⚠ agent {agent_version} != client "
+                          f"{__version__}")
+            if gateway_info.get('cached'):
+                reason = ' '.join(str(
+                    gateway_info.get('last_error') or 'transport unavailable'
+                ).split())[:80]
+                extra += f" · ⚠ cached: {reason}"
         return f"{real} sessions · updated {updated}{extra}"
 
     async def _warm_pool_warm_all_async(self, nodes) -> None:
         """PTY/ssh setup can be slow on a busy login node; keep it off-loop."""
+        if _gateway_mode():
+            return
         try:
             await _offload(self._warm_pool.warm_all, nodes)
         except Exception:
@@ -2820,6 +2956,8 @@ class AutotmuxApp(App):
 
     async def _warm_pool_warm_node_async(self, node: str) -> None:
         """Replenish one consumed slave without delaying the resumed TUI."""
+        if _gateway_mode():
+            return
         try:
             await _offload_for(
                 _UI_FILE_READ_TIMEOUT, self._warm_pool.warm, node)
@@ -2827,7 +2965,7 @@ class AutotmuxApp(App):
             return  # the ordinary ssh path remains available
 
     def _schedule_warm_replenish(self, node: str) -> None:
-        if node == 'localhost':
+        if node == 'localhost' or _gateway_mode():
             return
         self.run_worker(
             self._warm_pool_warm_node_async(node),
@@ -2986,6 +3124,10 @@ class AutotmuxApp(App):
         """Request a preview from the daemon's node-level SSH coordinator."""
         if not _valid_node(node):
             raise ValueError(f'invalid preview node: {node!r}')
+        if _GATEWAY_POOL is not None:
+            return await _offload_for(
+                float(_GATEWAY_POOL.settings['state_timeout']) + 1.0,
+                _GATEWAY_POOL.preview, node, sess)
         return await _offload_for(
             _PREVIEW_CAPTURE_TIMEOUT + 4.0,
             ipc.request, PREVIEW_SOCKET,
@@ -3176,7 +3318,8 @@ class AutotmuxApp(App):
         network_outcome = None
         network_reason = ''
         used_direct = False
-        direct_preferred = _node_network_degraded(self._last_state, node)
+        direct_preferred = (False if _gateway_mode() else
+                            _node_network_degraded(self._last_state, node))
         # If we're inside tmux and about to nest another tmux (any real session,
         # local or remote), step the outer tmux aside for the duration of the
         # attach so the INNER session receives the C-b prefix instead of the
@@ -3208,7 +3351,7 @@ class AutotmuxApp(App):
                     if direct_preferred:
                         print(f"\n[atmux] {node} is in network recovery; "
                               "bypassing the shared SSH connection.", flush=True)
-                    else:
+                    elif not _gateway_mode():
                         try:
                             if self._warm_pool.is_starting(node):
                                 print(f"\n[atmux] preparing warm SSH to {node}…",
@@ -3286,7 +3429,8 @@ class AutotmuxApp(App):
         network_outcome = None
         network_reason = ''
         used_direct = False
-        direct_preferred = _node_network_degraded(self._last_state, node)
+        direct_preferred = (False if _gateway_mode() else
+                            _node_network_degraded(self._last_state, node))
         with self.suspend():
             if node == 'localhost':
                 returncode, command_error = _run_user_command(
@@ -3294,7 +3438,7 @@ class AutotmuxApp(App):
             else:
                 warm_result = WarmHandoffResult(
                     WarmHandoffStatus.UNAVAILABLE)
-                if not direct_preferred:
+                if not direct_preferred and not _gateway_mode():
                     try:
                         if self._warm_pool.is_starting(node):
                             print(f"\n[atmux] preparing warm SSH to {node}…",
@@ -3396,7 +3540,7 @@ class AutotmuxApp(App):
         # first few seconds after launch, before the timer fills it).
         try:
             self._ka_entries = await _offload_for(
-                8, self._ka_registry_entries, True)
+                _operation_timeout(8), self._ka_registry_entries, True)
             self._ka_names = {
                 entry.get('job_name') for entry in self._ka_entries
                 if isinstance(entry.get('job_name'), str)
@@ -3416,7 +3560,7 @@ class AutotmuxApp(App):
                 kwargs = ({'job_id': existing_job_id, 'entry_id': existing_id}
                           if existing_job_id else {})
                 await _offload_for(
-                    8, keepalive.set_entry_enabled,
+                    _operation_timeout(8), _set_keepalive_enabled,
                     config.KEEPALIVE_PATH,
                     str(existing.get('job_name') or job_name), False,
                     **kwargs)
@@ -3460,7 +3604,8 @@ class AutotmuxApp(App):
             f'job:{normalized_job_id}' if normalized_job_id else job_name)
         entry_id = entry_id or uuid.uuid4().hex
         try:
-            info = await _offload_for(10, self._scontrol_job, job_id)
+            info = await _offload_for(
+                _operation_timeout(10), self._scontrol_job, job_id)
             if info is None:
                 self.notify(f'could not read job {job_id} (scontrol)',
                             severity='warning', timeout=4, markup=False)
@@ -3477,7 +3622,8 @@ class AutotmuxApp(App):
             if not isinstance(authoritative_name, str) or not authoritative_name:
                 authoritative_name = job_name
             await _offload_for(
-                8, keepalive.set_entry_enabled, config.KEEPALIVE_PATH,
+                _operation_timeout(8), _set_keepalive_enabled,
+                config.KEEPALIVE_PATH,
                 authoritative_name, True, info['command'],
                 info.get('workdir') or '', job_id=job_id, entry_id=entry_id)
             new_entry = {
@@ -3517,6 +3663,8 @@ class AutotmuxApp(App):
         # as an option (argv injection) rather than a job id.
         if not re.match(r'^\d+(_\d+|_\[[0-9,\-]+\])?$', str(job_id)):
             return None
+        if _GATEWAY_POOL is not None:
+            return _GATEWAY_POOL.scontrol_job(str(job_id))
         try:
             result = _hard_subprocess_run(
                 ['scontrol', 'show', 'job', str(job_id)],
@@ -3645,6 +3793,8 @@ def _launch_daemon() -> tuple[bool, str]:
     name ``atd`` on PATH can resolve the unrelated system at-job daemon when
     AutoTmux's console wrapper is absent or the environment was not activated.
     """
+    if _gateway_mode():
+        return True, ''
     if _daemon_running():
         return True, ''
     cmd = [sys.executable, '-m', 'autotmux.daemon', 'start']
@@ -3682,6 +3832,8 @@ def _launch_daemon() -> tuple[bool, str]:
 
 def _request_daemon_start() -> None:
     """Best-effort daemon start for direct attach without delaying attach."""
+    if _gateway_mode():
+        return
     try:
         threading.Thread(target=_launch_daemon, daemon=True,
                          name='atmux-daemon-start').start()
@@ -3691,6 +3843,8 @@ def _request_daemon_start() -> None:
 
 def _published_direct_preference(node: str) -> bool:
     """Read the daemon's local state for a non-TUI attach helper."""
+    if _gateway_mode():
+        return False
     try:
         valid, state = _read_json_dict_checked(STATE_FILE, _STATE_FILE_LIMIT)
     except Exception:
@@ -3784,6 +3938,13 @@ def _build_argparser():
                         help='Skip the TUI and attach directly to NODE:SESSION.')
     target.add_argument('--shell', dest='shell_node', metavar='NODE',
                         help='Skip the TUI and open a shell directly on NODE.')
+    target.add_argument(
+        '--gateway-login', action='store_true',
+        help='Interactively authenticate and pre-warm every configured login '
+             'gateway, then exit.')
+    target.add_argument(
+        '--gateway-check', action='store_true',
+        help='Probe every configured login gateway and agent, then exit.')
     mouse = p.add_mutually_exclusive_group()
     mouse.add_argument('--no-mouse', action='store_true',
                        help='Force keyboard-only (no mouse tracking). This is the '
@@ -3793,6 +3954,18 @@ def _build_argparser():
                             'Off by default over SSH because mouse-report traffic '
                             'competes with keystrokes and can make arrow keys feel '
                             'dead on a remote/loaded terminal.')
+    deployment = p.add_mutually_exclusive_group()
+    deployment.add_argument(
+        '--gateway-mode', action='store_true',
+        help='Run the TUI locally and reach Slurm nodes through the login '
+             'gateways configured in [client].')
+    deployment.add_argument(
+        '--login-mode', action='store_true',
+        help='Force the original native login-node mode for this invocation.')
+    p.add_argument(
+        '--gateway', action='append', default=[], metavar='SSH_HOST',
+        help='Use this SSH login gateway for local mode (repeatable; overrides '
+             '[client].gateways).')
     return p
 
 
@@ -3815,11 +3988,96 @@ def _want_mouse(args) -> bool:
     return not _is_remote_session()   # on locally, off over SSH
 
 
+def _configure_gateway_mode(args) -> str:
+    """Configure the optional local gateway pool; return an error or ``''``."""
+    global _GATEWAY_POOL
+    _GATEWAY_POOL = None
+    cli_gateways = list(getattr(args, 'gateway', None) or [])
+    if getattr(args, 'login_mode', False):
+        # Preserve native login-node startup even if ~/.config is on a wedged
+        # shared filesystem.
+        return ''
+    explicit_gateway = bool(
+        cli_gateways or getattr(args, 'gateway_mode', False)
+        or getattr(args, 'gateway_login', False)
+        or getattr(args, 'gateway_check', False))
+    if _is_remote_session() and not explicit_gateway:
+        # Native login-node mode is the compatibility contract.  Do not even
+        # touch an NFS-backed client config during ordinary SSH use; users who
+        # genuinely want a gateway client on a remote host can request it with
+        # --gateway-mode.
+        return ''
+    config_ok, settings = _load_client_config_bounded()
+    if not config_ok or not isinstance(settings, dict):
+        if cli_gateways:
+            settings = dict(config.CLIENT_DEFAULTS)
+            settings['gateways'] = []
+            settings['agent_command'] = list(
+                config.CLIENT_DEFAULTS['agent_command'])
+        else:
+            return ('timed out reading [client] config; use --login-mode or '
+                    'pass --gateway explicitly')
+    if cli_gateways:
+        invalid = [value for value in cli_gateways
+                   if not config.valid_gateway(value)]
+        if invalid:
+            return f'invalid gateway SSH destination: {invalid[0]!r}'
+        settings['gateways'] = list(dict.fromkeys(cli_gateways))
+
+    forced = bool(
+        getattr(args, 'gateway_mode', False) or cli_gateways
+        or getattr(args, 'gateway_login', False)
+        or getattr(args, 'gateway_check', False))
+    mode = settings.get('mode', 'auto')
+    enabled = forced or mode == 'gateway' or (
+        mode == 'auto' and bool(settings.get('gateways'))
+        and not _is_remote_session())
+    if not enabled:
+        return ''
+    if not settings.get('gateways'):
+        return 'gateway mode needs at least one [client].gateways entry'
+    try:
+        _GATEWAY_POOL = gateway_client.GatewayPool(settings)
+    except Exception as error:
+        return f'could not initialize gateway mode: {error}'
+    return ''
+
+
 def main():
     global _RUNTIME_DISCOVERY_ENABLED
-    _RUNTIME_DISCOVERY_ENABLED = True
-    _sync_active_runtime_paths()
-    args = _build_argparser().parse_args()
+    parser = _build_argparser()
+    args = parser.parse_args()
+    deployment_error = _configure_gateway_mode(args)
+    if deployment_error:
+        parser.error(deployment_error)
+    _RUNTIME_DISCOVERY_ENABLED = not _gateway_mode()
+    if not _gateway_mode():
+        _sync_active_runtime_paths()
+    if args.gateway_login or args.gateway_check:
+        if _GATEWAY_POOL is None:
+            parser.error('this command needs configured login gateways')
+        results = (_GATEWAY_POOL.authenticate() if args.gateway_login
+                   else _GATEWAY_POOL.check_all())
+        for result in results:
+            name = result.get('gateway', '?')
+            if result.get('ok'):
+                if args.gateway_login:
+                    detail = ('already active' if result.get('existing')
+                              else 'authenticated')
+                else:
+                    latency = result.get('latency_ms')
+                    detail = (f"{float(latency):.0f} ms"
+                              if isinstance(latency, (int, float)) else 'ok')
+                    remote = result.get('host') or ''
+                    version = result.get('version') or ''
+                    if remote:
+                        detail += f' · {remote}'
+                    if version:
+                        detail += f' · AutoTmux {version}'
+                print(f'✓ {name}: {detail}')
+            else:
+                print(f"✗ {name}: {result.get('error') or 'unavailable'}")
+        sys.exit(0 if all(result.get('ok') for result in results) else 1)
     if args.attach:
         sys.exit(_direct_attach(args.attach))
     if args.shell_node:

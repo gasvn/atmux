@@ -5,7 +5,7 @@ compute nodes. It automatically discovers your running jobs, keeps fast
 SSH connections to each node open in the background, and lets you list,
 preview, and attach to remote tmux sessions from a single TUI.
 
-## Architecture (v0.4.0)
+## Architecture (v0.5.0)
 
 AutoTmux is split into two pieces:
 
@@ -38,6 +38,22 @@ AutoTmux is split into two pieces:
 This split means the frontend never blocks on `squeue` or SSH, and tmux
 session listings refresh in the background without any user-visible work.
 
+AutoTmux 0.5 adds an optional third piece without changing that native mode:
+
+- **`atmux-agent`** — a bounded, one-request SSH-stdio bridge. A laptop can
+  query the existing daemon on several login nodes, request previews, update
+  keep-alive intent, and launch an interactive attach. It opens no listening
+  port and receives no copied SSH key.
+- **Local gateway pool** — the locally-running `atmux` races login nodes on
+  first use, keeps a sticky low-latency route, reuses a local SSH
+  ControlMaster, applies per-gateway circuit breaking, and automatically tries
+  another login node after a transport loss. Last-good state and previews are
+  cached locally so an outage does not blank the dashboard.
+
+The original login-node deployment remains the default when no gateways are
+configured. In `mode = "auto"`, an `atmux` launched through SSH also stays in
+native login-node mode, so the same installation can support both workflows.
+
 ## Installation
 
 ```bash
@@ -46,9 +62,10 @@ cd atmux
 pip install .
 ```
 
-This installs `atmux`, `atmux-daemon`, and the backward-compatible `atd`
-alias, and pulls in Textual 8.x and Rich. Prefer `atmux-daemon`: some Linux
-systems already use the generic name `atd` for their at-job scheduler.
+This installs `atmux`, `atmux-agent`, `atmux-daemon`, and the
+backward-compatible `atd` alias, and pulls in Textual 8.x and Rich. Prefer
+`atmux-daemon`: some Linux systems already use the generic name `atd` for
+their at-job scheduler.
 
 `atmux` will auto-start its daemon module the first time it can't find a running
 daemon, so day-to-day usage is just:
@@ -56,6 +73,77 @@ daemon, so day-to-day usage is just:
 ```bash
 atmux
 ```
+
+## Local client with multiple login nodes
+
+Install the same AutoTmux version on the local machine and on every login node.
+On clusters with a shared home/software environment, one login-side install is
+usually enough. Keep using `atmux` normally on a login node; local mode is an
+additional deployment, not a replacement.
+
+On the local machine, add a `[client]` section to
+`~/.config/autotmux/config.toml`:
+
+```toml
+[client]
+mode = "auto"
+gateways = ["login1", "login2", "login3"]  # SSH aliases or user@host
+
+# Optional when a non-interactive SSH shell cannot find atmux-agent:
+# agent_command = ["/home/me/.local/bin/atmux-agent"]
+
+connect_timeout = 5
+state_timeout = 10
+hedge_delay = 0.35
+sticky_ttl = 300
+backoff_base = 2
+backoff_cap = 60
+probe_interval = 60
+control_persist = 3600
+server_alive_int = 15
+server_alive_max = 3
+```
+
+If login requires MFA, a password, or keyboard-interactive authentication,
+bootstrap the login ControlMasters explicitly:
+
+```bash
+atmux --gateway-login   # the only path which permits interactive SSH prompts
+atmux --gateway-check   # concurrently verify every agent and show latency
+atmux                   # local dashboard
+```
+
+Background refreshes always use `BatchMode=yes`; an expired MFA session
+therefore becomes a visible, bounded gateway failure instead of an invisible
+prompt that freezes the TUI. Run `atmux --gateway-login` again to renew it.
+Key-only users can normally skip the login command. While the dashboard is
+open, `probe_interval` sends a low-frequency ping to standby gateways so their
+masters stay authenticated, their login-side daemons stay warm, and their
+latency/error scores remain current.
+
+Useful one-shot overrides:
+
+```bash
+atmux --gateway login1 --gateway login2  # use these gateways for this run
+atmux --login-mode                       # force original native mode
+atmux --gateway-mode                     # force configured local mode
+```
+
+Local mode displays the laptop as `localhost` and the selected login host as
+`login--HOST`; compute-node names are unchanged. Interactive traffic follows:
+
+```text
+local atmux → selected login agent → compute node → tmux
+```
+
+The login agent reuses that host's existing compute ControlMaster. If the
+outer login connection returns SSH's transport status, AutoTmux retries the
+same gateway once without a stale local mux and then moves to another healthy
+login node. A live TCP/SSH stream cannot migrate between gateways, but the tmux
+server remains alive on the compute node and AutoTmux immediately reattaches
+through the next route. Read-only state uses hedged requests; mutating
+keep-alive updates are idempotent and protected by the existing shared lease,
+so failover cannot submit duplicate replacement jobs.
 
 ## Daemon control
 
@@ -82,6 +170,9 @@ if available, otherwise `/tmp/autotmux_<uid>/` (see [Configuration](#configurati
 | `<BASE>/snapshots.json` | Per-(node,session) tmux pane snapshots. |
 | `<BASE>/preview.sock` | Private frontend/daemon preview and network-health IPC. |
 | `<BASE>/warm/` | Ownership records for pre-warmed interactive SSH children. |
+| `<BASE>/gateway-ctl/` | Local-mode ControlMaster sockets for login gateways. |
+| `<BASE>/gateway-state.json` | Last-good local-mode dashboard state. |
+| `<BASE>/gateway-snapshots.json` | Last-good local-mode pane previews. |
 | `/tmp/autotmux_daemon_<uid>.guard` | Stable singleton guard plus active-runtime metadata. |
 
 ## Configuration
@@ -115,6 +206,14 @@ submit_timeout = 60        # maximum seconds to wait for sbatch
 Unknown, non-finite, wrong-type, and out-of-range numeric values are ignored
 with a warning in the daemon log.
 Restart the daemon to apply changes: `atmux-daemon restart`.
+
+The `[client]` table is read by the local frontend and does not require a
+daemon restart. Ordinary SSH/Mosh launches always keep native login-node
+behaviour without waiting on the client config; use `--gateway-mode` explicitly
+for the unusual case of running a gateway client there. Outside SSH,
+`mode = "auto"` enables configured gateways, `mode = "gateway"` forces them,
+and `mode = "login"` keeps native behaviour. CLI flags override the file for
+one invocation.
 
 ### Runtime files & paths
 
@@ -215,6 +314,8 @@ its reply was lost.
 - `tmux` installed both locally and on the remote nodes.
 - `squeue` (Slurm) on the login host where you run `atmux`.
 - SSH key-based access to the compute nodes (`BatchMode=yes` is used).
+- For local mode, SSH access to every configured login gateway and the same
+  `atmux-agent` version available in its non-interactive command environment.
 
 ## Development
 

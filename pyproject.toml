@@ -41,6 +41,7 @@ dependencies = [
 atmux = "autotmux.cli:main"
 atd = "autotmux.daemon:main_entry"
 atmux-daemon = "autotmux.daemon:main_entry"
+atmux-agent = "autotmux.agent:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

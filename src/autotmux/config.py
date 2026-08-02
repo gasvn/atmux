@@ -7,6 +7,8 @@ warning). The AUTOTMUX_CONFIG env var overrides the path (used by tests).
 import os
 import logging
 import math
+import re
+import shlex
 
 log = logging.getLogger('autotmux_daemon.config')
 
@@ -51,6 +53,46 @@ DEFAULTS = {
     'network_backoff_cap': 60,
     'warm_orphan_interval': 30,
 }
+
+
+# Optional local-client mode.  An empty gateway list preserves the historical
+# behaviour exactly: atmux and its daemon run together on the login host.  When
+# gateways are configured, the local frontend talks to the existing daemon on
+# one of those hosts through ``atmux-agent`` over SSH.
+CLIENT_DEFAULTS = {
+    'mode': 'auto',
+    'gateways': [],
+    'connect_timeout': 5,
+    'state_timeout': 10.0,
+    'hedge_delay': 0.35,
+    'sticky_ttl': 300.0,
+    'backoff_base': 2.0,
+    'backoff_cap': 60.0,
+    'probe_interval': 60.0,
+    'control_persist': 3600,
+    'server_alive_int': 15,
+    'server_alive_max': 3,
+    'agent_command': ['atmux-agent'],
+}
+
+_CLIENT_NUMBER_RULES = {
+    'connect_timeout':   (int,   1,   120),
+    'state_timeout':     (float, 1.0, 120.0),
+    'hedge_delay':       (float, 0.0, 10.0),
+    'sticky_ttl':        (float, 0.0, 86_400.0),
+    'backoff_base':      (float, 0.1, 3_600.0),
+    'backoff_cap':       (float, 0.1, 86_400.0),
+    'probe_interval':    (float, 5.0, 86_400.0),
+    'control_persist':   (int,   1,   86_400),
+    'server_alive_int':  (int,   1,   3_600),
+    'server_alive_max':  (int,   1,   100),
+}
+
+# SSH destinations are argv items, never shell fragments.  Supporting ordinary
+# aliases plus user@host covers the common HPC cases; ports belong in
+# ~/.ssh/config so a value can never be mistaken for an option or command.
+_GATEWAY_RE = re.compile(
+    r'^(?:[A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._:-]*$')
 
 
 # Type/range validation is part of the daemon's liveness contract.  Values such
@@ -117,7 +159,11 @@ def load() -> dict:
     except Exception as e:
         log.warning(f'failed to parse {CONFIG_PATH}: {e}; using defaults')
         return cfg
-    section = data.get('daemon', data)  # accept [daemon] table or flat
+    # Accept the historical flat daemon keys, but do not mistake a file which
+    # contains only [client] for a flat daemon table and warn on every launch.
+    section = data.get('daemon')
+    if section is None:
+        section = data if any(key in data for key in DEFAULTS) else {}
     if not isinstance(section, dict):
         log.warning('ignoring invalid [daemon] config (expected a table)')
         return cfg
@@ -133,6 +179,97 @@ def load() -> dict:
         log.warning('network_backoff_cap is below network_backoff_base; '
                     'raising cap to base')
         cfg['network_backoff_cap'] = cfg['network_backoff_base']
+    return cfg
+
+
+def valid_gateway(value) -> bool:
+    """Whether *value* is a safe OpenSSH destination argv item."""
+    return (isinstance(value, str) and 0 < len(value) <= 255
+            and _GATEWAY_RE.fullmatch(value) is not None)
+
+
+def _client_agent_command(value) -> list[str] | None:
+    if isinstance(value, str):
+        try:
+            parts = shlex.split(value)
+        except ValueError:
+            return None
+    elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+        parts = list(value)
+    else:
+        return None
+    if not 1 <= len(parts) <= 16:
+        return None
+    if parts[0].startswith('-'):
+        return None
+    if any(not part or len(part) > 512 or '\x00' in part
+           or '\n' in part or '\r' in part for part in parts):
+        return None
+    return parts
+
+
+def load_client() -> dict:
+    """Load and validate the optional ``[client]`` gateway configuration.
+
+    This parser never raises.  Invalid gateway entries are ignored individually
+    so one typo cannot prevent a user from falling back to native login-node
+    mode.
+    """
+    cfg = dict(CLIENT_DEFAULTS)
+    cfg['gateways'] = []
+    cfg['agent_command'] = list(CLIENT_DEFAULTS['agent_command'])
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            return cfg
+    if not os.path.exists(CONFIG_PATH):
+        return cfg
+    try:
+        with open(CONFIG_PATH, 'rb') as handle:
+            data = tomllib.load(handle)
+    except Exception as error:
+        log.warning(f'failed to parse {CONFIG_PATH}: {error}; using client defaults')
+        return cfg
+    section = data.get('client', {})
+    if not isinstance(section, dict):
+        log.warning('ignoring invalid [client] config (expected a table)')
+        return cfg
+
+    mode = section.get('mode', cfg['mode'])
+    if isinstance(mode, str) and mode in {'auto', 'gateway', 'login'}:
+        cfg['mode'] = mode
+    elif 'mode' in section:
+        log.warning(f'ignoring invalid client mode: {mode!r}')
+
+    gateways = section.get('gateways', [])
+    if isinstance(gateways, list):
+        seen = set()
+        for gateway in gateways[:64]:
+            if valid_gateway(gateway) and gateway not in seen:
+                seen.add(gateway)
+                cfg['gateways'].append(gateway)
+            else:
+                log.warning(f'ignoring invalid/duplicate gateway: {gateway!r}')
+    elif 'gateways' in section:
+        log.warning('ignoring invalid client gateways (expected an array)')
+
+    for key, rule in _CLIENT_NUMBER_RULES.items():
+        if key in section:
+            cfg[key] = _validated_number(
+                key, section[key], CLIENT_DEFAULTS[key], rule)
+    if cfg['backoff_cap'] < cfg['backoff_base']:
+        log.warning('client backoff_cap is below backoff_base; raising cap to base')
+        cfg['backoff_cap'] = cfg['backoff_base']
+
+    if 'agent_command' in section:
+        command = _client_agent_command(section['agent_command'])
+        if command is None:
+            log.warning('ignoring invalid client agent_command')
+        else:
+            cfg['agent_command'] = command
     return cfg
 
 

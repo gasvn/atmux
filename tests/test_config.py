@@ -94,5 +94,73 @@ class LoadConfigTests(unittest.TestCase):
             self.assertEqual(cfg['backoff_cap'], cfg['backoff_base'])
 
 
+class LoadClientConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._saved_path = config.CONFIG_PATH
+
+    def tearDown(self):
+        config.CONFIG_PATH = self._saved_path
+
+    def _write(self, td, text):
+        path = os.path.join(td, 'config.toml')
+        with open(path, 'w') as handle:
+            handle.write(text)
+        config.CONFIG_PATH = path
+        return path
+
+    def test_client_only_file_does_not_change_daemon_defaults(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, '[client]\ngateways = ["login1"]\n')
+            self.assertEqual(config.load(), config.DEFAULTS)
+
+    def test_gateway_client_values_are_validated(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(
+                td,
+                '[client]\n'
+                'mode = "gateway"\n'
+                'gateways = ["me@login1", "login2", "login2", "-oProxy=x"]\n'
+                'connect_timeout = 7\n'
+                'state_timeout = 4.5\n'
+                'agent_command = ["python3", "-m", "autotmux.agent"]\n')
+            cfg = config.load_client()
+            self.assertEqual(cfg['mode'], 'gateway')
+            self.assertEqual(cfg['gateways'], ['me@login1', 'login2'])
+            self.assertEqual(cfg['connect_timeout'], 7)
+            self.assertEqual(cfg['state_timeout'], 4.5)
+            self.assertEqual(
+                cfg['agent_command'], ['python3', '-m', 'autotmux.agent'])
+
+    def test_invalid_client_values_fall_back_safely(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(
+                td,
+                '[client]\nmode = "recursive"\n'
+                'gateways = "login1"\nhedge_delay = -1\n'
+                'agent_command = ["-bad"]\n')
+            cfg = config.load_client()
+            self.assertEqual(cfg['mode'], config.CLIENT_DEFAULTS['mode'])
+            self.assertEqual(cfg['gateways'], [])
+            self.assertEqual(
+                cfg['hedge_delay'], config.CLIENT_DEFAULTS['hedge_delay'])
+            self.assertEqual(
+                cfg['agent_command'], config.CLIENT_DEFAULTS['agent_command'])
+
+    def test_load_client_returns_deep_enough_copies(self):
+        with tempfile.TemporaryDirectory() as td:
+            config.CONFIG_PATH = os.path.join(td, 'missing.toml')
+            cfg = config.load_client()
+            cfg['gateways'].append('login1')
+            cfg['agent_command'].append('rpc')
+            self.assertEqual(config.CLIENT_DEFAULTS['gateways'], [])
+            self.assertEqual(config.CLIENT_DEFAULTS['agent_command'], ['atmux-agent'])
+
+    def test_gateway_validator_rejects_options_and_shell_fragments(self):
+        self.assertTrue(config.valid_gateway('user@login.example.edu'))
+        self.assertTrue(config.valid_gateway('ssh-alias'))
+        for value in ('-v', 'host;id', 'host name', '', None):
+            self.assertFalse(config.valid_gateway(value))
+
+
 if __name__ == '__main__':
     unittest.main()
