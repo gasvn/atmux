@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -251,6 +252,63 @@ class NestedTmuxTransparentTests(unittest.TestCase):
             if client.poll() is None:
                 client.kill()
                 client.wait(timeout=5)
+            os.close(master_fd)
+
+    def test_client_handoff_executes_helper_and_reattaches(self):
+        master_fd, slave_fd = pty.openpty()
+        env = os.environ.copy()
+        env.pop('TMUX', None)
+        env.pop('TMUX_PANE', None)
+        env['TERM'] = 'xterm-256color'
+        client = subprocess.Popen(
+            ['tmux', '-S', self.sock, 'attach-session', '-t', 'outer'],
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            close_fds=True, env=env)
+        os.close(slave_fd)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                listed = subprocess.run(
+                    ['tmux', '-S', self.sock, 'list-clients'],
+                    capture_output=True, text=True)
+                if listed.returncode == 0 and listed.stdout.strip():
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail('isolated outer tmux client did not attach')
+
+            with mock.patch.object(autotmux, '_GATEWAY_POOL', None):
+                self.assertTrue(autotmux._handoff_outer_tmux_client(
+                    ['--version']))
+
+            output = bytearray()
+            deadline = time.monotonic() + 8
+            reattached = False
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master_fd], [], [], 0.1)
+                if ready:
+                    try:
+                        output.extend(os.read(master_fd, 65536))
+                    except OSError:
+                        break
+                listed = subprocess.run(
+                    ['tmux', '-S', self.sock, 'list-clients'],
+                    capture_output=True, text=True)
+                reattached = bool(
+                    listed.returncode == 0 and listed.stdout.strip())
+                if b'AutoTmux ' in output and reattached:
+                    break
+            self.assertIn(b'AutoTmux ', output)
+            self.assertTrue(reattached)
+            self.assertIsNone(client.poll())
+        finally:
+            if client.poll() is None:
+                client.terminate()
+                try:
+                    client.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    client.kill()
+                    client.wait(timeout=3)
             os.close(master_fd)
 
     def test_restore_reverts_everything(self):
@@ -517,6 +575,50 @@ class WillNestLogicTests(unittest.TestCase):
         step.assert_called_once_with()
         restore.assert_called_once_with()
         run.assert_called_once_with(['tmux', 'attach', '-t', 'main'])
+
+    def test_outer_client_handoff_removes_outer_tmux_from_data_path(self):
+        os.environ['TMUX'] = '/tmp/outer.sock,123,0'
+        with mock.patch.object(
+                autotmux, '_tmux_output', return_value='/dev/pts/42\n'), \
+             mock.patch.object(autotmux, '_tmux', return_value=True) as run, \
+             mock.patch.object(autotmux, '_GATEWAY_POOL', None):
+            self.assertTrue(autotmux._handoff_outer_tmux_client(
+                ['--attach', 'gpu1:train session']))
+        args = run.call_args.args
+        self.assertEqual(args[:4], (
+            'detach-client', '-t', '/dev/pts/42', '-E'))
+        command = args[4]
+        self.assertIn('unset TMUX TMUX_PANE', command)
+        self.assertIn('--attach', command)
+        self.assertIn('gpu1:train session', command)
+        self.assertIn('/tmp/outer.sock', command)
+        self.assertIn("attach-session -t '$0'", command)
+
+    def test_outer_client_handoff_fails_closed_without_safe_client_tty(self):
+        for value in (None, '', 'relative', '/dev/pts/1\n/dev/pts/2'):
+            with self.subTest(value=value), \
+                 mock.patch.object(autotmux, '_tmux_output',
+                                   return_value=value), \
+                 mock.patch.object(autotmux, '_tmux') as run, \
+                 mock.patch.object(autotmux, '_GATEWAY_POOL', None):
+                self.assertFalse(autotmux._handoff_outer_tmux_client(
+                    ['--attach', 'gpu1:train']))
+                run.assert_not_called()
+
+    def test_outer_client_handoff_preserves_live_gateway_order(self):
+        os.environ['TMUX'] = '/tmp/outer.sock,123,0'
+        pool = SimpleNamespace(
+            gateways=('login1', 'login2'), active_gateway='login2')
+        with mock.patch.object(
+                autotmux, '_tmux_output', return_value='/dev/pts/42'), \
+             mock.patch.object(autotmux, '_tmux', return_value=True) as run, \
+             mock.patch.object(autotmux, '_GATEWAY_POOL', pool):
+            self.assertTrue(autotmux._handoff_outer_tmux_client(
+                ['--attach', 'gpu1:train']))
+        command = run.call_args.args[4]
+        self.assertLess(
+            command.index('--gateway login2'),
+            command.index('--gateway login1'))
 
     def test_direct_attach_restore_failure_is_visible_and_nonzero(self):
         import io

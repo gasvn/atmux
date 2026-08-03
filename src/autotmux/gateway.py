@@ -40,6 +40,23 @@ _NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _FAST_INTERACTIVE_RETRY = 300.0
+_INTERACTIVE_CONTROL_PERSIST = 300
+
+
+def interactive_ssh_options() -> list[str]:
+    """OpenSSH options for a latency-sensitive terminal data path.
+
+    ``IgnoreUnknown`` must precede ``ObscureKeystrokeTiming`` so the same argv
+    works with the OpenSSH 8.x clients still common on login nodes as well as
+    newer laptop clients.  RPC/preview transports deliberately do not use
+    these options: only the human-facing terminal needs this policy.
+    """
+    return [
+        "-o", "IPQoS=none",
+        "-o", "Compression=no",
+        "-o", "IgnoreUnknown=ObscureKeystrokeTiming",
+        "-o", "ObscureKeystrokeTiming=no",
+    ]
 
 
 class GatewayError(RuntimeError):
@@ -208,6 +225,8 @@ class GatewayPool:
         # end-to-end SSH auth to compute nodes, so remember a failed fast path
         # briefly and use the universally-compatible login agent instead.
         self._fast_interactive_retry: dict[tuple[str, str], float] = {}
+        self._interactive_prewarming: set[tuple[str, str]] = set()
+        self._interactive_prewarm_retry: dict[tuple[str, str], float] = {}
         self._last_probe: dict[str, float | None] = {
             gateway: None for gateway in self._gateways}
         self._active: str | None = None
@@ -317,6 +336,8 @@ class GatewayPool:
             "-o", f"ServerAliveCountMax={int(self.settings['server_alive_max'])}",
             "-o", "StrictHostKeyChecking=accept-new",
         ]
+        if tty:
+            args += interactive_ssh_options()
         if direct:
             args += ["-o", "ControlPath=none", "-o", "ControlMaster=no"]
         else:
@@ -324,7 +345,7 @@ class GatewayPool:
                             if tty else self._control_path(gateway))
             args += [
                 "-o", "ControlMaster=auto",
-                "-o", f"ControlPersist={int(self.settings['control_persist'])}",
+                "-o", f"ControlPersist={min(int(self.settings['control_persist']), _INTERACTIVE_CONTROL_PERSIST) if tty else int(self.settings['control_persist'])}",
                 "-o", f"ControlPath={control_path}",
             ]
         args.append("-tt" if tty else "-T")
@@ -350,13 +371,14 @@ class GatewayPool:
             "-o", f"ServerAliveInterval={int(self.settings['server_alive_int'])}",
             "-o", f"ServerAliveCountMax={int(self.settings['server_alive_max'])}",
             "-o", "StrictHostKeyChecking=accept-new",
+            *interactive_ssh_options(),
         ]
         if direct:
             args += ["-o", "ControlPath=none", "-o", "ControlMaster=no"]
         else:
             args += [
                 "-o", "ControlMaster=auto",
-                "-o", f"ControlPersist={int(self.settings['control_persist'])}",
+                "-o", f"ControlPersist={min(int(self.settings['control_persist']), _INTERACTIVE_CONTROL_PERSIST)}",
                 "-o", f"ControlPath={self._interactive_control_path(gateway)}",
             ]
         args += ["-T", "-W", "%h:%p", gateway]
@@ -378,13 +400,14 @@ class GatewayPool:
                 "-o", f"ServerAliveCountMax={int(self.settings['server_alive_max'])}",
                 "-o", "StrictHostKeyChecking=accept-new",
                 "-o", f"ProxyCommand={self._jump_proxy_command(gateway, direct=direct)}",
+                *interactive_ssh_options(),
             ]
             if direct:
                 args += ["-o", "ControlPath=none", "-o", "ControlMaster=no"]
             else:
                 args += [
                     "-o", "ControlMaster=auto",
-                    "-o", f"ControlPersist={int(self.settings['control_persist'])}",
+                    "-o", f"ControlPersist={min(int(self.settings['control_persist']), _INTERACTIVE_CONTROL_PERSIST)}",
                     "-o", f"ControlPath={self._jump_control_path(gateway, target)}",
                 ]
             with self._lock:
@@ -397,8 +420,82 @@ class GatewayPool:
                            if remote_user else target)
             args += ["-tt", destination]
         if kind == "attach":
-            args.append(f"exec tmux attach -t {shlex.quote(session or '')}")
+            # Detach ghost clients left behind by a stalled TCP connection.
+            # Otherwise their old geometry and delayed input continue to act
+            # on the same tmux session after the user reconnects.
+            args.append(
+                f"exec tmux attach-session -d -t {shlex.quote(session or '')}")
         return args
+
+    def _fast_probe_argv(self, gateway: str, target: str) -> list[str]:
+        """Establish the exact interactive transport without taking a PTY."""
+        args = self._fast_interactive_argv(
+            gateway, target, "shell", None, direct=False)
+        try:
+            tty_index = args.index("-tt")
+        except ValueError as error:
+            raise GatewayError("interactive SSH argv has no TTY option") from error
+        args[tty_index] = "-T"
+        args.append("true")
+        return args
+
+    def prewarm_interactive(self, node: str) -> bool:
+        """Best-effort background handshake for the next terminal attach.
+
+        Unlike the historical warm-shell feature this retains no PTY and
+        proxies no terminal bytes.  It only leaves OpenSSH's dedicated master
+        alive for five minutes, so the foreground attach can open its channel
+        immediately while still using the native ssh terminal loop.
+        """
+        try:
+            route = self._route_for(node)
+        except (KeyError, ValueError):
+            return False
+        if route.target == "localhost" and route.gateway is None:
+            return False
+        candidates = self._interactive_candidates(
+            route.target, route.gateway if route.fixed else None)
+        if not candidates:
+            return False
+        gateway = candidates[0]
+        key = (gateway, route.target)
+        now = self._clock()
+        with self._lock:
+            if not self._fast_interactive_eligible(gateway, route.target):
+                return False
+            if key in self._interactive_prewarming:
+                return False
+            if self._interactive_prewarm_retry.get(key, 0.0) > now:
+                return False
+            if self._fast_interactive_master_present(gateway, route.target):
+                return True
+            self._interactive_prewarming.add(key)
+        try:
+            try:
+                result = subprocess.run(
+                    self._fast_probe_argv(gateway, route.target),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=int(self.settings["connect_timeout"]) + 5,
+                )
+                ok = result.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+            with self._lock:
+                if ok:
+                    self._interactive_prewarm_retry.pop(key, None)
+                else:
+                    self._interactive_prewarm_retry[key] = (
+                        self._clock() + _FAST_INTERACTIVE_RETRY)
+            if ok:
+                self._restore_fast_interactive(gateway, route.target)
+            else:
+                self._defer_fast_interactive(gateway, route.target)
+            return ok
+        finally:
+            with self._lock:
+                self._interactive_prewarming.discard(key)
 
     @staticmethod
     def _parse_response(stdout: bytes) -> dict:

@@ -74,6 +74,9 @@ class PickBaseTests(unittest.TestCase):
         self.assertTrue(paths.CTL_DIR.startswith(paths.BASE))
         self.assertTrue(paths.WARM_DIR.startswith(paths.BASE))
         self.assertEqual(os.path.basename(paths.WARM_DIR), 'warm')
+        self.assertTrue(paths.INTERACTIVE_CTL_DIR.startswith(paths.BASE))
+        self.assertEqual(
+            os.path.basename(paths.INTERACTIVE_CTL_DIR), 'interactive-ctl')
         self.assertEqual(
             paths.GUARD_FILE,
             os.environ.get('AUTOTMUX_GUARD_FILE',
@@ -97,6 +100,10 @@ class PickBaseTests(unittest.TestCase):
                  mock.patch.object(paths, 'CTL_DIR', ctl), \
                  mock.patch.object(paths, 'WARM_DIR',
                                    os.path.join(base, 'warm')), \
+                 mock.patch.object(paths, 'INTERACTIVE_CTL_DIR',
+                                   os.path.join(base, 'interactive-ctl')), \
+                 mock.patch.object(paths, 'GATEWAY_CTL_DIR',
+                                   os.path.join(base, 'gateway-ctl')), \
                  mock.patch.object(paths, '_BASE_ID', (st.st_dev, st.st_ino)):
                 paths.ensure_runtime_dirs()
                 os.rename(base, base + '.old')

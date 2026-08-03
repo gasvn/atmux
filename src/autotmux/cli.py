@@ -9,6 +9,7 @@ import asyncio
 from dataclasses import dataclass
 import enum
 import fcntl
+from functools import partial
 import hashlib
 import json
 import math
@@ -56,6 +57,7 @@ GUARD_FILE = paths.GUARD_FILE
 SNAPSHOT_FILE = paths.SNAPSHOT_FILE
 PREVIEW_SOCKET = paths.PREVIEW_SOCKET
 WARM_DIR = paths.WARM_DIR
+INTERACTIVE_CTL_DIR = paths.INTERACTIVE_CTL_DIR
 _RUNTIME_DISCOVERY_ENABLED = False
 _runtime_paths_lock = threading.Lock()
 _NODE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
@@ -87,9 +89,9 @@ _OUTER_TMUX_LOCK_TIMEOUT = 2.0
 # still leaves room for a terminal escape sequence delivered in one packet.
 _OUTER_TMUX_NESTED_ESCAPE_TIME = 10
 _OUTER_TMUX_LATENCY_LEASE_VERSION = 1
-_PROXY_INPUT_BUFFER_LIMIT = 64 * 1024
-_PROXY_OUTPUT_BUFFER_LIMIT = 256 * 1024
-_PROXY_IO_CHUNK = 16 * 1024
+_PROXY_INPUT_BUFFER_LIMIT = 16 * 1024
+_PROXY_OUTPUT_BUFFER_LIMIT = 64 * 1024
+_PROXY_IO_CHUNK = 8 * 1024
 _PROXY_IDLE_TIMEOUT = 0.1
 _PREVIEW_LOOP_TICK = 0.25
 _PREVIEW_CHANGED_DELAY = 1.0
@@ -181,7 +183,7 @@ def _sync_active_runtime_paths() -> bool:
     if base is None:
         return False
     global STATE_FILE, SNAPSHOT_FILE, PREVIEW_SOCKET, WARM_DIR
-    global PID_FILE, LOCK_FILE, CTL_DIR
+    global PID_FILE, LOCK_FILE, CTL_DIR, INTERACTIVE_CTL_DIR
     with _runtime_paths_lock:
         changed = STATE_FILE != os.path.join(base, 'daemon.json')
         STATE_FILE = os.path.join(base, 'daemon.json')
@@ -191,6 +193,7 @@ def _sync_active_runtime_paths() -> bool:
         PID_FILE = os.path.join(base, 'daemon.pid')
         LOCK_FILE = PID_FILE + '.lock'
         CTL_DIR = os.path.join(base, 'ctl')
+        INTERACTIVE_CTL_DIR = os.path.join(base, 'interactive-ctl')
     return changed
 
 
@@ -310,6 +313,10 @@ def _ctl_path(node: str) -> str:
     return paths.control_path(node, CTL_DIR)
 
 
+def _interactive_ctl_path(node: str) -> str:
+    return paths.control_path(f'interactive-{node}', INTERACTIVE_CTL_DIR)
+
+
 def _apply_daemon_ssh_settings(state: dict) -> None:
     """Adopt validated daemon-published SSH settings without reading NFS."""
     published = state.get('ssh_config') if isinstance(state, dict) else None
@@ -330,7 +337,8 @@ def _apply_daemon_ssh_settings(state: dict) -> None:
         _SSH_SETTINGS.update(validated)
 
 
-def _get_ssh_args(node: str, *, direct: bool = False) -> list:
+def _get_ssh_args(node: str, *, direct: bool = False,
+                  interactive: bool = False) -> list:
     """Return ControlPath + keepalive flags so an idle slave channel
     doesn't get silently dropped by NAT/firewalls (which is what kicks
     `<Start Shell>` users out — plain bash has no keepalive of its own,
@@ -344,10 +352,22 @@ def _get_ssh_args(node: str, *, direct: bool = False) -> list:
         '-o', f"ServerAliveInterval={settings['server_alive_int']}",
         '-o', f"ServerAliveCountMax={settings['server_alive_max']}",
     ]
+    if interactive:
+        # Some networks mishandle OpenSSH's interactive DSCP marking.  Newer
+        # clients also add fixed-rate keystroke packets; under loss those extra
+        # packets amplify queueing and make input arrive in visible bursts.
+        # IgnoreUnknown keeps the argv compatible with OpenSSH < 9.5.
+        args += gateway_client.interactive_ssh_options()
     if direct:
         # Explicitly bypass a stale/exhausted mux. Merely omitting ControlPath
         # still lets ~/.ssh/config select one again.
         args += ['-o', 'ControlPath=none', '-o', 'ControlMaster=no']
+    elif interactive:
+        args += [
+            '-o', 'ControlMaster=auto',
+            '-o', 'ControlPersist=300',
+            '-o', f'ControlPath={_interactive_ctl_path(node)}',
+        ]
     else:
         ctl = _ctl_path(node)
         if os.path.exists(ctl):
@@ -1061,6 +1081,54 @@ def _will_nest_tmux(sess: str) -> bool:
         _START_SHELL_SESSION, _OFFLINE_SESSION)
 
 
+def _handoff_outer_tmux_client(helper_args: list[str]) -> bool:
+    """Run an interactive helper outside the surrounding tmux client.
+
+    Making the outer server transparent fixes key bindings, but its renderer is
+    still in the byte path and can lag behind a smooth direct SSH connection.
+    tmux 2.7+'s ``detach-client -E`` lets the real client temporarily replace
+    itself with our attach helper.  The dashboard keeps running in its detached
+    pane; after the helper exits, the same client reattaches to it.
+
+    In gateway mode the helper receives the live pool's gateways explicitly,
+    with the current route first, so one-shot overrides survive the handoff.
+    """
+    context = _outer_tmux_context()
+    if context is None:
+        return False
+    client_tty = _tmux_output('display-message', '-p', '#{client_tty}')
+    if client_tty is None:
+        return False
+    client_tty = client_tty.strip()
+    if (not client_tty or len(client_tty) > 4096
+            or not os.path.isabs(client_tty)
+            or any(ord(char) < 32 or ord(char) == 127 for char in client_tty)):
+        return False
+    deployment_args = []
+    if _GATEWAY_POOL is not None:
+        gateways = list(_GATEWAY_POOL.gateways)
+        active = _GATEWAY_POOL.active_gateway
+        if active in gateways:
+            gateways.remove(active)
+            gateways.insert(0, active)
+        for gateway in gateways:
+            deployment_args.extend(['--gateway', gateway])
+    helper = [
+        sys.executable, '-m', 'autotmux.cli',
+        *deployment_args, *helper_args,
+    ]
+    reattach = [
+        'tmux', '-S', context['socket'],
+        'attach-session', '-t', context['session'],
+    ]
+    command = (
+        f"unset TMUX TMUX_PANE; {shlex.join(helper)}; "
+        f"exec {shlex.join(reattach)}"
+    )
+    return _tmux(
+        'detach-client', '-t', client_tty, '-E', command)
+
+
 def _run_user_command(argv) -> tuple[int, str]:
     """Run an intentional interactive command without crashing the TUI.
 
@@ -1112,9 +1180,18 @@ def _run_remote_user_command(node: str, remote_args: list[str] | None,
             node, remote_args, direct=direct)
 
     def argv(use_direct: bool) -> list[str]:
-        base = (['ssh'] + _get_ssh_args(node, direct=use_direct)
+        command = list(remote_args or ())
+        if (len(command) == 4
+                and command[:3] == ['tmux', 'attach', '-t']):
+            # A dead-but-not-yet-timed-out SSH connection leaves a tmux client
+            # behind.  Detaching it prevents its old window size and delayed
+            # keystrokes from affecting the newly connected client.
+            command = [
+                'tmux', 'attach-session', '-d', '-t', command[3]]
+        base = (['ssh'] + _get_ssh_args(
+                    node, direct=use_direct, interactive=True)
                 + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node])
-        return base + (remote_args or [])
+        return base + command
 
     mode = 'direct SSH' if direct else 'SSH'
     print(f"\n[atmux] connecting to {node} via {mode}…", flush=True)
@@ -1125,7 +1202,7 @@ def _run_remote_user_command(node: str, remote_args: list[str] | None,
         _report_network_event(
             node, 'failure', 'ControlMaster interactive attach failed',
             'attach-mux')
-        print("\n[atmux] shared SSH path failed; retrying once with a direct connection…",
+        print("\n[atmux] low-latency SSH path failed; retrying once with a fresh connection…",
               flush=True)
         returncode, error = _run_user_command(argv(True))
         direct = True
@@ -2527,8 +2604,13 @@ class AutotmuxApp(App):
         # a render per keystroke.
         self._preview_render_timer = None
         self._selection_changed_at = 0.0
-        # Pool of pre-warmed ssh slaves — see WarmSlavePool docstring.
+        # Retained only so a live deployment switch can shut down legacy warm
+        # children created by an older frontend. Normal attaches never call
+        # this pool; terminal bytes always stay in native OpenSSH.
         self._warm_pool = WarmSlavePool()
+        self._interactive_prewarm_retry: dict[str, float] = {}
+        self._interactive_prewarming: set[str] = set()
+        self._interactive_prewarm_lock = threading.Lock()
 
         # Paint an immediately-responsive empty shell, then populate from
         # bounded background reads. Even a wedged runtime filesystem can no
@@ -2707,25 +2789,23 @@ class AutotmuxApp(App):
                 ok = False
         return ok
 
-    # Cap on pre-warmed ssh slaves. Each slave is a persistent `ssh -tt` plus a
-    # held pty master fd, so warming EVERY node in a big allocation (100+ nodes)
-    # would exhaust file descriptors (EMFILE) and put an idle-shell load on every
-    # node. We warm at most this many, always including the selected node.
-    _MAX_WARM = 12
+    # Cap background handshakes.  These are ordinary no-PTY `ssh ... true`
+    # channels that leave only a short-lived ControlMaster behind; bounding the
+    # set avoids an authentication burst for very large allocations.
+    _MAX_WARM = 4
 
     def _dispatch_warm(self, rows) -> None:
-        if _gateway_mode():
-            # Compute-node warming remains owned by the login-node daemon.
-            return
-        # Keep an idle ssh slave warm for the nodes most likely to be attached —
-        # Spawn off the main thread so it never blocks the UI. exclusive=True
-        # stops back-to-back refreshes dispatching parallel warm-alls.
+        # Historical versions pre-opened a remote shell on a private PTY and
+        # relayed every terminal byte through Python.  That saved one remote
+        # fork at attach time, but under backpressure it accumulated old screen
+        # output and queued input -- the user-visible "input drift".  Warm only
+        # native OpenSSH masters now; no PTY or terminal byte is retained here.
         state_nodes = self._last_state.get('nodes', {}) if isinstance(
             self._last_state, dict) else {}
-        nodes_in_view = []
+        nodes = []
         for row in rows:
             node = row[0]
-            if node == 'localhost':
+            if node == 'localhost' or node in nodes:
                 continue
             node_state = state_nodes.get(node, {}) if isinstance(
                 state_nodes, dict) else {}
@@ -2735,16 +2815,19 @@ class AutotmuxApp(App):
                     and network_state.get('state') in {
                         'suspect', 'offline', 'half-open'}):
                 continue
-            nodes_in_view.append(node)
-        # Dedup preserving order; prioritise the currently-selected node.
-        ordered = ([self.selected_node] if self.selected_node in nodes_in_view else [])
-        for n in nodes_in_view:
-            if n not in ordered:
-                ordered.append(n)
-        wanted = set(ordered[:self._MAX_WARM])
+            nodes.append(node)
+        if self.selected_node in nodes:
+            nodes.remove(self.selected_node)
+            nodes.insert(0, self.selected_node)
+        if not nodes:
+            return
+        source_pool = _GATEWAY_POOL
         self.run_worker(
-            self._warm_pool_warm_all_async(wanted),
-            exclusive=True, group='warm-pool',
+            partial(
+                self._prewarm_interactive_async,
+                tuple(nodes[:self._MAX_WARM]), source_pool,
+            ),
+            exclusive=True, group='interactive-prewarm',
         )
 
     def _refresh_table(self, state=None) -> None:
@@ -3240,32 +3323,63 @@ class AutotmuxApp(App):
                 extra += f" · ⚠ cached: {reason}"
         return f"{real} sessions · updated {updated}{extra}"
 
-    async def _warm_pool_warm_all_async(self, nodes) -> None:
-        """PTY/ssh setup can be slow on a busy login node; keep it off-loop."""
-        if _gateway_mode():
-            return
-        try:
-            await _offload(self._warm_pool.warm_all, nodes)
-        except Exception:
-            return  # warming is an optional latency optimization
+    async def _prewarm_interactive_async(
+            self, nodes: tuple[str, ...], source_pool) -> None:
+        """Pre-establish native SSH transports without allocating a PTY."""
+        def warm() -> None:
+            if source_pool is not None:
+                for node in nodes:
+                    if source_pool is not _GATEWAY_POOL:
+                        return
+                    source_pool.prewarm_interactive(node)
+                return
 
-    async def _warm_pool_warm_node_async(self, node: str) -> None:
-        """Replenish one consumed slave without delaying the resumed TUI."""
-        if _gateway_mode():
-            return
-        try:
-            await _offload_for(
-                _UI_FILE_READ_TIMEOUT, self._warm_pool.warm, node)
-        except Exception:
-            return  # the ordinary ssh path remains available
+            for node in nodes:
+                if _GATEWAY_POOL is not None:
+                    return
+                now = time.monotonic()
+                # Cancelling a Textual worker cannot stop a subprocess already
+                # running in its executor thread. A slow handshake may outlive
+                # several UI refreshes, so guard it independently and never
+                # launch duplicate SSH attempts for the same node.
+                with self._interactive_prewarm_lock:
+                    if (node in self._interactive_prewarming
+                            or self._interactive_prewarm_retry.get(
+                                node, 0.0) > now):
+                        continue
+                    if os.path.exists(_interactive_ctl_path(node)):
+                        self._interactive_prewarm_retry.pop(node, None)
+                        continue
+                    self._interactive_prewarming.add(node)
+                with _SSH_SETTINGS_LOCK:
+                    timeout = int(_SSH_SETTINGS['connect_timeout']) + 5
+                argv = [
+                    'ssh', *_get_ssh_args(node, interactive=True),
+                    '-o', 'StrictHostKeyChecking=accept-new',
+                    '-T', node, 'true',
+                ]
+                ok = False
+                try:
+                    result = subprocess.run(
+                        argv, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, timeout=timeout)
+                    ok = result.returncode == 0
+                except (OSError, subprocess.TimeoutExpired):
+                    ok = False
+                finally:
+                    with self._interactive_prewarm_lock:
+                        self._interactive_prewarming.discard(node)
+                        if ok:
+                            self._interactive_prewarm_retry.pop(node, None)
+                        else:
+                            self._interactive_prewarm_retry[node] = (
+                                time.monotonic() + 300.0)
 
-    def _schedule_warm_replenish(self, node: str) -> None:
-        if node == 'localhost' or _gateway_mode():
+        try:
+            await _offload(warm)
+        except Exception:
             return
-        self.run_worker(
-            self._warm_pool_warm_node_async(node),
-            exclusive=True, group=f'warm-replenish:{node}',
-        )
 
     async def action_refresh_table(self) -> None:
         await self._refresh_async()
@@ -3615,10 +3729,16 @@ class AutotmuxApp(App):
             self.notify(f'invalid node name: {node!r}', severity='error',
                         timeout=5, markup=False)
             return
-        used_warm = False
+        if node != 'localhost' and os.environ.get('TMUX'):
+            helper_args = (
+                ['--shell', node]
+                if sess == _START_SHELL_SESSION
+                else ['--attach', f'{node}:{sess}']
+            )
+            if _handoff_outer_tmux_client(helper_args):
+                return
         network_outcome = None
         network_reason = ''
-        used_direct = False
         direct_preferred = (False if _gateway_mode() else
                             _node_network_degraded(self._last_state, node))
         # If we're inside tmux and about to nest another tmux (any real session,
@@ -3647,55 +3767,21 @@ class AutotmuxApp(App):
                         returncode, command_error = _run_user_command(
                             ['tmux', 'attach', '-t', sess])
                 else:
-                    warm_result = WarmHandoffResult(
-                        WarmHandoffStatus.UNAVAILABLE)
                     if direct_preferred:
                         print(f"\n[atmux] {node} is in network recovery; "
-                              "bypassing the shared SSH connection.", flush=True)
-                    elif not _gateway_mode():
-                        try:
-                            if self._warm_pool.is_starting(node):
-                                print(f"\n[atmux] preparing warm SSH to {node}…",
-                                      flush=True)
-                            warm_result = (
-                                self._warm_pool.shell(node)
-                                if sess == _START_SHELL_SESSION
-                                else self._warm_pool.attach(node, sess))
-                        except Exception as error:
-                            warm_result = WarmHandoffResult(
-                                WarmHandoffStatus.TRANSPORT_LOST, str(error))
-                    used_warm = bool(warm_result)
-                    if used_warm:
+                              "opening a fresh SSH connection.", flush=True)
+                    remote_args = None if sess == _START_SHELL_SESSION else [
+                        'tmux', 'attach', '-t', shlex.quote(sess)]
+                    returncode, command_error, _used_direct = (
+                        _run_remote_user_command(
+                            node, remote_args, direct=direct_preferred))
+                    if returncode == 255:
+                        network_outcome = 'failure'
+                        network_reason = command_error or 'interactive SSH failed'
+                    elif returncode != 127 or not command_error:
+                        # Any remote exit status other than SSH's transport
+                        # status 255 proves the network path worked.
                         network_outcome = 'success'
-                    elif warm_result.status is WarmHandoffStatus.REMOTE_REJECTED:
-                        # The warm shell proved transport health and reported a
-                        # vanished tmux session. Retrying SSH cannot bring it back.
-                        returncode = 1
-                        command_error = warm_result.detail
-                        network_outcome = 'success'
-                    elif warm_result.status is WarmHandoffStatus.CANCELLED:
-                        returncode = 130
-                        command_error = 'connection cancelled'
-                    else:
-                        use_direct = direct_preferred or warm_result.bypass_master
-                        if warm_result.bypass_master:
-                            _report_network_event(
-                                node, 'failure', warm_result.detail or
-                                warm_result.status.value, 'warm-attach')
-                            print("\n[atmux] warm/shared SSH is unavailable; "
-                                  "switching to a direct connection.", flush=True)
-                        remote_args = None if sess == _START_SHELL_SESSION else [
-                            'tmux', 'attach', '-t', shlex.quote(sess)]
-                        returncode, command_error, used_direct = (
-                            _run_remote_user_command(
-                                node, remote_args, direct=use_direct))
-                        if returncode == 255:
-                            network_outcome = 'failure'
-                            network_reason = command_error or 'interactive SSH failed'
-                        elif returncode != 127 or not command_error:
-                            # Any remote exit status other than SSH's transport
-                            # status 255 proves the network path worked.
-                            network_outcome = 'success'
             finally:
                 if nest:
                     restore_ok = _tmux_restore()
@@ -3710,11 +3796,6 @@ class AutotmuxApp(App):
         elif nest and not step_ok:
             self.notify('outer tmux passthrough was unavailable',
                         severity='warning', timeout=6, markup=False)
-        # Replace a consumed (or missing/stale) slave in the background so the
-        # next attach is fast without making this one wait before the dashboard
-        # becomes responsive again.
-        if not used_direct and network_outcome != 'failure':
-            self._schedule_warm_replenish(node)
 
     async def action_open_shell(self) -> None:
         node = self.selected_node
@@ -3724,12 +3805,13 @@ class AutotmuxApp(App):
             self.notify(f'invalid node name: {node!r}', severity='error',
                         timeout=5, markup=False)
             return
+        if (node != 'localhost' and os.environ.get('TMUX')
+                and _handoff_outer_tmux_client(['--shell', node])):
+            return
         returncode = 0
         command_error = ''
-        used_warm = False
         network_outcome = None
         network_reason = ''
-        used_direct = False
         direct_preferred = (False if _gateway_mode() else
                             _node_network_degraded(self._last_state, node))
         with self.suspend():
@@ -3737,44 +3819,19 @@ class AutotmuxApp(App):
                 returncode, command_error = _run_user_command(
                     [os.environ.get('SHELL') or '/bin/bash'])
             else:
-                warm_result = WarmHandoffResult(
-                    WarmHandoffStatus.UNAVAILABLE)
-                if not direct_preferred and not _gateway_mode():
-                    try:
-                        if self._warm_pool.is_starting(node):
-                            print(f"\n[atmux] preparing warm SSH to {node}…",
-                                  flush=True)
-                        warm_result = self._warm_pool.shell(node)
-                    except Exception as error:
-                        warm_result = WarmHandoffResult(
-                            WarmHandoffStatus.TRANSPORT_LOST, str(error))
-                used_warm = bool(warm_result)
-                if used_warm:
+                returncode, command_error, _used_direct = (
+                    _run_remote_user_command(
+                        node, None, direct=direct_preferred))
+                if returncode == 255:
+                    network_outcome = 'failure'
+                    network_reason = command_error or 'interactive SSH failed'
+                elif returncode != 127 or not command_error:
                     network_outcome = 'success'
-                elif warm_result.status is WarmHandoffStatus.CANCELLED:
-                    returncode = 130
-                    command_error = 'connection cancelled'
-                else:
-                    use_direct = direct_preferred or warm_result.bypass_master
-                    if warm_result.bypass_master:
-                        _report_network_event(
-                            node, 'failure', warm_result.detail or
-                            warm_result.status.value, 'warm-shell')
-                    returncode, command_error, used_direct = (
-                        _run_remote_user_command(
-                            node, None, direct=use_direct))
-                    if returncode == 255:
-                        network_outcome = 'failure'
-                        network_reason = command_error or 'interactive SSH failed'
-                    elif returncode != 127 or not command_error:
-                        network_outcome = 'success'
         self._report_command_result(
             f'shell on {node}', returncode, command_error)
         if network_outcome:
             _report_network_event(
                 node, network_outcome, network_reason, 'interactive-shell')
-        if not used_direct and network_outcome != 'failure':
-            self._schedule_warm_replenish(node)
 
     async def action_local_shell(self) -> None:
         # 'autotmux_local' is a tmux session, so inside tmux this nests too.

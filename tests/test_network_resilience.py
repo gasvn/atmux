@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -292,6 +293,12 @@ class InteractiveFallbackTests(unittest.TestCase):
         first = run.call_args_list[0].args[0]
         second = run.call_args_list[1].args[0]
         self.assertNotIn('ControlPath=none', first)
+        self.assertIn('ControlMaster=auto', first)
+        self.assertIn('ControlPersist=300', first)
+        self.assertIn('IPQoS=none', first)
+        self.assertIn('Compression=no', first)
+        self.assertIn('attach-session', first)
+        self.assertIn('-d', first)
         self.assertIn('ControlPath=none', second)
         self.assertIn('ControlMaster=no', second)
         report.assert_called_once()
@@ -313,6 +320,13 @@ class InteractiveFallbackTests(unittest.TestCase):
             with cli._SSH_SETTINGS_LOCK:
                 cli._SSH_SETTINGS.clear()
                 cli._SSH_SETTINGS.update(previous)
+
+    def test_interactive_master_is_isolated_from_daemon_master(self):
+        args = cli._get_ssh_args('gpu1', interactive=True)
+        control = next(
+            item for item in args if item.startswith('ControlPath='))
+        self.assertNotEqual(control, f'ControlPath={cli._ctl_path("gpu1")}')
+        self.assertIn('interactive-ctl', control)
 
     def test_direct_attach_helper_uses_published_direct_preference(self):
         with mock.patch.object(cli, '_request_daemon_start'), \
@@ -340,6 +354,39 @@ class InteractiveFallbackTests(unittest.TestCase):
 
         run.assert_called_once_with('gpu1', None, direct=False)
         publish.assert_called_once_with('gpu1', 0, '', 'direct-shell')
+
+
+class InteractivePrewarmTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_native_handshake_is_not_duplicated_by_refresh(self):
+        app = object.__new__(cli.AutotmuxApp)
+        app._interactive_prewarm_retry = {}
+        app._interactive_prewarming = set()
+        app._interactive_prewarm_lock = threading.Lock()
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_run(*_args, **_kwargs):
+            started.set()
+            release.wait(3)
+            return mock.Mock(returncode=0)
+
+        first = None
+        with mock.patch.object(cli, '_GATEWAY_POOL', None), \
+             mock.patch.object(cli.os.path, 'exists', return_value=False), \
+             mock.patch.object(cli.subprocess, 'run', side_effect=slow_run) as run:
+            first = asyncio.create_task(
+                app._prewarm_interactive_async(('gpu1',), None))
+            try:
+                deadline = time.monotonic() + 2
+                while not started.is_set() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                self.assertTrue(started.is_set(),
+                                'first SSH prewarm did not start')
+                await app._prewarm_interactive_async(('gpu1',), None)
+                self.assertEqual(run.call_count, 1)
+            finally:
+                release.set()
+                await first
 
 
 class PreviewCoordinatorTests(unittest.TestCase):

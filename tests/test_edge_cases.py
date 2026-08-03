@@ -610,6 +610,8 @@ class SessionPayloadTests(unittest.TestCase):
         self.assertNotIn('\x00', script)
         self.assertIn(r'\000AUTOTMUX_SESSIONS\000', script)
         self.assertIn(r'\000AUTOTMUX_TMUXINFO\000', script)
+        self.assertIn('escape-time 10', script)
+        self.assertIn('_atmux_escape -gt 10', script)
 
     def test_noise_and_old_text_marker_cannot_create_phantom_sessions(self):
         payload = (

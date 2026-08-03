@@ -5,7 +5,7 @@ compute nodes. It automatically discovers your running jobs, keeps fast
 SSH connections to each node open in the background, and lets you list,
 preview, and attach to remote tmux sessions from a single TUI.
 
-## Architecture (v0.6.0)
+## Architecture (v0.6.1)
 
 AutoTmux is split into two pieces:
 
@@ -13,7 +13,9 @@ AutoTmux is split into two pieces:
   (`src/autotmux/daemon.py`) that:
   - Polls `squeue -u $USER` every 30 s to discover allocated nodes.
   - Maintains a long-lived SSH ControlMaster connection per node so subsequent
-    `ssh`/`tmux attach` calls return instantly without re-authenticating.
+    background probes return instantly without re-authenticating. Interactive
+    terminals use a separate short-lived master so preview/session payloads
+    can never queue ahead of keystrokes.
   - Uses bounded `ssh -O check` probes plus SSH server keepalives to detect dead
     masters without mistaking an overloaded compute node for a broken one;
     confirmed failures use exponential backoff (30 s → 600 s capped).
@@ -159,12 +161,21 @@ fallback:  local atmux → selected login agent → compute tmux
 ```
 
 The fast path uses one target PTY and a dedicated interactive SSH master, so
-keystrokes never queue behind state/preview RPC payloads. It also applies the
-login account name learned from the remote daemon, which matters when the
-laptop username differs from the cluster username. If the cluster disallows
-end-to-end SSH authentication to compute nodes, AutoTmux remembers that result
-for five minutes and transparently uses the login agent instead. The agent
-reuses that host's existing compute ControlMaster.
+keystrokes never queue behind state/preview RPC payloads. AutoTmux establishes
+that native OpenSSH path in the background for the most likely targets, but no
+Python process relays terminal bytes. Interactive masters expire after five
+idle minutes so a slow connection from an old network does not linger for an
+hour. The path disables compression, problematic DSCP marking, and (on newer
+OpenSSH clients) fixed-rate keystroke padding. It also applies the login account
+name learned from the remote daemon, which matters when the laptop username
+differs from the cluster username. If the cluster disallows end-to-end SSH
+authentication to compute nodes, AutoTmux remembers that result for five
+minutes and transparently uses the login agent instead.
+
+Disabling optional keystroke-timing padding favors responsiveness on lossy
+links. SSH payloads remain encrypted, but a passive observer may infer typing
+timing; remove the `ObscureKeystrokeTiming=no` policy if that privacy tradeoff
+is inappropriate for your environment.
 
 If an outer login connection returns SSH's transport status, AutoTmux bypasses
 the stale mux and then moves to another healthy login node. A live TCP/SSH
@@ -196,6 +207,7 @@ if available, otherwise `/tmp/autotmux_<uid>/` (see [Configuration](#configurati
 | `<BASE>/daemon.pid`  | Daemon PID. |
 | `<BASE>/daemon.pid.lock` | Runtime singleton lock (held for the daemon lifetime). |
 | `<BASE>/ctl/cm_<node>` | One ControlMaster socket per node. |
+| `<BASE>/interactive-ctl/` | Short-lived, terminal-only ControlMaster sockets. |
 | `<BASE>/snapshots.json` | Per-(node,session) tmux pane snapshots. |
 | `<BASE>/preview.sock` | Private frontend/daemon preview and network-health IPC. |
 | `<BASE>/warm/` | Ownership records for pre-warmed interactive SSH children. |
@@ -289,11 +301,15 @@ legacy `/tmp` pid file so you don't end up with two daemons.
 | **r**     | Force-refresh the table from the daemon snapshot. |
 | **q**     | Quit. |
 
-When `atmux` itself runs inside tmux and attaches another tmux, it temporarily
-makes the surrounding session transparent so the inner prefix and function
-keys pass through. During that attach the outer status line is hidden and the
-outer server's `escape-time` is leased at `min(current, 10 ms)` to avoid stacked
-500 ms key-sequence delays. The last concurrent attach restores every original
+When `atmux` itself runs inside tmux, it temporarily hands the outer client
+directly to the SSH helper with `detach-client -E`; after detach it automatically
+reattaches to the dashboard. Local gateway selections are carried into the
+helper automatically. This removes the outer tmux renderer from the terminal
+data path entirely. If client handoff is unavailable, AutoTmux falls back to
+making the surrounding session transparent so inner prefixes and function keys
+pass through. During that fallback the outer status line is hidden and
+`escape-time` is leased at
+`min(current, 10 ms)`. The last concurrent attach restores every original
 setting exactly; press **F12** for emergency recovery after a killed client.
 
 The right-hand pane shows a `tmux capture-pane` preview of the
@@ -308,19 +324,21 @@ gradually (up to 8 s); transport failures use jittered exponential backoff up
 to `network_backoff_cap`. The STATUS column and subtitle show network recovery
 and cached-preview age instead of leaving an indefinite “Loading” message.
 
-Remote attaches reuse the already-started warm login shell after a normal tmux
-detach, so repeat entry avoids another remote shell startup. Each warm SSH is
-bound to its owning frontend with Linux's parent-death signal and an
-identity-checked runtime record; a daemon sweep removes crash leftovers without
-matching unrelated SSH clients. If a shared ControlMaster attach returns SSH's
-transport status, AutoTmux retries exactly once with `ControlPath=none` and
-`ControlMaster=no`. During a truly stuck interactive connection, press Enter
-and then type `~.` to disconnect immediately.
+Remote attaches now hand the real terminal directly to OpenSSH. AutoTmux only
+pre-establishes a no-PTY master, removing the former Python/PTY relay whose
+screen and input buffers could drift apart under backpressure. Reattaching uses
+`tmux attach-session -d`, which removes a ghost client left by a stalled TCP
+connection before that client's delayed input or stale geometry can affect the
+new screen. If the low-latency master returns SSH's transport status, AutoTmux
+retries exactly once with `ControlPath=none` and `ControlMaster=no`. During a
+truly stuck interactive connection, press Enter and then type `~.` to disconnect
+immediately.
 
-The STATUS column shows `⚠ ESC Nms` when the remote tmux server's `escape-time`
-exceeds 50 ms; this setting can make Vim/Alt/function-key sequences feel stuck
-even when the network relay is healthy. Set it in the remote tmux configuration
-(commonly `set -sg escape-time 10`) if that latency is unwanted.
+The daemon lowers a live remote tmux server's `escape-time` to 10 ms when it is
+higher, without editing `tmux.conf`; an already-lower value is preserved. This
+removes the default 500 ms ambiguity delay that makes Vim/Alt/function-key
+sequences feel stuck, especially when tmux is nested. The STATUS column still
+shows `⚠ ESC Nms` if tuning was unavailable and the value remains above 50 ms.
 
 ### Keep-alive auto-renew
 

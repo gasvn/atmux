@@ -266,8 +266,36 @@ class GatewayPoolTests(unittest.TestCase):
         self.assertEqual(argv.count("-tt"), 1)
         self.assertEqual(
             argv[-2:],
-            ["cluster-user@gpu1", "exec tmux attach -t 'train session'"])
+            ["cluster-user@gpu1",
+             "exec tmux attach-session -d -t 'train session'"])
         self.assertNotIn("atmux-agent", " ".join(argv))
+
+    def test_interactive_path_disables_latency_amplifying_ssh_features(self):
+        pool = self.pool(gateways=("login1",), control_persist=3600)
+        argv = pool._fast_interactive_argv(
+            "login1", "gpu1", "attach", "train")
+        joined = " ".join(argv)
+        self.assertIn("IPQoS=none", argv)
+        self.assertIn("Compression=no", argv)
+        self.assertIn("IgnoreUnknown=ObscureKeystrokeTiming", argv)
+        self.assertIn("ObscureKeystrokeTiming=no", argv)
+        self.assertIn("ControlPersist=300", argv)
+        self.assertIn("attach-session -d", joined)
+
+    def test_prewarm_establishes_master_without_allocating_a_pty(self):
+        pool = self.pool(gateways=("login1",))
+        pool._routes["gpu1"] = gateway.Route("login1", "gpu1")
+        completed = SimpleNamespace(returncode=0)
+        with mock.patch.object(
+                pool, "_fast_interactive_master_present",
+                return_value=False), \
+             mock.patch.object(
+                gateway.subprocess, "run", return_value=completed) as run:
+            self.assertTrue(pool.prewarm_interactive("gpu1"))
+        argv = run.call_args.args[0]
+        self.assertIn("-T", argv)
+        self.assertNotIn("-tt", argv)
+        self.assertEqual(argv[-1], "true")
 
     def test_failed_compute_fast_path_falls_back_and_is_temporarily_cached(self):
         pool = self.pool(gateways=("login1",))
@@ -479,6 +507,17 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(build.call_count, 2)
         self.assertTrue(build.call_args_list[1].kwargs["direct"])
         report.assert_called_once_with("gpu1", 0, "gateway-attach")
+
+    def test_agent_fallback_also_uses_isolated_low_latency_master(self):
+        with mock.patch.object(agent, "_read_state", return_value={}):
+            argv = agent._compute_ssh_argv("gpu1", "train")
+        joined = " ".join(argv)
+        self.assertIn("ControlMaster=auto", argv)
+        self.assertIn("ControlPersist=300", argv)
+        self.assertIn("IPQoS=none", argv)
+        self.assertIn("Compression=no", argv)
+        self.assertIn("interactive-ctl", joined)
+        self.assertIn("attach-session -d", argv[-1])
 
 
 class CliDeploymentModeTests(unittest.TestCase):

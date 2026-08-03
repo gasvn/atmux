@@ -2460,6 +2460,15 @@ def _parse_session_payload(out: str) -> tuple[list, str, str, str]:
 def _session_probe_script() -> str:
     """One shell round trip for sessions, load and tmux latency metadata."""
     return (
+        # A 500 ms tmux escape window is indistinguishable from lost shortcuts
+        # over a weak link, and two nested tmux servers stack that delay.  Tune
+        # the live server before publishing its metadata.  This is idempotent,
+        # never raises a user's already-lower value, and does not edit tmux.conf.
+        "_atmux_escape=$(tmux show-options -s -v escape-time 2>/dev/null || true);"
+        " case $_atmux_escape in ''|*[!0-9]*) ;; *)"
+        " if [ $_atmux_escape -gt 10 ]; then"
+        " tmux set-option -s escape-time 10 >/dev/null 2>&1 || true;"
+        " fi ;; esac;"
         "printf '\\000AUTOTMUX_SESSIONS\\000';"
         "tmux list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null;"
         " printf '\\000AUTOTMUX_NODEINFO\\000\\n';"

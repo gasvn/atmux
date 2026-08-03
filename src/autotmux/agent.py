@@ -333,15 +333,22 @@ def _compute_ssh_argv(node: str, session: str | None, *,
         "-o", f"ServerAliveInterval={int(settings['server_alive_int'])}",
         "-o", f"ServerAliveCountMax={int(settings['server_alive_max'])}",
         "-o", "StrictHostKeyChecking=accept-new",
+        *gateway.interactive_ssh_options(),
     ]
-    control_path = None if direct else _control_path(node)
+    control_path = (None if direct else paths.control_path(
+        f"agent-interactive-{node}", paths.INTERACTIVE_CTL_DIR))
     if control_path:
-        args += ["-o", f"ControlPath={control_path}"]
+        args += [
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=300",
+            "-o", f"ControlPath={control_path}",
+        ]
     elif direct:
         args += ["-o", "ControlPath=none", "-o", "ControlMaster=no"]
     args += ["-t", node]
     if session is not None:
-        args.append(f"tmux attach -t {shlex.quote(session)}")
+        args.append(
+            f"exec tmux attach-session -d -t {shlex.quote(session)}")
     return args
 
 
@@ -359,14 +366,14 @@ def interactive_main(token: str) -> int:
             shell = os.environ.get("SHELL") or "/bin/bash"
             argv = [shell, "-l"]
         else:
-            argv = ["tmux", "attach", "-t", session]
+            argv = ["tmux", "attach-session", "-d", "-t", session]
         try:
             return subprocess.call(argv)
         except OSError as error:
             sys.stderr.write(f"atmux-agent: {error.strerror or error}\n")
             return 127
 
-    used_master = _control_path(node) is not None
+    used_master = True
     try:
         returncode = subprocess.call(_compute_ssh_argv(node, session))
         if returncode == 255 and used_master:

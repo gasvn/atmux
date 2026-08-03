@@ -89,9 +89,16 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._saved_launch = autotmux._launch_daemon
         autotmux._launch_daemon = lambda: (True, '')
+        self._saved_prewarm = autotmux.AutotmuxApp._prewarm_interactive_async
+
+        async def no_prewarm(_app, _nodes, _source_pool):
+            return None
+
+        autotmux.AutotmuxApp._prewarm_interactive_async = no_prewarm
 
     def tearDown(self):
         autotmux._launch_daemon = self._saved_launch
+        autotmux.AutotmuxApp._prewarm_interactive_async = self._saved_prewarm
 
     async def test_app_starts_and_renders_table(self):
         with tempfile.TemporaryDirectory() as td:
@@ -260,7 +267,7 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('offline', notify.call_args.args[0])
                 self.assertFalse(notify.call_args.kwargs['markup'])
 
-    async def test_start_shell_row_uses_pre_warmed_remote_shell(self):
+    async def test_start_shell_row_uses_native_remote_transport(self):
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)
             app = autotmux.AutotmuxApp()
@@ -270,16 +277,15 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.selected_session = autotmux._START_SHELL_SESSION
                 with mock.patch.object(app, 'suspend', return_value=nullcontext()), \
                         mock.patch.object(
-                            app._warm_pool, 'shell', return_value=True) as warm_shell, \
+                            app._warm_pool, 'shell') as warm_shell, \
                         mock.patch.object(
-                            autotmux, '_run_user_command',
-                            side_effect=AssertionError('cold ssh should not run')), \
-                        mock.patch.object(app, '_schedule_warm_replenish') as replenish:
+                            autotmux, '_run_remote_user_command',
+                            return_value=(0, '', False)) as native:
                     await app.action_attach_session()
-                warm_shell.assert_called_once_with('gpu1')
-                replenish.assert_called_once_with('gpu1')
+                warm_shell.assert_not_called()
+                native.assert_called_once_with('gpu1', None, direct=False)
 
-    async def test_open_shell_action_uses_pre_warmed_remote_shell(self):
+    async def test_open_shell_action_uses_native_remote_transport(self):
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)
             app = autotmux.AutotmuxApp()
@@ -288,14 +294,13 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 app.selected_node = 'gpu1'
                 with mock.patch.object(app, 'suspend', return_value=nullcontext()), \
                         mock.patch.object(
-                            app._warm_pool, 'shell', return_value=True) as warm_shell, \
+                            app._warm_pool, 'shell') as warm_shell, \
                         mock.patch.object(
-                            autotmux, '_run_user_command',
-                            side_effect=AssertionError('cold ssh should not run')), \
-                        mock.patch.object(app, '_schedule_warm_replenish') as replenish:
+                            autotmux, '_run_remote_user_command',
+                            return_value=(0, '', False)) as native:
                     await app.action_open_shell()
-                warm_shell.assert_called_once_with('gpu1')
-                replenish.assert_called_once_with('gpu1')
+                warm_shell.assert_not_called()
+                native.assert_called_once_with('gpu1', None, direct=False)
 
     async def test_single_click_on_row_triggers_attach(self):
         """A single mouse click on a session row must attach to THAT row.

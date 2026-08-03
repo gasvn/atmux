@@ -100,6 +100,12 @@ STATE_FILE    = os.path.join(BASE, 'daemon.json')
 SNAPSHOT_FILE = os.path.join(BASE, 'snapshots.json')
 PREVIEW_SOCKET = os.path.join(BASE, 'preview.sock')
 WARM_DIR      = os.path.join(BASE, 'warm')
+# Interactive terminals must not share the daemon's compute-node master.  The
+# daemon continuously runs health/session/preview commands; multiplexing those
+# payloads with a user's keystrokes creates head-of-line stalls on one TCP
+# stream.  Keep latency-sensitive masters in a directory the daemon never
+# adopts, checks, or tears down.
+INTERACTIVE_CTL_DIR = os.path.join(BASE, 'interactive-ctl')
 GATEWAY_CTL_DIR = os.path.join(BASE, 'gateway-ctl')
 GATEWAY_STATE_CACHE = os.path.join(BASE, 'gateway-state.json')
 GATEWAY_SNAPSHOT_CACHE = os.path.join(BASE, 'gateway-snapshots.json')
@@ -130,6 +136,7 @@ def control_path(node: str, ctl_dir: str | None = None) -> str:
 # the frontend start a clean instance in its newly-selected runtime directory.
 _secure_dir(CTL_DIR)
 _secure_dir(WARM_DIR)
+_secure_dir(INTERACTIVE_CTL_DIR)
 _secure_dir(GATEWAY_CTL_DIR)
 _base_stat = os.lstat(BASE)
 _BASE_ID = (_base_stat.st_dev, _base_stat.st_ino)
@@ -143,4 +150,5 @@ def ensure_runtime_dirs() -> None:
         raise RuntimeError(f'runtime dir {BASE!r} was replaced')
     _secure_dir(CTL_DIR)
     _secure_dir(WARM_DIR)
+    _secure_dir(INTERACTIVE_CTL_DIR)
     _secure_dir(GATEWAY_CTL_DIR)
