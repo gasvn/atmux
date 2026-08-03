@@ -5,4 +5,4 @@ The single source of truth for the package version lives here; both the
 `[tool.setuptools.dynamic]`.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

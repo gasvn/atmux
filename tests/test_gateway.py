@@ -219,7 +219,9 @@ class GatewayPoolTests(unittest.TestCase):
             calls.append((name, direct, gateway.decode_interactive_token(token)))
             return ((255, "") if name == "login1" else (0, ""))
 
-        with mock.patch.object(pool, "_interactive_once", side_effect=interactive), \
+        with mock.patch.object(
+                pool, "_fast_interactive_once", return_value=(255, "")), \
+             mock.patch.object(pool, "_interactive_once", side_effect=interactive), \
              mock.patch("sys.stdout", new=io.StringIO()):
             rc, error, used_direct = pool.run_interactive(
                 "gpu1", ["tmux", "attach", "-t", "'train session'"])
@@ -232,12 +234,73 @@ class GatewayPoolTests(unittest.TestCase):
     def test_long_interactive_lifetime_does_not_pollute_latency_score(self):
         pool = self.pool(gateways=("login1",))
         pool._health["login1"]["ewma_ms"] = 12.0
-        with mock.patch.object(pool, "_interactive_once", return_value=(0, "")), \
+        with mock.patch.object(
+                pool, "_fast_interactive_once", return_value=(0, "")) as fast, \
+             mock.patch.object(
+                pool, "_interactive_once",
+                side_effect=AssertionError("fast path should avoid the agent")), \
              mock.patch("sys.stdout", new=io.StringIO()):
             rc, _, _ = pool.run_interactive(
                 "gpu1", ["tmux", "attach", "-t", "train"])
         self.assertEqual(rc, 0)
+        fast.assert_called_once()
         self.assertEqual(pool._health["login1"]["ewma_ms"], 12.0)
+
+    def test_interactive_transport_is_isolated_from_rpc_master(self):
+        pool = self.pool(gateways=("login1",))
+        rpc = pool._ssh_argv("login1")
+        interactive = pool._ssh_argv("login1", tty=True)
+        rpc_control = next(value for value in rpc if value.startswith("ControlPath="))
+        tty_control = next(
+            value for value in interactive if value.startswith("ControlPath="))
+        self.assertNotEqual(rpc_control, tty_control)
+        self.assertIn("gateway-interactive", tty_control)
+
+    def test_compute_fast_path_uses_proxy_and_one_target_pty(self):
+        pool = self.pool(gateways=("login1",))
+        pool._remote_users["login1"] = "cluster-user"
+        argv = pool._fast_interactive_argv(
+            "login1", "gpu1", "attach", "train session")
+        proxy = next(value for value in argv if value.startswith("ProxyCommand="))
+        self.assertIn("-W %h:%p login1", proxy)
+        self.assertEqual(argv.count("-tt"), 1)
+        self.assertEqual(
+            argv[-2:],
+            ["cluster-user@gpu1", "exec tmux attach -t 'train session'"])
+        self.assertNotIn("atmux-agent", " ".join(argv))
+
+    def test_failed_compute_fast_path_falls_back_and_is_temporarily_cached(self):
+        pool = self.pool(gateways=("login1",))
+        with mock.patch.object(
+                pool, "_fast_interactive_once", return_value=(255, "")) as fast, \
+             mock.patch.object(
+                pool, "_interactive_once", return_value=(0, "")) as agent_call, \
+             mock.patch("sys.stdout", new=io.StringIO()):
+            first = pool.run_interactive(
+                "gpu1", ["tmux", "attach", "-t", "train"])
+            second = pool.run_interactive(
+                "gpu1", ["tmux", "attach", "-t", "train"])
+        self.assertEqual(first[0], 0)
+        self.assertEqual(second[0], 0)
+        fast.assert_called_once()
+        self.assertEqual(agent_call.call_count, 2)
+
+    def test_stale_fast_master_retries_direct_before_agent_fallback(self):
+        pool = self.pool(gateways=("login1",))
+        with mock.patch.object(
+                pool, "_fast_interactive_master_present", return_value=True), \
+             mock.patch.object(
+                pool, "_fast_interactive_once",
+                side_effect=[(255, ""), (0, "")]) as fast, \
+             mock.patch.object(
+                pool, "_interactive_once",
+                side_effect=AssertionError("direct fast retry should win")), \
+             mock.patch("sys.stdout", new=io.StringIO()):
+            rc, error, used_direct = pool.run_interactive(
+                "gpu1", ["tmux", "attach", "-t", "train"])
+        self.assertEqual((rc, error, used_direct), (0, "", True))
+        self.assertFalse(fast.call_args_list[0].kwargs["direct"])
+        self.assertTrue(fast.call_args_list[1].kwargs["direct"])
 
     def test_preview_is_cached_for_offline_display(self):
         pool = self.pool()
@@ -295,6 +358,17 @@ class GatewayPoolTests(unittest.TestCase):
         self.assertAlmostEqual(timeouts[1][0], 0.4)
         self.assertTrue(timeouts[1][1])
 
+    def test_agent_ping_teaches_fast_path_the_cluster_username(self):
+        pool = self.pool(gateways=("login1",))
+        with mock.patch.object(
+                pool, "_rpc_once",
+                return_value={"protocol": 1, "ok": True,
+                              "user": "cluster-user"}):
+            pool._rpc_gateway("login1", {"action": "ping"}, 1.0)
+        argv = pool._fast_interactive_argv(
+            "login1", "gpu1", "attach", "train")
+        self.assertIn("cluster-user@gpu1", argv)
+
     def test_explicit_authentication_is_only_non_batch_ssh_path(self):
         pool = self.pool(gateways=("login1",))
         with mock.patch.object(pool, "_master_alive",
@@ -329,6 +403,7 @@ class AgentTests(unittest.TestCase):
         response = agent.handle_rpc({"action": "ping"})
         self.assertTrue(response["ok"])
         self.assertIn("version", response)
+        self.assertIn("user", response)
         invalid = agent.handle_rpc({
             "action": "preview", "node": "-oProxy=x", "session": "s"})
         self.assertEqual(invalid["kind"], "invalid")
@@ -342,6 +417,13 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertTrue(response["daemon_starting"])
         start.assert_called_once_with()
+
+    def test_daemon_start_request_reaches_the_spawn_path(self):
+        with mock.patch.object(agent, "_daemon_running", return_value=False), \
+             mock.patch.object(agent.subprocess, "Popen") as popen:
+            self.assertTrue(agent._request_daemon_start())
+        popen.assert_called_once()
+        self.assertIn("autotmux.daemon", popen.call_args.args[0])
 
     def test_state_response_bundles_registry_and_starts_no_second_daemon(self):
         state = remote_state()
@@ -455,6 +537,20 @@ class CliDeploymentModeTests(unittest.TestCase):
         self.assertIs(cli._GATEWAY_POOL, sentinel)
         self.assertEqual(
             pool.call_args.args[0]["gateways"], ["login9", "login10"])
+
+    def test_local_first_run_offers_tui_setup_without_a_config(self):
+        settings = dict(config.CLIENT_DEFAULTS)
+        with mock.patch.object(cli, "_is_remote_session", return_value=False), \
+             mock.patch.object(
+                cli, "_load_client_config_bounded",
+                return_value=(True, settings)):
+            self.assertTrue(cli._should_offer_connection_setup(self.args()))
+        settings["mode"] = "login"
+        with mock.patch.object(cli, "_is_remote_session", return_value=False), \
+             mock.patch.object(
+                cli, "_load_client_config_bounded",
+                return_value=(True, settings)):
+            self.assertFalse(cli._should_offer_connection_setup(self.args()))
 
     def test_gateway_sequence_orders_states_across_remote_host_clocks(self):
         current = {

@@ -157,6 +157,66 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                     await app.action_toggle_jobs_view()
                 self.assertEqual(app.jobs_view_mode, 'pending')
 
+    async def test_connection_manager_discovers_and_saves_ssh_aliases(self):
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            settings = dict(autotmux.config.CLIENT_DEFAULTS)
+            settings['gateways'] = []
+            saved = (dict(settings, gateways=['login2']), None)
+            with mock.patch.object(
+                    autotmux, '_load_client_config_bounded',
+                    return_value=(True, settings)), \
+                 mock.patch.object(
+                    autotmux.config, 'discover_ssh_aliases',
+                    return_value=['login1', 'login2']), \
+                 mock.patch.object(
+                    app, '_persist_connection_choice',
+                    return_value=saved) as persist, \
+                 mock.patch.object(app, '_dispatch_warm'), \
+                 mock.patch.object(
+                    autotmux, '_RUNTIME_DISCOVERY_ENABLED', False), \
+                 mock.patch.object(autotmux, '_GATEWAY_POOL', None), \
+                 mock.patch.object(
+                    autotmux, '_sync_active_runtime_paths', return_value=False):
+                async with app.run_test() as pilot:
+                    main_screen = app.screen
+                    await app.action_manage_connections()
+                    await pilot.pause()
+                    dialog = app.screen
+                    self.assertIsInstance(dialog, autotmux.ConnectionManager)
+                    choices = dialog.query_one(
+                        '#connection_aliases', autotmux.SelectionList)
+                    choices.select('login2')
+                    dialog.action_save()
+                    await pilot.pause()
+                    self.assertIs(app.screen, main_screen)
+            result = persist.call_args.args[0]
+            self.assertEqual(result['mode'], 'gateway')
+            self.assertEqual(result['gateways'], ['login2'])
+
+    async def test_first_run_setup_does_not_start_local_daemon_behind_dialog(self):
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp(offer_connection_setup=True)
+            settings = dict(autotmux.config.CLIENT_DEFAULTS)
+            with mock.patch.object(
+                    autotmux, '_load_client_config_bounded',
+                    return_value=(True, settings)), \
+                 mock.patch.object(
+                    autotmux.config, 'discover_ssh_aliases', return_value=[]), \
+                 mock.patch.object(autotmux, '_daemon_running', return_value=False), \
+                 mock.patch.object(
+                    autotmux, '_launch_daemon',
+                    side_effect=AssertionError('setup must decide deployment first')):
+                async with app.run_test(size=(60, 20)) as pilot:
+                    await pilot.pause()
+                    self.assertIsInstance(
+                        app.screen, autotmux.ConnectionManager)
+                    save = app.screen.query_one('#connection_save')
+                    self.assertLessEqual(save.region.right, 60)
+                    self.assertLessEqual(save.region.bottom, 20)
+
     async def test_jobs_panel_marks_stale_squeue_data(self):
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)

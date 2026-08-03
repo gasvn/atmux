@@ -5,10 +5,14 @@ malformed, or unparseable file falls back to defaults (with a logged
 warning). The AUTOTMUX_CONFIG env var overrides the path (used by tests).
 """
 import os
+import glob
+import json
 import logging
 import math
 import re
 import shlex
+import stat
+import uuid
 
 log = logging.getLogger('autotmux_daemon.config')
 
@@ -23,6 +27,22 @@ KEEPALIVE_PATH = os.environ.get(
     'AUTOTMUX_KEEPALIVE',
     os.path.expanduser('~/.config/autotmux/keepalive.json'),
 )
+
+# Gateway choices made in the TUI live separately from the hand-written
+# daemon configuration.  This keeps the common local-client workflow out of
+# TOML entirely while preserving config.toml as an advanced/compatible input.
+CLIENT_STATE_PATH = os.environ.get(
+    'AUTOTMUX_CLIENT_STATE',
+    os.path.expanduser('~/.config/autotmux/connections.json'),
+)
+SSH_CONFIG_PATH = os.environ.get(
+    'AUTOTMUX_SSH_CONFIG',
+    os.path.expanduser('~/.ssh/config'),
+)
+_CLIENT_STATE_LIMIT = 64 * 1024
+_SSH_CONFIG_FILE_LIMIT = 1024 * 1024
+_SSH_CONFIG_TOTAL_LIMIT = 2 * 1024 * 1024
+_SSH_CONFIG_FILE_COUNT_LIMIT = 32
 
 # Keep-alive auto-renew tunables (the [keepalive] table).
 KEEPALIVE_DEFAULTS = {
@@ -208,6 +228,186 @@ def _client_agent_command(value) -> list[str] | None:
     return parts
 
 
+def _read_client_state() -> dict | None:
+    """Read the small TUI-owned connection selection, if one is trustworthy."""
+    fd = None
+    try:
+        flags = (os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
+                 | getattr(os, 'O_NOFOLLOW', 0))
+        fd = os.open(CLIENT_STATE_PATH, flags)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_size > _CLIENT_STATE_LIMIT):
+            return None
+        raw = bytearray()
+        while len(raw) <= _CLIENT_STATE_LIMIT:
+            chunk = os.read(fd, min(
+                16 * 1024, _CLIENT_STATE_LIMIT + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > _CLIENT_STATE_LIMIT:
+            return None
+        value = json.loads(raw)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    if not isinstance(value, dict) or value.get('version') != 1:
+        return None
+    mode = value.get('mode')
+    gateways = value.get('gateways')
+    if mode not in {'gateway', 'login'} or not isinstance(gateways, list):
+        return None
+    clean = []
+    for gateway in gateways[:64]:
+        if valid_gateway(gateway) and gateway not in clean:
+            clean.append(gateway)
+    if mode == 'gateway' and not clean:
+        return None
+    command = _client_agent_command(value.get('agent_command', ['atmux-agent']))
+    if command is None:
+        return None
+    return {'mode': mode, 'gateways': clean, 'agent_command': command}
+
+
+def client_state_exists() -> bool:
+    """Whether the user has completed (or dismissed) the TUI connection setup."""
+    return _read_client_state() is not None
+
+
+def save_client_state(mode: str, gateways: list[str],
+                      agent_command) -> None:
+    """Atomically persist a connection selection made by the local TUI."""
+    if mode not in {'gateway', 'login'}:
+        raise ValueError('invalid connection mode')
+    clean = []
+    for gateway in gateways:
+        if not valid_gateway(gateway):
+            raise ValueError(f'invalid SSH alias: {gateway!r}')
+        if gateway not in clean:
+            clean.append(gateway)
+    if mode == 'gateway' and not clean:
+        raise ValueError('select at least one login gateway')
+    command = _client_agent_command(agent_command)
+    if command is None:
+        raise ValueError('invalid remote agent command')
+    value = {
+        'version': 1,
+        'mode': mode,
+        'gateways': clean,
+        'agent_command': command,
+    }
+    raw = (json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+           + '\n').encode('utf-8')
+    directory = os.path.dirname(CLIENT_STATE_PATH)
+    if not directory:
+        raise ValueError('connection state path needs a parent directory')
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    directory_info = os.lstat(directory)
+    if (stat.S_ISLNK(directory_info.st_mode)
+            or not stat.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != os.getuid()):
+        raise OSError('connection state directory is not a user-owned directory')
+    temporary = os.path.join(
+        directory, f'.connections.tmp.{os.getpid()}.{uuid.uuid4().hex}')
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, 'O_CLOEXEC', 0)
+             | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        fd = os.open(temporary, flags, 0o600)
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, CLIENT_STATE_PATH)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def discover_ssh_aliases(path: str | None = None) -> list[str]:
+    """Return literal ``Host`` aliases from bounded user SSH config files.
+
+    Wildcard/negated patterns are intentionally omitted: they are matching
+    rules, not destinations a user can select.  ``Include`` is followed with
+    strict file-count and byte limits so a connection dialog cannot be held
+    forever by an accidentally huge include tree.
+    """
+    root = os.path.expanduser(path or SSH_CONFIG_PATH)
+    aliases: list[str] = []
+    seen_aliases: set[str] = set()
+    visited: set[str] = set()
+    total_bytes = 0
+
+    def visit(filename: str) -> None:
+        nonlocal total_bytes
+        if len(visited) >= _SSH_CONFIG_FILE_COUNT_LIMIT:
+            return
+        filename = os.path.abspath(os.path.expanduser(filename))
+        identity = os.path.realpath(filename)
+        if identity in visited:
+            return
+        try:
+            info = os.stat(filename)
+            if (not stat.S_ISREG(info.st_mode)
+                    or info.st_size > _SSH_CONFIG_FILE_LIMIT
+                    or total_bytes + info.st_size > _SSH_CONFIG_TOTAL_LIMIT):
+                return
+            with open(filename, 'r', encoding='utf-8', errors='replace') as handle:
+                content = handle.read(_SSH_CONFIG_FILE_LIMIT + 1)
+        except OSError:
+            return
+        if len(content.encode('utf-8', 'replace')) > _SSH_CONFIG_FILE_LIMIT:
+            return
+        visited.add(identity)
+        total_bytes += info.st_size
+        base = os.path.dirname(filename)
+        for line in content.splitlines():
+            try:
+                parts = shlex.split(line, comments=True, posix=True)
+            except ValueError:
+                continue
+            if len(parts) < 2:
+                continue
+            keyword = parts[0].lower()
+            if keyword == 'host':
+                for alias in parts[1:]:
+                    if (alias.startswith('!')
+                            or any(char in alias for char in '*?[]')
+                            or not valid_gateway(alias)
+                            or alias in seen_aliases):
+                        continue
+                    seen_aliases.add(alias)
+                    aliases.append(alias)
+            elif keyword == 'include':
+                for pattern in parts[1:]:
+                    expanded = os.path.expanduser(pattern)
+                    if not os.path.isabs(expanded):
+                        expanded = os.path.join(base, expanded)
+                    for included in sorted(glob.glob(expanded)):
+                        visit(included)
+
+    visit(root)
+    return aliases
+
+
+def _apply_client_state(cfg: dict) -> dict:
+    state = _read_client_state()
+    if state is not None:
+        cfg['mode'] = state['mode']
+        cfg['gateways'] = list(state['gateways'])
+        cfg['agent_command'] = list(state['agent_command'])
+    return cfg
+
+
 def load_client() -> dict:
     """Load and validate the optional ``[client]`` gateway configuration.
 
@@ -224,19 +424,19 @@ def load_client() -> dict:
         try:
             import tomli as tomllib
         except ModuleNotFoundError:
-            return cfg
+            return _apply_client_state(cfg)
     if not os.path.exists(CONFIG_PATH):
-        return cfg
+        return _apply_client_state(cfg)
     try:
         with open(CONFIG_PATH, 'rb') as handle:
             data = tomllib.load(handle)
     except Exception as error:
         log.warning(f'failed to parse {CONFIG_PATH}: {error}; using client defaults')
-        return cfg
+        return _apply_client_state(cfg)
     section = data.get('client', {})
     if not isinstance(section, dict):
         log.warning('ignoring invalid [client] config (expected a table)')
-        return cfg
+        return _apply_client_state(cfg)
 
     mode = section.get('mode', cfg['mode'])
     if isinstance(mode, str) and mode in {'auto', 'gateway', 'login'}:
@@ -270,7 +470,7 @@ def load_client() -> dict:
             log.warning('ignoring invalid client agent_command')
         else:
             cfg['agent_command'] = command
-    return cfg
+    return _apply_client_state(cfg)
 
 
 def load_keepalive() -> dict:

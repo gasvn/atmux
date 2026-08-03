@@ -68,6 +68,15 @@ def _request_daemon_start() -> bool:
     """Start the native login-node daemon without tying it to this SSH RPC."""
     if _daemon_running():
         return False
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "autotmux.daemon", "start"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+            close_fds=True)
+        return True
+    except OSError:
+        return False
 
 
 def _bounded_registry_read(timeout: float = 0.5) -> tuple[bool, list]:
@@ -90,15 +99,6 @@ def _bounded_registry_read(timeout: float = 0.5) -> tuple[bool, list]:
     except queue.Empty:
         return False, []
     return value if (isinstance(value, tuple) and len(value) == 2) else (False, [])
-    try:
-        subprocess.Popen(
-            [sys.executable, "-m", "autotmux.daemon", "start"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True,
-            close_fds=True)
-        return True
-    except OSError:
-        return False
 
 
 def _state_response() -> dict:
@@ -188,6 +188,7 @@ def handle_rpc(request: dict) -> dict:
         if request.get("ensure_daemon") is True and not running:
             starting = _request_daemon_start()
         return {"ok": True, "host": socket.gethostname(),
+                "user": os.environ.get("USER", ""),
                 "version": __version__, "daemon_running": running,
                 "daemon_starting": starting}
     if action == "state":

@@ -37,7 +37,9 @@ _CACHE_LIMIT = 10 * 1024 * 1024
 _SNAPSHOT_CACHE_LIMIT = 16 * 1024 * 1024
 _SNAPSHOT_ENTRY_LIMIT = 1024 * 1024
 _NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_FAST_INTERACTIVE_RETRY = 300.0
 
 
 class GatewayError(RuntimeError):
@@ -200,6 +202,12 @@ class GatewayPool:
             for gateway in self._gateways
         }
         self._route_health: dict[tuple[str, str], dict] = {}
+        self._remote_users: dict[str, str] = {}
+        # A direct ProxyCommand route removes the login-host PTY and Python
+        # relay from interactive traffic.  Some clusters intentionally reject
+        # end-to-end SSH auth to compute nodes, so remember a failed fast path
+        # briefly and use the universally-compatible login agent instead.
+        self._fast_interactive_retry: dict[tuple[str, str], float] = {}
         self._last_probe: dict[str, float | None] = {
             gateway: None for gateway in self._gateways}
         self._active: str | None = None
@@ -241,6 +249,12 @@ class GatewayPool:
                     self._sequence = max(0, sequence)
                     self._cache_sequence = self._sequence
                 self._restore_routes(state)
+                source_gateway = gateway_info.get("active")
+                source_user = gateway_info.get("source_user")
+                if (source_gateway in self._gateways
+                        and isinstance(source_user, str)
+                        and _USER_RE.fullmatch(source_user)):
+                    self._remote_users[source_gateway] = source_user
                 state_cache_valid = True
         except Exception:
             pass
@@ -276,8 +290,58 @@ class GatewayPool:
     def _control_path(self, gateway: str) -> str:
         return paths.control_path(f"gateway-{gateway}", paths.GATEWAY_CTL_DIR)
 
+    def _interactive_control_path(self, gateway: str) -> str:
+        """Dedicated login transport for latency-sensitive terminal traffic.
+
+        State and preview RPCs can return multi-megabyte payloads.  Sharing
+        their SSH master made keystrokes wait behind those channels because
+        OpenSSH multiplexes them over one TCP stream.  A second persistent
+        master keeps attach latency low without paying a fresh handshake each
+        time.
+        """
+        return paths.control_path(
+            f"gateway-interactive-{gateway}", paths.GATEWAY_CTL_DIR)
+
+    def _jump_control_path(self, gateway: str, target: str) -> str:
+        return paths.control_path(
+            f"gateway-jump-{gateway}-{target}", paths.GATEWAY_CTL_DIR)
+
     def _ssh_argv(self, gateway: str, *, tty: bool = False,
                   direct: bool = False) -> list[str]:
+        args = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={int(self.settings['connect_timeout'])}",
+            "-o", "ConnectionAttempts=1",
+            "-o", f"ServerAliveInterval={int(self.settings['server_alive_int'])}",
+            "-o", f"ServerAliveCountMax={int(self.settings['server_alive_max'])}",
+            "-o", "StrictHostKeyChecking=accept-new",
+        ]
+        if direct:
+            args += ["-o", "ControlPath=none", "-o", "ControlMaster=no"]
+        else:
+            control_path = (self._interactive_control_path(gateway)
+                            if tty else self._control_path(gateway))
+            args += [
+                "-o", "ControlMaster=auto",
+                "-o", f"ControlPersist={int(self.settings['control_persist'])}",
+                "-o", f"ControlPath={control_path}",
+            ]
+        args.append("-tt" if tty else "-T")
+        args.append(gateway)
+        return args
+
+    def _agent_command(self, *args: str) -> str:
+        command = list(self.settings.get("agent_command") or ["atmux-agent"])
+        return shlex.join([*command, *args])
+
+    def _jump_proxy_command(self, gateway: str, *, direct: bool) -> str:
+        """OpenSSH ProxyCommand for an end-to-end compute connection.
+
+        Building argv then quoting it keeps SSH aliases safe while allowing the
+        jump process to reuse the dedicated interactive login master.  ``%h``
+        and ``%p`` are expanded by the destination ssh process.
+        """
         args = [
             "ssh",
             "-o", "BatchMode=yes",
@@ -293,15 +357,48 @@ class GatewayPool:
             args += [
                 "-o", "ControlMaster=auto",
                 "-o", f"ControlPersist={int(self.settings['control_persist'])}",
-                "-o", f"ControlPath={self._control_path(gateway)}",
+                "-o", f"ControlPath={self._interactive_control_path(gateway)}",
             ]
-        args.append("-tt" if tty else "-T")
-        args.append(gateway)
-        return args
+        args += ["-T", "-W", "%h:%p", gateway]
+        return shlex.join(args)
 
-    def _agent_command(self, *args: str) -> str:
-        command = list(self.settings.get("agent_command") or ["atmux-agent"])
-        return shlex.join([*command, *args])
+    def _fast_interactive_argv(self, gateway: str, target: str,
+                               kind: str, session: str | None, *,
+                               direct: bool = False) -> list[str]:
+        """Build the single-PTY fast path used before the agent fallback."""
+        if target == "localhost":
+            args = self._ssh_argv(gateway, tty=True, direct=direct)
+        else:
+            args = [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", f"ConnectTimeout={int(self.settings['connect_timeout'])}",
+                "-o", "ConnectionAttempts=1",
+                "-o", f"ServerAliveInterval={int(self.settings['server_alive_int'])}",
+                "-o", f"ServerAliveCountMax={int(self.settings['server_alive_max'])}",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", f"ProxyCommand={self._jump_proxy_command(gateway, direct=direct)}",
+            ]
+            if direct:
+                args += ["-o", "ControlPath=none", "-o", "ControlMaster=no"]
+            else:
+                args += [
+                    "-o", "ControlMaster=auto",
+                    "-o", f"ControlPersist={int(self.settings['control_persist'])}",
+                    "-o", f"ControlPath={self._jump_control_path(gateway, target)}",
+                ]
+            with self._lock:
+                remote_user = self._remote_users.get(gateway)
+            if not remote_user and "@" in gateway:
+                candidate_user = gateway.rsplit("@", 1)[0]
+                if _USER_RE.fullmatch(candidate_user):
+                    remote_user = candidate_user
+            destination = (f"{remote_user}@{target}"
+                           if remote_user else target)
+            args += ["-tt", destination]
+        if kind == "attach":
+            args.append(f"exec tmux attach -t {shlex.quote(session or '')}")
+        return args
 
     @staticmethod
     def _parse_response(stdout: bytes) -> dict:
@@ -435,6 +532,12 @@ class GatewayPool:
                     raise
                 response = self._rpc_once(
                     gateway, payload, remaining, direct=True)
+            remote_user = (response.get("user")
+                           if isinstance(response, dict) else None)
+            if (isinstance(remote_user, str)
+                    and _USER_RE.fullmatch(remote_user)):
+                with self._lock:
+                    self._remote_users[gateway] = remote_user
             self._record_success(gateway, self._clock() - started)
             return response
         except GatewayError as error:
@@ -633,6 +736,10 @@ class GatewayPool:
         routes = {}
         existing = {str(name) for name in source_nodes}
         login_display = _login_key(gateway, remote_host, existing)
+        source_user = decorated.get("user")
+        if (not isinstance(source_user, str)
+                or _USER_RE.fullmatch(source_user) is None):
+            source_user = ""
         for source_name, raw_item in source_nodes.items():
             if (not isinstance(source_name, str)
                     or _NODE_RE.fullmatch(source_name) is None
@@ -657,6 +764,7 @@ class GatewayPool:
         gateway_info.update({
             "active": gateway,
             "source_host": remote_host,
+            "source_user": source_user,
             "cached": False,
             "received_epoch": self._wall_clock(),
             "received_monotonic": self._clock(),
@@ -670,6 +778,8 @@ class GatewayPool:
             self._sequence += 1
             decorated["gateway_sequence"] = self._sequence
             self._routes = routes
+            if source_user:
+                self._remote_users[gateway] = source_user
             if isinstance(keepalive_entries, list):
                 self._keepalive_entries = [
                     dict(entry) for entry in keepalive_entries
@@ -1137,6 +1247,37 @@ class GatewayPool:
         except OSError as error:
             return 127, f"ssh: {error.strerror or error}"
 
+    def _fast_interactive_once(self, gateway: str, target: str,
+                               kind: str, session: str | None, *,
+                               direct: bool = False) -> tuple[int, str]:
+        argv = self._fast_interactive_argv(
+            gateway, target, kind, session, direct=direct)
+        try:
+            return subprocess.call(argv), ""
+        except OSError as error:
+            return 127, f"ssh: {error.strerror or error}"
+
+    def _fast_interactive_eligible(self, gateway: str, target: str) -> bool:
+        with self._lock:
+            retry_at = self._fast_interactive_retry.get((gateway, target), 0.0)
+        return retry_at <= self._clock()
+
+    def _fast_interactive_master_present(self, gateway: str,
+                                         target: str) -> bool:
+        control_path = (self._interactive_control_path(gateway)
+                        if target == "localhost"
+                        else self._jump_control_path(gateway, target))
+        return os.path.exists(control_path)
+
+    def _defer_fast_interactive(self, gateway: str, target: str) -> None:
+        with self._lock:
+            self._fast_interactive_retry[(gateway, target)] = (
+                self._clock() + _FAST_INTERACTIVE_RETRY)
+
+    def _restore_fast_interactive(self, gateway: str, target: str) -> None:
+        with self._lock:
+            self._fast_interactive_retry.pop((gateway, target), None)
+
     def run_interactive(self, node: str, remote_args: list[str] | None,
                         *, direct: bool = False) -> tuple[int, str, bool]:
         kind, session = self._session_from_remote_args(remote_args)
@@ -1151,7 +1292,42 @@ class GatewayPool:
         last_error = "all login gateways failed"
         final_returncode = 255
         for index, gateway in enumerate(candidates, 1):
-            mode = "direct" if direct else "multiplexed"
+            # Prefer one end-to-end PTY.  For a login-host tmux this invokes
+            # tmux directly; for compute nodes ProxyCommand tunnels to the
+            # target without allocating a login-host PTY.  Besides avoiding a
+            # full terminal line discipline, this keeps keystrokes off the RPC
+            # master that carries state/preview payloads.
+            if self._fast_interactive_eligible(gateway, route.target):
+                mode = "direct" if direct else "low-latency"
+                print(
+                    f"\n[atmux] gateway {index}/{len(candidates)}: {gateway} "
+                    f"({mode}) → {route.target}…", flush=True)
+                had_fast_master = (not direct
+                                   and self._fast_interactive_master_present(
+                                       gateway, route.target))
+                fast_returncode, fast_error = self._fast_interactive_once(
+                    gateway, route.target, kind, session, direct=direct)
+                fast_used_direct = direct
+                if fast_returncode == 255 and had_fast_master:
+                    print(
+                        "[atmux] low-latency master was stale; retrying the "
+                        "end-to-end path directly…", flush=True)
+                    fast_returncode, fast_error = self._fast_interactive_once(
+                        gateway, route.target, kind, session, direct=True)
+                    fast_used_direct = True
+                if (fast_returncode != 255
+                        and not (fast_returncode == 127 and fast_error)):
+                    self._record_transport_alive(gateway)
+                    self._record_route_success(gateway, route.target)
+                    self._restore_fast_interactive(gateway, route.target)
+                    self._set_active(gateway)
+                    return fast_returncode, fast_error, fast_used_direct
+                self._defer_fast_interactive(gateway, route.target)
+                print(
+                    "[atmux] end-to-end path unavailable; using the "
+                    "login-side agent…", flush=True)
+
+            mode = "direct" if direct else "isolated"
             print(
                 f"\n[atmux] gateway {index}/{len(candidates)}: {gateway} "
                 f"({mode}) → {route.target}…", flush=True)

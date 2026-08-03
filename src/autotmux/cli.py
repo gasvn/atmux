@@ -32,10 +32,13 @@ import uuid
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.reactive import reactive
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button, DataTable, Footer, Header, Input, Label, SelectionList, Static,
+)
 import rich.text
 
 from autotmux import __version__
@@ -2200,6 +2203,198 @@ def _make_no_motion_driver(base_cls):
     return _NoMotionDriver
 
 
+class ConnectionManager(ModalScreen[dict | None]):
+    """TUI-owned SSH alias picker; no hand editing of TOML is required."""
+
+    CSS = """
+    ConnectionManager {
+        align: center middle;
+        background: $background 55%;
+    }
+    #connection_dialog {
+        width: 88;
+        max-width: 94%;
+        height: 36;
+        max-height: 92%;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #connection_title {
+        text-style: bold;
+        color: $accent;
+    }
+    #connection_help {
+        height: auto;
+    }
+    #connection_status {
+        height: 2;
+        max-height: 2;
+        overflow-y: auto;
+    }
+    #connection_aliases {
+        height: 1fr;
+        min-height: 4;
+        border: solid $primary-darken-2;
+    }
+    #connection_buttons {
+        height: 1;
+        align-horizontal: right;
+    }
+    #connection_buttons Button {
+        width: 25%;
+        min-width: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+s", "save", "Save & connect"),
+    ]
+
+    def __init__(self, settings: dict, aliases: list[str]) -> None:
+        super().__init__()
+        self._settings = dict(settings)
+        current = list(settings.get('gateways') or ())
+        self._aliases = list(dict.fromkeys([*current, *aliases]))
+
+    def compose(self) -> ComposeResult:
+        selected = set(self._settings.get('gateways') or ())
+        choices = [
+            (alias, alias, alias in selected) for alias in self._aliases
+        ]
+        command = shlex.join(
+            list(self._settings.get('agent_command') or ['atmux-agent']))
+        with Vertical(id="connection_dialog"):
+            yield Label("Connections", id="connection_title", markup=False)
+            yield Label(
+                "AutoTmux found these literal Host aliases in ~/.ssh/config. "
+                "Use Space to select one or more login nodes; the fastest "
+                "healthy route is chosen automatically.",
+                id="connection_help", markup=False)
+            yield SelectionList(*choices, id="connection_aliases", compact=True)
+            yield Input(
+                placeholder="Additional SSH aliases (space or comma separated)",
+                id="connection_extra", compact=True)
+            yield Input(
+                value=command,
+                placeholder="Remote agent command (advanced)",
+                id="connection_agent", compact=True)
+            yield Label("Ready", id="connection_status", markup=False)
+            with Horizontal(id="connection_buttons"):
+                yield Button("Test", id="connection_test", compact=True)
+                yield Button("Local", id="connection_local", compact=True)
+                yield Button("Cancel", id="connection_cancel", compact=True)
+                yield Button(
+                    "Save", id="connection_save", variant="primary",
+                    compact=True)
+
+    def on_mount(self) -> None:
+        if self._aliases:
+            self.query_one("#connection_aliases", SelectionList).focus()
+        else:
+            self.query_one("#connection_extra", Input).focus()
+
+    def _selection(self) -> tuple[list[str], list[str]]:
+        gateways = list(
+            self.query_one("#connection_aliases", SelectionList).selected)
+        extra = self.query_one("#connection_extra", Input).value.strip()
+        if extra:
+            try:
+                values = shlex.split(extra.replace(',', ' '))
+            except ValueError as error:
+                raise ValueError(f'could not parse additional aliases: {error}')
+            gateways.extend(values)
+        gateways = list(dict.fromkeys(gateways))
+        invalid = [value for value in gateways
+                   if not config.valid_gateway(value)]
+        if invalid:
+            raise ValueError(f'invalid SSH alias: {invalid[0]!r}')
+        command_text = self.query_one("#connection_agent", Input).value
+        command = config._client_agent_command(command_text)
+        if command is None:
+            raise ValueError('invalid remote agent command')
+        return gateways, command
+
+    def _show_error(self, error: Exception | str) -> None:
+        self.query_one("#connection_status", Label).update(str(error))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_save(self) -> None:
+        try:
+            gateways, command = self._selection()
+            if not gateways:
+                raise ValueError('select or enter at least one SSH alias')
+        except ValueError as error:
+            self._show_error(error)
+            return
+        self.dismiss({
+            'mode': 'gateway', 'gateways': gateways,
+            'agent_command': command,
+        })
+
+    async def _test_selection(self) -> None:
+        try:
+            gateways, command = self._selection()
+            if not gateways:
+                raise ValueError('select or enter at least one SSH alias')
+        except ValueError as error:
+            self._show_error(error)
+            return
+        status = self.query_one("#connection_status", Label)
+        status.update(f"Testing {len(gateways)} gateway(s)…")
+        settings = dict(config.CLIENT_DEFAULTS)
+        settings.update(self._settings)
+        settings['gateways'] = gateways
+        settings['agent_command'] = command
+        try:
+            pool = gateway_client.GatewayPool(settings)
+            results = await _offload_for(
+                float(settings['state_timeout']) + 2.0, pool.check_all)
+        except Exception as error:
+            status.update(f"Test failed: {error}")
+            return
+        parts = []
+        for result in results:
+            name = result.get('gateway', '?')
+            if result.get('ok'):
+                latency = result.get('latency_ms')
+                detail = (f"{float(latency):.0f} ms"
+                          if isinstance(latency, (int, float)) else 'ok')
+                parts.append(f"✓ {name} {detail}")
+            else:
+                detail = " ".join(str(
+                    result.get('error') or 'unavailable').split())[:64]
+                parts.append(f"✗ {name} {detail}")
+        visible = parts[:4]
+        if len(parts) > len(visible):
+            visible.append(f"+{len(parts) - len(visible)} more")
+        status.update(" · ".join(visible))
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button_id = event.button.id
+        if button_id == 'connection_test':
+            await self._test_selection()
+        elif button_id == 'connection_local':
+            command = config._client_agent_command(
+                self.query_one("#connection_agent", Input).value)
+            self.dismiss({
+                'mode': 'login', 'gateways': [],
+                'agent_command': command or ['atmux-agent'],
+            })
+        elif button_id == 'connection_cancel':
+            self.action_cancel()
+        elif button_id == 'connection_save':
+            self.action_save()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.action_save()
+
+
 class AutotmuxApp(App):
     def get_driver_class(self):
         base = super().get_driver_class()
@@ -2242,6 +2437,7 @@ class AutotmuxApp(App):
     BINDINGS = [
         Binding("q", "app.quit", "Quit"),
         Binding("r", "refresh_table", "Refresh"),
+        Binding("g", "manage_connections", "Connections"),
         # Enter is handled by on_data_table_row_selected (DataTable consumes
         # the key itself and emits RowSelected, so an App-level Binding
         # for "enter" would never fire).
@@ -2255,8 +2451,10 @@ class AutotmuxApp(App):
     title = reactive(f"AutoTmux v{__version__}")
     sub_title = reactive("")
 
-    def __init__(self) -> None:
+    def __init__(self, *, offer_connection_setup: bool = False) -> None:
         super().__init__()
+        self._connection_setup_pending = bool(offer_connection_setup)
+        self._connection_manager_open = False
         self._restart_attempts = []   # time.monotonic() of recent daemon restarts
         self._crash_looping = False
         self._recovery_inflight = False
@@ -2349,6 +2547,93 @@ class AutotmuxApp(App):
                         group='initial-refresh')
         self.run_worker(self._reload_snapshots_async(render_loading=True), exclusive=True,
                         group='initial-snapshots')
+        if self._connection_setup_pending:
+            self.call_after_refresh(self.action_manage_connections)
+
+    async def action_manage_connections(self) -> None:
+        """Open the local SSH-alias picker without blocking the render loop."""
+        if self._connection_manager_open:
+            return
+        self._connection_manager_open = True
+        if _GATEWAY_POOL is not None:
+            settings = dict(_GATEWAY_POOL.settings)
+        else:
+            ok, loaded = _load_client_config_bounded()
+            settings = (dict(loaded) if ok and isinstance(loaded, dict)
+                        else dict(config.CLIENT_DEFAULTS))
+        try:
+            aliases = await _offload_for(
+                _CLIENT_CONFIG_TIMEOUT, config.discover_ssh_aliases)
+        except Exception:
+            aliases = []
+        try:
+            await self.push_screen(
+                ConnectionManager(settings, aliases),
+                callback=self._connection_manager_closed)
+        except Exception as error:
+            self._connection_manager_open = False
+            self._connection_setup_pending = False
+            self.notify(f'could not open Connections · {error}',
+                        severity='error', timeout=7, markup=False)
+
+    async def _connection_manager_closed(self, result: dict | None) -> None:
+        self._connection_manager_open = False
+        if result is None:
+            self._connection_setup_pending = False
+            # First-run Cancel means "not now".  Resume the ordinary local
+            # daemon path, but ask again on a future launch because no choice
+            # was persisted.
+            self._refresh_table(self._last_state)
+            return
+        self._connection_setup_pending = True
+        try:
+            settings, pool = await _offload_for(
+                5.0, self._persist_connection_choice, result)
+        except Exception as error:
+            self._connection_setup_pending = False
+            self.notify(f'could not save Connections · {error}',
+                        severity='error', timeout=8, markup=False)
+            self._refresh_table(self._last_state)
+            return
+        self._connection_setup_pending = False
+        global _GATEWAY_POOL, _RUNTIME_DISCOVERY_ENABLED
+        _GATEWAY_POOL = pool
+        _RUNTIME_DISCOVERY_ENABLED = pool is None
+        if pool is None:
+            _sync_active_runtime_paths()
+        # Native warm slaves point at a different host namespace and must not
+        # survive a live deployment switch.  Shutdown is bounded off-loop.
+        old_warm_pool = self._warm_pool
+        self._warm_pool = WarmSlavePool()
+        try:
+            await _offload_for(1.0, old_warm_pool.shutdown)
+        except Exception:
+            pass
+        self._last_state = {}
+        self._last_rows_sig = None
+        self._last_structural_sig = None
+        self._ka_reg_cache = (None, tuple())
+        self._ka_entries = []
+        self._ka_names = set()
+        self.snapshots = {}
+        self._rendered_cache.clear()
+        self._refresh_table({})
+        mode = ('gateway pool ' + ', '.join(settings['gateways'])
+                if pool is not None else 'local/login-node mode')
+        self.notify(f'Connections saved · using {mode}', timeout=6,
+                    markup=False)
+        await self.action_refresh_table()
+
+    @staticmethod
+    def _persist_connection_choice(result: dict) -> tuple[dict, object | None]:
+        mode = result.get('mode')
+        gateways = list(result.get('gateways') or ())
+        command = result.get('agent_command') or ['atmux-agent']
+        config.save_client_state(mode, gateways, command)
+        settings = config.load_client()
+        pool = (gateway_client.GatewayPool(settings)
+                if mode == 'gateway' else None)
+        return settings, pool
 
     # ── table refresh ─────────────────────────────────────────────────────────
 
@@ -2356,15 +2641,21 @@ class AutotmuxApp(App):
         """Timer entry point: read daemon state OFF the event loop, then
         render. Keeps the 5s tick from freezing the UI on a slow / NFS /
         mid-write state-file read."""
-        if not _gateway_mode():
+        source_pool = _GATEWAY_POOL
+        if source_pool is None:
             _sync_active_runtime_paths()
         try:
-            timeout = (_UI_FILE_READ_TIMEOUT if _GATEWAY_POOL is None else
-                       float(_GATEWAY_POOL.settings['state_timeout']) + 1.0)
+            timeout = (_UI_FILE_READ_TIMEOUT if source_pool is None else
+                       float(source_pool.settings['state_timeout']) + 1.0)
             state_ok, state = await _offload_for(
                 timeout, _read_state_checked)
         except Exception:
             state_ok, state = False, {}
+        if source_pool is not _GATEWAY_POOL:
+            # The user changed deployment in Connections while this bounded
+            # read was in flight.  Never paint the old host namespace over the
+            # freshly-selected one.
+            return
         if not state_ok:
             # A daemon restart briefly removes the file. Keep the last complete
             # view instead of clearing rows and moving the user's cursor.
@@ -2387,6 +2678,8 @@ class AutotmuxApp(App):
                 _operation_timeout(_UI_FILE_READ_TIMEOUT),
                 self._ka_registry_entries)
         except Exception:
+            return
+        if source_pool is not _GATEWAY_POOL:
             return
         if new_entries != self._ka_entries:
             self._ka_entries = new_entries
@@ -2784,6 +3077,8 @@ class AutotmuxApp(App):
         """Auto-restart a PID-dead daemon (with loop guard); banner-only for a
         hung-but-alive one (the existing stale subtitle covers that, and we
         never auto-kill a daemon that's merely slow)."""
+        if self._connection_setup_pending:
+            return
         if _gateway_mode() or _daemon_running():
             self._crash_looping = False
             self._recovery_inflight = False
@@ -3016,10 +3311,13 @@ class AutotmuxApp(App):
 
     async def _reload_snapshots_async(self, render_loading: bool = False) -> None:
         # Filesystem could be slow / NFS-y; never block the event loop on it.
+        source_pool = _GATEWAY_POOL
         try:
             ok, snapshots = await _offload_for(
                 _UI_FILE_READ_TIMEOUT, _read_snapshots_checked)
         except Exception:
+            return
+        if source_pool is not _GATEWAY_POOL:
             return
         if ok:
             self.snapshots = snapshots
@@ -3206,7 +3504,10 @@ class AutotmuxApp(App):
                     continue
 
                 try:
+                    source_pool = _GATEWAY_POOL
                     response = await self._spawn_preview_capture(node, sess)
+                    if source_pool is not _GATEWAY_POOL:
+                        continue
                     if not isinstance(response, dict):
                         raise RuntimeError('invalid preview service response')
                     if not response.get('ok'):
@@ -3939,6 +4240,9 @@ def _build_argparser():
     target.add_argument('--shell', dest='shell_node', metavar='NODE',
                         help='Skip the TUI and open a shell directly on NODE.')
     target.add_argument(
+        '--connections', action='store_true',
+        help='Open the TUI connection manager on startup.')
+    target.add_argument(
         '--gateway-login', action='store_true',
         help='Interactively authenticate and pre-warm every configured login '
              'gateway, then exit.')
@@ -4043,6 +4347,20 @@ def _configure_gateway_mode(args) -> str:
     return ''
 
 
+def _should_offer_connection_setup(args) -> bool:
+    """Whether a local first run should open the SSH-alias picker."""
+    if getattr(args, 'connections', False):
+        return True
+    if (_is_remote_session() or getattr(args, 'login_mode', False)
+            or getattr(args, 'gateway', None)
+            or getattr(args, 'gateway_mode', False)):
+        return False
+    ok, settings = _load_client_config_bounded()
+    return bool(ok and isinstance(settings, dict)
+                and settings.get('mode') != 'login'
+                and not settings.get('gateways'))
+
+
 def main():
     global _RUNTIME_DISCOVERY_ENABLED
     parser = _build_argparser()
@@ -4085,7 +4403,9 @@ def main():
     # The first frame should never wait behind a slow/failed daemon start.
     # on_mount() paints immediately and dispatches the existing guarded
     # recovery worker when no singleton lock is held.
-    AutotmuxApp().run(mouse=_want_mouse(args))
+    AutotmuxApp(
+        offer_connection_setup=_should_offer_connection_setup(args),
+    ).run(mouse=_want_mouse(args))
 
 
 if __name__ == "__main__":

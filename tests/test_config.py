@@ -97,9 +97,15 @@ class LoadConfigTests(unittest.TestCase):
 class LoadClientConfigTests(unittest.TestCase):
     def setUp(self):
         self._saved_path = config.CONFIG_PATH
+        self._saved_state_path = config.CLIENT_STATE_PATH
+        self._state_dir = tempfile.TemporaryDirectory()
+        config.CLIENT_STATE_PATH = os.path.join(
+            self._state_dir.name, 'connections.json')
 
     def tearDown(self):
         config.CONFIG_PATH = self._saved_path
+        config.CLIENT_STATE_PATH = self._saved_state_path
+        self._state_dir.cleanup()
 
     def _write(self, td, text):
         path = os.path.join(td, 'config.toml')
@@ -160,6 +166,42 @@ class LoadClientConfigTests(unittest.TestCase):
         self.assertTrue(config.valid_gateway('ssh-alias'))
         for value in ('-v', 'host;id', 'host name', '', None):
             self.assertFalse(config.valid_gateway(value))
+
+    def test_tui_selection_works_without_toml_and_overrides_legacy_client(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, '[client]\ngateways = ["old-login"]\n')
+            config.save_client_state(
+                'gateway', ['login2', 'login1'],
+                ['/remote/bin/atmux-agent'])
+            cfg = config.load_client()
+        self.assertTrue(config.client_state_exists())
+        self.assertEqual(cfg['mode'], 'gateway')
+        self.assertEqual(cfg['gateways'], ['login2', 'login1'])
+        self.assertEqual(
+            cfg['agent_command'], ['/remote/bin/atmux-agent'])
+        self.assertEqual(os.stat(config.CLIENT_STATE_PATH).st_mode & 0o777, 0o600)
+
+    def test_tui_can_remember_native_mode_without_a_gateway(self):
+        with tempfile.TemporaryDirectory() as td:
+            config.CONFIG_PATH = os.path.join(td, 'missing.toml')
+            config.save_client_state('login', [], ['atmux-agent'])
+            cfg = config.load_client()
+        self.assertEqual(cfg['mode'], 'login')
+        self.assertEqual(cfg['gateways'], [])
+
+    def test_ssh_alias_discovery_follows_include_and_skips_patterns(self):
+        with tempfile.TemporaryDirectory() as td:
+            included = os.path.join(td, 'cluster.conf')
+            with open(included, 'w') as handle:
+                handle.write('Host login2 login3\n  User me\n')
+            root = os.path.join(td, 'config')
+            with open(root, 'w') as handle:
+                handle.write(
+                    'Host * !blocked wildcard-*\n  ServerAliveInterval 10\n'
+                    'Host login1 login2\n  HostName example\n'
+                    'Include cluster.conf\n')
+            aliases = config.discover_ssh_aliases(root)
+        self.assertEqual(aliases, ['login1', 'login2', 'login3'])
 
 
 if __name__ == '__main__':

@@ -5,7 +5,7 @@ compute nodes. It automatically discovers your running jobs, keeps fast
 SSH connections to each node open in the background, and lets you list,
 preview, and attach to remote tmux sessions from a single TUI.
 
-## Architecture (v0.5.0)
+## Architecture (v0.6.0)
 
 AutoTmux is split into two pieces:
 
@@ -38,7 +38,7 @@ AutoTmux is split into two pieces:
 This split means the frontend never blocks on `squeue` or SSH, and tmux
 session listings refresh in the background without any user-visible work.
 
-AutoTmux 0.5 adds an optional third piece without changing that native mode:
+AutoTmux 0.5+ includes an optional third piece without changing that native mode:
 
 - **`atmux-agent`** — a bounded, one-request SSH-stdio bridge. A laptop can
   query the existing daemon on several login nodes, request previews, update
@@ -49,6 +49,9 @@ AutoTmux 0.5 adds an optional third piece without changing that native mode:
   ControlMaster, applies per-gateway circuit breaking, and automatically tries
   another login node after a transport loss. Last-good state and previews are
   cached locally so an outage does not blank the dashboard.
+- **Connection Manager** (0.6+) — the TUI discovers existing OpenSSH aliases,
+  tests latency, and persists the selected pool, so local deployment needs no
+  hand-edited client config.
 
 The original login-node deployment remains the default when no gateways are
 configured. In `mode = "auto"`, an `atmux` launched through SSH also stays in
@@ -81,8 +84,26 @@ On clusters with a shared home/software environment, one login-side install is
 usually enough. Keep using `atmux` normally on a login node; local mode is an
 additional deployment, not a replacement.
 
-On the local machine, add a `[client]` section to
-`~/.config/autotmux/config.toml`:
+If the local machine already has passwordless SSH aliases such as `login1`,
+`login2`, and `login3`, no config editing is needed. Run:
+
+```bash
+atmux
+```
+
+On first local use AutoTmux opens **Connections**, discovers literal `Host`
+aliases from `~/.ssh/config` (including bounded `Include` files), and lets you:
+
+- select multiple login nodes with Space;
+- test every selected gateway and see its latency;
+- add an alias which was not discovered;
+- save with the button or `Ctrl+S` and connect without restarting the TUI.
+
+Press `g` from the dashboard to reopen Connections at any time, or launch it
+directly with `atmux --connections`. The choice is stored in the TUI-owned
+`~/.config/autotmux/connections.json`; users do not need to edit it.
+
+The old TOML form remains available for automation and advanced timing overrides:
 
 ```toml
 [client]
@@ -133,17 +154,25 @@ Local mode displays the laptop as `localhost` and the selected login host as
 `login--HOST`; compute-node names are unchanged. Interactive traffic follows:
 
 ```text
-local atmux → selected login agent → compute node → tmux
+fast path: local atmux → SSH tunnel through login → compute tmux
+fallback:  local atmux → selected login agent → compute tmux
 ```
 
-The login agent reuses that host's existing compute ControlMaster. If the
-outer login connection returns SSH's transport status, AutoTmux retries the
-same gateway once without a stale local mux and then moves to another healthy
-login node. A live TCP/SSH stream cannot migrate between gateways, but the tmux
-server remains alive on the compute node and AutoTmux immediately reattaches
-through the next route. Read-only state uses hedged requests; mutating
-keep-alive updates are idempotent and protected by the existing shared lease,
-so failover cannot submit duplicate replacement jobs.
+The fast path uses one target PTY and a dedicated interactive SSH master, so
+keystrokes never queue behind state/preview RPC payloads. It also applies the
+login account name learned from the remote daemon, which matters when the
+laptop username differs from the cluster username. If the cluster disallows
+end-to-end SSH authentication to compute nodes, AutoTmux remembers that result
+for five minutes and transparently uses the login agent instead. The agent
+reuses that host's existing compute ControlMaster.
+
+If an outer login connection returns SSH's transport status, AutoTmux bypasses
+the stale mux and then moves to another healthy login node. A live TCP/SSH
+stream cannot migrate between gateways, but the tmux server remains alive on
+the compute node and AutoTmux immediately reattaches through the next route.
+Read-only state uses hedged requests; mutating keep-alive updates are idempotent
+and protected by the existing shared lease, so failover cannot submit duplicate
+replacement jobs.
 
 ## Daemon control
 
@@ -208,12 +237,14 @@ with a warning in the daemon log.
 Restart the daemon to apply changes: `atmux-daemon restart`.
 
 The `[client]` table is read by the local frontend and does not require a
-daemon restart. Ordinary SSH/Mosh launches always keep native login-node
-behaviour without waiting on the client config; use `--gateway-mode` explicitly
-for the unusual case of running a gateway client there. Outside SSH,
-`mode = "auto"` enables configured gateways, `mode = "gateway"` forces them,
-and `mode = "login"` keeps native behaviour. CLI flags override the file for
-one invocation.
+daemon restart. A selection saved through Connections overrides its mode,
+gateway list, and agent command while retaining advanced numeric tunables from
+TOML. Ordinary SSH/Mosh launches always keep native login-node behaviour
+without waiting on local-client files; use `--gateway-mode` explicitly for the
+unusual case of running a gateway client there. Outside SSH, `mode = "auto"`
+enables configured gateways, `mode = "gateway"` forces them, and `mode =
+"login"` keeps native behaviour. CLI flags override both saved sources for one
+invocation.
 
 ### Runtime files & paths
 
