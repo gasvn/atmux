@@ -5,13 +5,16 @@ made transparent (prefix None / private key-table / status off, F12 to recover)
 so the inner session receives the prefix. These tests drive the real helpers
 against an ISOLATED tmux server on a private socket — never the live one.
 """
+import fcntl
 import os
 import pty
 import select
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import unittest
 from types import SimpleNamespace
@@ -24,6 +27,21 @@ from autotmux import cli as autotmux
 
 def _have_tmux() -> bool:
     return shutil.which('tmux') is not None
+
+
+def _open_sized_pty(rows: int = 24, cols: int = 80):
+    """A pty that reports a real window size.
+
+    ``pty.openpty()`` leaves the size at 0x0.  tmux invents a size for its own
+    client, but anything written straight to the pty afterwards -- a helper
+    executed through ``detach-client -E``, say -- wraps at an arbitrary column,
+    which can split a short string like ``AutoTmux 0.6.1`` across lines and
+    make an assertion miss text that is really there.
+    """
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ,
+                struct.pack('HHHH', rows, cols, 0, 0))
+    return master_fd, slave_fd
 
 
 @unittest.skipUnless(_have_tmux(), 'tmux not installed')
@@ -212,7 +230,7 @@ class NestedTmuxTransparentTests(unittest.TestCase):
         subprocess.run(
             ['tmux', '-S', self.sock, 'respawn-pane', '-k', '-t', 'outer',
              'cat -v'], check=True)
-        master_fd, slave_fd = pty.openpty()
+        master_fd, slave_fd = _open_sized_pty()
         env = os.environ.copy()
         env.pop('TMUX', None)
         env.pop('TMUX_PANE', None)
@@ -272,7 +290,7 @@ class NestedTmuxTransparentTests(unittest.TestCase):
             os.close(master_fd)
 
     def test_client_handoff_executes_helper_and_reattaches(self):
-        master_fd, slave_fd = pty.openpty()
+        master_fd, slave_fd = _open_sized_pty()
         env = os.environ.copy()
         env.pop('TMUX', None)
         env.pop('TMUX_PANE', None)
