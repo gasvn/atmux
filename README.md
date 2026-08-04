@@ -565,6 +565,58 @@ reminders are enabled — `desktop = false` silences only the OS popup. Announce
 JobIDs are remembered under the runtime dir, so restarting `atmux` does not
 re-announce a job you have already been told about.
 
+#### Setting up a Slack webhook
+
+Create the endpoint at <https://api.slack.com/apps>:
+
+1. **Create New App** → **From scratch**, name it, pick the workspace.
+2. **Incoming Webhooks** in the sidebar → turn **Activate Incoming Webhooks**
+   on (it is off by default).
+3. **Add New Webhook to Workspace** at the bottom → choose the channel → **Allow**.
+4. Copy the generated `https://hooks.slack.com/services/…` URL.
+
+None of the App Credentials (Client Secret, Signing Secret, Verification Token)
+are needed. Those are for OAuth and for verifying requests Slack sends *you*;
+a webhook is a plain POST to that one URL.
+
+**Put the config where the daemon runs, not where the TUI runs.** The two
+routes read different machines:
+
+| Route | Config file lives on | Read by |
+| :--- | :--- | :--- |
+| `desktop` | the machine you run `atmux` on | the TUI |
+| `webhook_url` | the **login node** | that node's daemon |
+
+Sending from the login node is what lets a reminder arrive after you close the
+dashboard. On a cluster with a shared home, writing it once covers every login
+node — but each node's daemon only picks it up when **that** daemon restarts:
+
+```bash
+# on a login node
+install -d -m 700 ~/.config/autotmux
+cat > ~/.config/autotmux/config.toml <<'EOF'
+[notify]
+enabled     = true
+lead_time   = 3600
+webhook_url = "https://hooks.slack.com/services/..."
+EOF
+chmod 600 ~/.config/autotmux/config.toml
+atmux-daemon restart
+```
+
+The URL is a credential: anyone holding it can post to that channel. Keep the
+file mode `600`, never commit it, and prefer passing it through an environment
+variable over a command line on a shared login node — `/proc/<pid>/cmdline` is
+world-readable there while `environ` is not.
+
+To confirm delivery without waiting for a job to age:
+
+```bash
+python3 -c 'import os
+from autotmux import notify, config
+print(notify.post(config.load_notify()["webhook_url"], "AutoTmux test", 10))'
+```
+
 ### Keep-alive auto-renew
 
 Press `k` on any remote Slurm row—including `<Start Shell>` or `<offline>`—to
