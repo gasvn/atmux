@@ -125,7 +125,37 @@ probe_interval = 60
 control_persist = 3600
 server_alive_int = 15
 server_alive_max = 3
+
+# Reuse SSH masters owned by something else instead of opening our own.
+# control_path = "~/.ssh/cm-2fa-%n"
 ```
+
+### Reusing externally managed SSH masters
+
+Some sites keep authenticated login masters alive with a separate helper —
+common where every new connection costs an MFA prompt. AutoTmux normally opens
+its own masters, which re-triggers that prompt on every background probe and
+every attach; because background traffic uses `BatchMode=yes`, the prompt
+cannot even appear and the connection simply fails with
+`Permission denied (keyboard-interactive)`.
+
+Point `control_path` at the helper's socket to ride it instead:
+
+```toml
+[client]
+control_path = "~/.ssh/cm-2fa-%n"
+```
+
+OpenSSH expands its usual tokens, so `%n` becomes the gateway alias as written
+in `gateways`. AutoTmux then uses that one master for every login-gateway
+connection — state RPCs, previews, attaches, and the `ProxyCommand` hop to a
+compute node alike — with `ControlMaster=no`, so it never creates or takes
+ownership of a socket belonging to another tool. Masters to compute nodes are
+still AutoTmux's own, since those terminate somewhere the login socket cannot
+reach.
+
+With this set, `atmux --gateway-login` reports which masters are missing rather
+than trying to open them; renew them with whichever tool owns them.
 
 If login requires MFA, a password, or keyboard-interactive authentication,
 bootstrap the login ControlMasters explicitly:

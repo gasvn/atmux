@@ -93,6 +93,12 @@ CLIENT_DEFAULTS = {
     'server_alive_int': 15,
     'server_alive_max': 3,
     'agent_command': ['atmux-agent'],
+    # Reuse SSH ControlMasters owned by something else (an MFA helper that
+    # keeps authenticated masters alive, for example) instead of opening our
+    # own.  Empty means AutoTmux manages its own gateway masters, as before.
+    # OpenSSH expands the usual tokens, so "~/.ssh/cm-2fa-%n" resolves %n to
+    # the gateway alias.
+    'control_path': '',
 }
 
 _CLIENT_NUMBER_RULES = {
@@ -113,6 +119,9 @@ _CLIENT_NUMBER_RULES = {
 # ~/.ssh/config so a value can never be mistaken for an option or command.
 _GATEWAY_RE = re.compile(
     r'^(?:[A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._:-]*$')
+
+# Terminal control sequences must never reach argv or a status line.
+_CONTROL_CHARS = re.compile(r'[\x00-\x1f\x7f-\x9f]')
 
 
 # Type/range validation is part of the daemon's liveness contract.  Values such
@@ -226,6 +235,26 @@ def _client_agent_command(value) -> list[str] | None:
            or '\n' in part or '\r' in part for part in parts):
         return None
     return parts
+
+
+def _client_control_path(value) -> str | None:
+    """Validate an externally managed ControlPath template.
+
+    The value reaches OpenSSH as one argv item, so it must not look like an
+    option or carry anything that could break the argument.  OpenSSH expands
+    ``~`` and its own %-tokens itself; we only expand ``~`` so our own
+    ``ssh -O check`` and any diagnostics agree with what ssh will open.
+    """
+    if not isinstance(value, str):
+        return None
+    path = os.path.expanduser(value.strip())
+    if not path:
+        return ''
+    if path.startswith('-') or len(path) > 200:
+        return None
+    if any(ch in path for ch in ('\x00', '\n', '\r')) or _CONTROL_CHARS.search(path):
+        return None
+    return path
 
 
 def _read_client_state() -> dict | None:
@@ -470,6 +499,13 @@ def load_client() -> dict:
             log.warning('ignoring invalid client agent_command')
         else:
             cfg['agent_command'] = command
+
+    if 'control_path' in section:
+        control_path = _client_control_path(section['control_path'])
+        if control_path is None:
+            log.warning('ignoring invalid client control_path')
+        else:
+            cfg['control_path'] = control_path
     return _apply_client_state(cfg)
 
 

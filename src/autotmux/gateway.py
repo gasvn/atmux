@@ -170,6 +170,17 @@ def _read_owned_json(path: str, limit: int) -> dict:
     return value
 
 
+def _escape_ssh_percent(value: str) -> str:
+    """Protect %-tokens that must survive into a nested ssh invocation.
+
+    OpenSSH expands tokens in a ProxyCommand against the *outer* destination
+    before running it, so an unescaped ``%n`` in a ControlPath would resolve to
+    the compute node rather than to the login alias the inner ssh connects to.
+    ``%%`` survives that pass as a literal ``%``.
+    """
+    return value.replace("%", "%%")
+
+
 def _gateway_jitter(gateway: str, failures: int) -> float:
     digest = hashlib.sha256(
         f"{gateway}\0{failures}".encode("utf-8", "surrogatepass")
@@ -313,10 +324,42 @@ class GatewayPool:
                     routes[display] = Route(gateway, target, fixed)
         self._routes = routes
 
+    def external_control_path(self) -> str:
+        """A ControlPath owned by something outside AutoTmux, or ""."""
+        value = self.settings.get("control_path")
+        return value.strip() if isinstance(value, str) else ""
+
+    def _control_options(self, control_path: str, persist: int) -> list[str]:
+        """ControlMaster options for a login-gateway connection.
+
+        An externally managed socket (an MFA helper keeping authenticated
+        masters alive, say) must be reused but never created or owned by us:
+        opening our own master at that path would collide with its owner, and
+        every AutoTmux socket category would otherwise need its own copy of
+        that already-authenticated session.
+        """
+        if self.external_control_path():
+            return ["-o", "ControlMaster=no",
+                    "-o", f"ControlPath={control_path}"]
+        return ["-o", "ControlMaster=auto",
+                "-o", f"ControlPersist={persist}",
+                "-o", f"ControlPath={control_path}"]
+
     def _control_path(self, gateway: str) -> str:
+        external = self.external_control_path()
+        if external:
+            return external
         return paths.control_path(f"gateway-{gateway}", paths.GATEWAY_CTL_DIR)
 
     def _interactive_control_path(self, gateway: str) -> str:
+        external = self.external_control_path()
+        if external:
+            # One authenticated master serves RPC and interactive traffic
+            # alike; its owner decides how long it lives.
+            return external
+        return self._own_interactive_control_path(gateway)
+
+    def _own_interactive_control_path(self, gateway: str) -> str:
         """Dedicated login transport for latency-sensitive terminal traffic.
 
         State and preview RPCs can return multi-megabyte payloads.  Sharing
@@ -350,11 +393,10 @@ class GatewayPool:
         else:
             control_path = (self._interactive_control_path(gateway)
                             if tty else self._control_path(gateway))
-            args += [
-                "-o", "ControlMaster=auto",
-                "-o", f"ControlPersist={min(int(self.settings['control_persist']), _INTERACTIVE_CONTROL_PERSIST) if tty else int(self.settings['control_persist'])}",
-                "-o", f"ControlPath={control_path}",
-            ]
+            persist = int(self.settings['control_persist'])
+            if tty:
+                persist = min(persist, _INTERACTIVE_CONTROL_PERSIST)
+            args += self._control_options(control_path, persist)
         args.append("-tt" if tty else "-T")
         args.append(gateway)
         return args
@@ -383,11 +425,12 @@ class GatewayPool:
         if direct:
             args += ["-o", "ControlPath=none", "-o", "ControlMaster=no"]
         else:
-            args += [
-                "-o", "ControlMaster=auto",
-                "-o", f"ControlPersist={min(int(self.settings['control_persist']), _INTERACTIVE_CONTROL_PERSIST)}",
-                "-o", f"ControlPath={self._interactive_control_path(gateway)}",
-            ]
+            # This ControlPath is consumed by the inner ssh, so any token in it
+            # has to survive the outer ssh's expansion pass intact.
+            args += self._control_options(
+                _escape_ssh_percent(self._interactive_control_path(gateway)),
+                min(int(self.settings['control_persist']),
+                    _INTERACTIVE_CONTROL_PERSIST))
         args += ["-T", "-W", "%h:%p", gateway]
         return shlex.join(args)
 
@@ -1375,11 +1418,21 @@ class GatewayPool:
         prompt can never corrupt the TUI.  This explicit bootstrap command is
         the one place where OpenSSH is allowed to prompt the user's terminal.
         """
+        external = self.external_control_path()
         results = []
         for index, gateway in enumerate(self._gateways, 1):
             if self._master_alive(gateway):
                 results.append({"gateway": gateway, "ok": True,
                                 "existing": True})
+                continue
+            if external:
+                # Opening our own master at someone else's ControlPath would
+                # collide with its owner, so report the gap instead of racing
+                # to fill it.
+                results.append({
+                    "gateway": gateway, "ok": False, "existing": False,
+                    "error": (f"no master at {external}; authenticate it with "
+                              "the tool that owns it")})
                 continue
             print(f"[atmux] authenticating gateway {index}/{len(self._gateways)}: "
                   f"{gateway}", flush=True)

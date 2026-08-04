@@ -124,8 +124,11 @@ class GatewayPoolTests(_PoolFixture, unittest.TestCase):
         pool = self.pool(gateways=("login1",))
         env_path = self.temp.name + os.pathsep + os.environ.get("PATH", "")
         with mock.patch.dict(os.environ, {"PATH": env_path}):
+            # The budget has to cover two Python interpreter starts (the fake
+            # ssh, then the agent it execs). A tight bound here fails on a
+            # loaded machine without telling us anything about framing.
             response = pool._rpc_gateway(
-                "login1", {"action": "ping"}, timeout=2)
+                "login1", {"action": "ping"}, timeout=30)
         self.assertTrue(response["ok"])
         self.assertEqual(response["protocol"], 1)
         self.assertIn("version", response)
@@ -583,6 +586,130 @@ class LoginNodeRosterTests(_PoolFixture, unittest.TestCase):
             pool._record_login_node("login2", reply)
         state = pool._decorate_state(remote_state(), "login1", "login1")
         self.assertEqual(self._login_rows(state), ["login--login1"])
+
+
+class ExternalControlPathTests(_PoolFixture, unittest.TestCase):
+    """`[client] control_path` reuses SSH masters owned by something else (an
+    MFA helper, say).  AutoTmux must ride those masters for every gateway
+    connection and never create one at a path it does not own."""
+
+    EXTERNAL = "/tmp/cm-external-%n"
+
+    def external_pool(self, **overrides):
+        return self.pool(control_path=self.EXTERNAL, **overrides)
+
+    @staticmethod
+    def _opt(argv, name):
+        return [v for v in argv if v.startswith(f"{name}=")]
+
+    def test_rpc_and_interactive_share_the_external_master(self):
+        pool = self.external_pool()
+        self.assertEqual(pool._control_path("login1"), self.EXTERNAL)
+        self.assertEqual(pool._interactive_control_path("login1"), self.EXTERNAL)
+
+    def test_external_master_is_used_but_never_created(self):
+        pool = self.external_pool()
+        for argv in (pool._ssh_argv("login1"),
+                     pool._ssh_argv("login1", tty=True)):
+            self.assertEqual(self._opt(argv, "ControlPath"),
+                             [f"ControlPath={self.EXTERNAL}"])
+            self.assertIn("ControlMaster=no", argv)
+            self.assertNotIn("ControlMaster=auto", argv)
+            # Persist belongs to the owner; claiming it would take the socket.
+            self.assertEqual(self._opt(argv, "ControlPersist"), [])
+
+    def test_proxy_hop_to_a_compute_node_uses_the_external_master(self):
+        """The attach failure this option exists for: the ProxyCommand hop is a
+        separate socket from the RPC one, so it must be covered too."""
+        pool = self.external_pool()
+        proxy = pool._jump_proxy_command("login1", direct=False)
+        self.assertIn("ControlPath=", proxy)
+        self.assertIn("ControlMaster=no", proxy)
+
+    def test_proxy_hop_tokens_survive_the_outer_expansion(self):
+        """OpenSSH expands %-tokens in a ProxyCommand against the *outer*
+        destination before running it.  An unescaped %n would resolve to the
+        compute node, sending the inner ssh at a socket that cannot exist and
+        making every attach fail.
+        """
+        pool = self.external_pool()
+        proxy = pool._jump_proxy_command("login1", direct=False)
+        self.assertIn("ControlPath=/tmp/cm-external-%%n", proxy)
+        self.assertNotIn("ControlPath=/tmp/cm-external-%n", proxy)
+        # The forwarding tokens must stay single so the outer ssh does expand
+        # them -- that is how the hop learns which compute node to reach.
+        self.assertIn("-W %h:%p", proxy)
+
+    def test_plain_control_paths_are_unchanged_in_a_proxy_command(self):
+        pool = self.pool()
+        proxy = pool._jump_proxy_command("login1", direct=False)
+        self.assertIn(
+            f"ControlPath={pool._interactive_control_path('login1')}", proxy)
+
+    def test_compute_node_master_is_still_our_own(self):
+        """The jump master terminates on the compute node, not the login node,
+        so it must not be pointed at the login-node socket."""
+        pool = self.external_pool()
+        argv = pool._fast_interactive_argv("login1", "gpu1", "shell", None)
+        jump = pool._jump_control_path("login1", "gpu1")
+        self.assertEqual(self._opt(argv, "ControlPath"),
+                         [f"ControlPath={jump}"])
+        self.assertNotEqual(jump, self.EXTERNAL)
+        self.assertIn("ControlMaster=auto", argv)
+
+    def test_direct_bypass_still_skips_multiplexing(self):
+        pool = self.external_pool()
+        argv = pool._ssh_argv("login1", direct=True)
+        self.assertIn("ControlPath=none", argv)
+        self.assertNotIn(f"ControlPath={self.EXTERNAL}", argv)
+
+    def test_gateway_login_reports_instead_of_stealing_the_socket(self):
+        pool = self.external_pool()
+        with mock.patch.object(pool, "_master_alive", return_value=False), \
+             mock.patch.object(gateway.subprocess, "call") as call:
+            results = pool.authenticate()
+        call.assert_not_called()
+        self.assertTrue(all(not r["ok"] for r in results))
+        self.assertIn(self.EXTERNAL, results[0]["error"])
+
+    def test_gateway_login_still_creates_our_own_master_by_default(self):
+        pool = self.pool()
+        with mock.patch.object(pool, "_master_alive", side_effect=[False, True,
+                                                                  False, True]), \
+             mock.patch.object(gateway.subprocess, "call", return_value=0) as call:
+            pool.authenticate()
+        self.assertTrue(call.called)
+        argv = call.call_args[0][0]
+        self.assertIn("ControlMaster=auto", argv)
+
+    def test_unset_option_keeps_private_per_purpose_masters(self):
+        pool = self.pool()
+        self.assertEqual(pool.external_control_path(), "")
+        self.assertNotEqual(pool._control_path("login1"),
+                            pool._interactive_control_path("login1"))
+        self.assertIn("ControlMaster=auto", pool._ssh_argv("login1"))
+
+
+class ClientControlPathConfigTests(unittest.TestCase):
+    def test_valid_values_are_expanded(self):
+        self.assertEqual(
+            config._client_control_path("~/.ssh/cm-%n"),
+            os.path.join(os.path.expanduser("~"), ".ssh/cm-%n"))
+        self.assertEqual(config._client_control_path("  /tmp/cm-%n  "),
+                         "/tmp/cm-%n")
+
+    def test_empty_means_manage_our_own(self):
+        for value in ("", "   "):
+            self.assertEqual(config._client_control_path(value), "")
+
+    def test_dangerous_values_are_rejected(self):
+        for value in ("-oProxyCommand=x", "/tmp/a\nb", "/tmp/a\x00b",
+                      "/tmp/\x1b[2Jb", "x" * 260, 5, None, ["/tmp/cm"]):
+            with self.subTest(value=value):
+                self.assertIsNone(config._client_control_path(value))
+
+    def test_default_is_unset(self):
+        self.assertEqual(config.CLIENT_DEFAULTS["control_path"], "")
 
 
 class AgentTests(unittest.TestCase):

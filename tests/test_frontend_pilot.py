@@ -603,7 +603,13 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                     ]))
 
     async def test_missing_state_file_doesnt_crash(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(autotmux, '_daemon_running',
+                                  return_value=True):
+            # Pin the daemon as up. Otherwise the app starts its recovery path
+            # and reports "starting daemon…", so the assertion below would
+            # depend on whether a real daemon happens to run on the machine
+            # running the tests.
             autotmux.STATE_FILE = os.path.join(td, 'missing.json')
             autotmux.SNAPSHOT_FILE = os.path.join(td, 'missing_snap.json')
             app = autotmux.AutotmuxApp()
