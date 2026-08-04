@@ -16,6 +16,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from textual.coordinate import Coordinate
+
 from autotmux import cli as autotmux
 
 # Synthetic state with a known shape — two alive nodes, one offline.
@@ -447,8 +449,8 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 new_state['nodes']['gpu1']['info']['load'] = '7.77'
                 app._refresh_table(new_state)
                 await pilot.pause()
-                # LOAD is display column index 5; row 0 is a gpu1 row.
-                self.assertEqual(str(app.table.get_cell_at(Coordinate(0, 5))), '7.77')
+                # LOAD is display column index 6 (IDLE leads); row 0 is gpu1.
+                self.assertEqual(str(app.table.get_cell_at(Coordinate(0, 6))), '7.77')
                 self.assertEqual(app._last_structural_sig, sig_before,
                                  "load-only change must not trigger a structural rebuild")
 
@@ -471,7 +473,7 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }
                 app._refresh_table(state)
-                cell = app.table.get_cell_at(Coordinate(0, 1))
+                cell = app.table.get_cell_at(Coordinate(0, 2))
                 self.assertIsInstance(cell, autotmux.rich.text.Text)
                 self.assertEqual(cell.plain, '[bold]literal[/bold]')
 
@@ -1036,6 +1038,86 @@ class ExpiringJobWarningTests(unittest.IsolatedAsyncioTestCase):
                 app._refresh_table(JOB_STATE)      # must not raise
                 await pilot.pause()
                 self.assertTrue(app.all_sessions)
+
+
+class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
+    """The idle hint leads the table. STATUS is the first column a narrow
+    terminal truncates, so a hint parked there is invisible exactly when the
+    table is crowded — which is when it matters."""
+
+    IDLE_STATE = {
+        'updated': '2026-01-01 00:00:00',
+        'nodes': {'gpu1': {
+            'alive': True, 'socket': '/tmp/x', 'last_error': '',
+            'info': {'time': '1-00:00:00'},
+            'sessions': [['quiet', '1', 900], ['old', '1', 7200],
+                         ['busy', '1', 5]]}},
+    }
+
+    def setUp(self):
+        self._saved_launch = autotmux._launch_daemon
+        autotmux._launch_daemon = lambda: (True, '')
+
+    def tearDown(self):
+        autotmux._launch_daemon = self._saved_launch
+
+    async def _render(self, state):
+        app = autotmux.AutotmuxApp()
+        async with app.run_test() as pilot:
+            app._refresh_table(state)
+            await pilot.pause()
+            headers = [str(c.label) for c in app.table.columns.values()]
+            rows = {}
+            for i, r in enumerate(app.all_sessions):
+                cells = [app.table.get_cell_at(Coordinate(i, c))
+                         for c in range(len(headers))]
+                rows[r[1]] = cells
+            return headers, rows
+
+    async def test_idle_is_the_first_column(self):
+        headers, _ = await self._render(self.IDLE_STATE)
+        self.assertEqual(headers[0], 'IDLE')
+        self.assertEqual(
+            headers,
+            ['IDLE', 'NODE', 'SESSION', 'WIN', 'TIME', 'CPU', 'LOAD', 'STATUS'])
+
+    async def test_marker_moves_out_of_status_into_the_lead_cell(self):
+        _, rows = await self._render(self.IDLE_STATE)
+        self.assertEqual(str(rows['quiet'][0]), '● 15m')
+        # Not duplicated: STATUS keeps only the state itself.
+        self.assertEqual(str(rows['quiet'][-1]), 'Active')
+
+    async def test_a_busy_session_has_an_empty_lead_cell(self):
+        _, rows = await self._render(self.IDLE_STATE)
+        self.assertEqual(str(rows['busy'][0]), '')
+        self.assertEqual(str(rows['busy'][-1]), 'Active')
+
+    async def test_the_dot_is_coloured_by_tier(self):
+        _, rows = await self._render(self.IDLE_STATE)
+        self.assertEqual(str(rows['quiet'][0].spans[0].style), 'yellow')
+        self.assertEqual(str(rows['old'][0].spans[0].style), 'red')
+        self.assertEqual(rows['busy'][0].spans, [])
+
+    async def test_in_place_updates_keep_the_columns_aligned(self):
+        """The fast path writes cells by index; a stale mapping would put the
+        load average in STATUS."""
+        app = autotmux.AutotmuxApp()
+        async with app.run_test() as pilot:
+            app._refresh_table(self.IDLE_STATE)
+            await pilot.pause()
+            moved = json.loads(json.dumps(self.IDLE_STATE))
+            moved['nodes']['gpu1']['info']['load'] = '9.99'
+            moved['nodes']['gpu1']['sessions'][0][2] = 7200   # quiet -> stale
+            app._refresh_table(moved)
+            await pilot.pause()
+            names = [r[1] for r in app.all_sessions]
+            row = names.index('quiet')
+            self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 0))),
+                             '● 2h')
+            self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 6))),
+                             '9.99')
+            self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 7))),
+                             'Active')
 
 
 class WarnedJobPersistenceTests(unittest.TestCase):

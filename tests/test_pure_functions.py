@@ -716,19 +716,35 @@ class IdleMarkerTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(autotmux._idle_marker(value), '')
 
+    @staticmethod
+    def _lead_cell(status):
+        """Render the leading IDLE cell the way the table does."""
+        marker, _rest = autotmux._split_idle_marker(status)
+        return autotmux._idle_cell(marker)
+
     def test_colour_escalates_with_age_and_is_scoped_to_the_dot(self):
-        quiet = autotmux._status_cell('● 15m Active')
-        stale = autotmux._status_cell('● 2h Active')
+        quiet = self._lead_cell('● 15m Active')
+        stale = self._lead_cell('● 2h Active')
         self.assertEqual([(s.start, s.end) for s in quiet.spans], [(0, 1)])
         self.assertEqual(str(quiet.spans[0].style), 'yellow')
         self.assertEqual(str(stale.spans[0].style), 'red')
         # An hour expressed in minutes is the same tier as one expressed in h.
-        self.assertEqual(
-            str(autotmux._status_cell('● 60m Active').spans[0].style), 'red')
+        self.assertEqual(str(self._lead_cell('● 60m Active').spans[0].style),
+                         'red')
 
     def test_ordinary_status_text_is_left_unstyled(self):
         for text in ('Active', 'OFFLINE: boom', 'No sessions'):
-            self.assertEqual(autotmux._status_cell(text).spans, [])
+            with self.subTest(text=text):
+                self.assertEqual(self._lead_cell(text).spans, [])
+
+    def test_status_text_is_separated_from_the_marker(self):
+        self.assertEqual(autotmux._split_idle_marker('● 15m Active'),
+                         ('● 15m', 'Active'))
+        self.assertEqual(
+            autotmux._split_idle_marker('● 2h DEGRADED: connect timeout'),
+            ('● 2h', 'DEGRADED: connect timeout'))
+        self.assertEqual(autotmux._split_idle_marker('Active'), ('', 'Active'))
+        self.assertEqual(autotmux._split_idle_marker(''), ('', ''))
 
 
 class IdleThresholdConfigTests(unittest.TestCase):

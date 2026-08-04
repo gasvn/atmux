@@ -2322,13 +2322,21 @@ def _literal_cell(value) -> rich.text.Text:
     return rich.text.Text(str(value))
 
 
-def _status_cell(value) -> rich.text.Text:
-    """STATUS, with a leading idle dot coloured by how long it has been quiet.
+def _split_idle_marker(status) -> tuple[str, str]:
+    """Separate a leading ``● 15m`` marker from the rest of the STATUS text."""
+    text = str(status)
+    if not text.startswith(_IDLE_DOT):
+        return '', text
+    parts = text.split(' ', 2)
+    if len(parts) < 3:
+        return text, ''
+    return f'{parts[0]} {parts[1]}', parts[2]
 
-    Only the dot is styled: the rest stays literal so a session's own text can
-    never be read as markup.
-    """
-    text = str(value)
+
+def _idle_cell(marker) -> rich.text.Text:
+    """The leading IDLE cell: a dot coloured by how long a session has been
+    quiet, plus its age. Only the dot is styled; the rest stays literal."""
+    text = str(marker)
     cell = rich.text.Text(text)
     if text.startswith(_IDLE_DOT):
         tier = 'stale' if _looks_stale(text) else 'idle'
@@ -2689,7 +2697,10 @@ class AutotmuxApp(App):
     async def on_mount(self) -> None:
         self.table = self.query_one(DataTable)
         self.table.cursor_type = "row"
-        self.table.add_columns("NODE", "SESSION", "WIN", "TIME", "CPU", "LOAD", "STATUS")
+        # IDLE leads: STATUS is the first thing a narrow terminal truncates, so
+        # a hint parked there is invisible exactly when the table is crowded.
+        self.table.add_columns(
+            "IDLE", "NODE", "SESSION", "WIN", "TIME", "CPU", "LOAD", "STATUS")
 
         self.log_view = self.query_one("#right_pane", Static)
         self.jobs_view = self.query_one("#jobs_panel", Static)
@@ -2906,14 +2917,16 @@ class AutotmuxApp(App):
 
     def _update_row_cells(self, i: int, r) -> bool:
         """Update only the volatile cells of row i in place. Display columns
-        are NODE0 SESSION1 WIN2 TIME3 CPU4 LOAD5 STATUS6, mapped from the row
-        tuple (node, session, wins, time, status, cpu, load). Returns False if
-        any cell write raised (so the caller can avoid caching a sig that
+        are IDLE0 NODE1 SESSION2 WIN3 TIME4 CPU5 LOAD6 STATUS7, mapped from the
+        row tuple (node, session, wins, time, status, cpu, load). Returns False
+        if any cell write raised (so the caller can avoid caching a sig that
         doesn't match what's actually on screen)."""
+        marker, status = _split_idle_marker(r[4])
         ok = True
-        for col, val in ((2, r[2]), (3, r[3]), (4, r[5]), (5, r[6]), (6, r[4])):
+        for col, val in ((0, marker), (3, r[2]), (4, r[3]),
+                         (5, r[5]), (6, r[6]), (7, status)):
             coord = Coordinate(i, col)
-            cell = _status_cell(val) if col == 6 else _literal_cell(val)
+            cell = _idle_cell(val) if col == 0 else _literal_cell(val)
             try:
                 if str(self.table.get_cell_at(coord)) != str(val):
                     self.table.update_cell_at(coord, cell)
@@ -3049,10 +3062,12 @@ class AutotmuxApp(App):
         self.table.clear()
         for r in rows:
             # row layout: (node, session, wins, time, status, cpu, load)
+            marker, status = _split_idle_marker(r[4])
             self.table.add_row(
+                _idle_cell(marker),
                 *(_literal_cell(value) for value in (
-                    r[0], _session_label(r[1]), r[2], r[3], r[5], r[6])),
-                _status_cell(r[4]),
+                    r[0], _session_label(r[1]), r[2], r[3], r[5], r[6],
+                    status)),
             )
 
         if rows:
