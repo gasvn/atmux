@@ -41,6 +41,9 @@ _USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _FAST_INTERACTIVE_RETRY = 300.0
 _INTERACTIVE_CONTROL_PERSIST = 300
+# Drop a standby login node from the table once its harvested sessions age out,
+# so an unreachable gateway stops advertising a stale session list.
+_LOGIN_NODE_TTL = 300.0
 
 
 def interactive_ssh_options() -> list[str]:
@@ -229,6 +232,10 @@ class GatewayPool:
         self._interactive_prewarm_retry: dict[tuple[str, str], float] = {}
         self._last_probe: dict[str, float | None] = {
             gateway: None for gateway in self._gateways}
+        # Every login node runs its own daemon, but only the gateway that wins
+        # the state race contributes its own tmux sessions.  Standby probes
+        # harvest the others so all configured login nodes stay listed.
+        self._login_nodes: dict[str, dict] = {}
         self._active: str | None = None
         self._sticky_until = 0.0
         self._routes: dict[str, Route] = {}
@@ -740,16 +747,131 @@ class GatewayPool:
 
         def worker(name: str) -> None:
             try:
-                self._rpc_gateway(
-                    name, {"action": "ping", "ensure_daemon": True},
+                # "state" also starts a stopped login-node daemon, exactly as
+                # the old ping+ensure_daemon probe did, and additionally
+                # carries that login node's own tmux sessions -- so the roster
+                # costs no extra round trip and no agent-side change.
+                response = self._rpc_gateway(
+                    name, {"action": "state", "ensure_daemon": True},
                     min(float(self.settings["state_timeout"]),
                         float(self.settings["connect_timeout"]) + 2.0))
+            except Exception:
+                return
+            try:
+                self._record_login_node(name, response)
             except Exception:
                 pass
 
         for gateway in to_probe:
             threading.Thread(target=worker, args=(gateway,), daemon=True,
                              name=f"gateway-standby-{gateway}").start()
+
+    def _store_login_node(self, gateway: str, host, state) -> None:
+        """Remember one login node's own tmux sessions from its daemon state."""
+        if not isinstance(state, dict):
+            return
+        nodes = state.get("nodes")
+        if not isinstance(nodes, dict):
+            return
+        item = nodes.get("localhost")
+        if not isinstance(item, dict):
+            return
+        if not isinstance(host, str) or _NODE_RE.fullmatch(host) is None:
+            host = ""
+        with self._lock:
+            self._login_nodes[gateway] = {
+                "host": host,
+                "item": copy.deepcopy(item),
+                "at": self._clock(),
+            }
+
+    def _record_login_node(self, gateway: str, response) -> None:
+        """Record a standby probe's reply, forgetting a gateway that failed."""
+        if not isinstance(response, dict) or not response.get("ok"):
+            with self._lock:
+                self._login_nodes.pop(gateway, None)
+            return
+        self._store_login_node(
+            gateway, response.get("host"), response.get("state"))
+
+    def _harvest_race_losers(self, results: "queue.Queue", pending: int) -> None:
+        """Keep the login-node sessions of gateways that lost the state race.
+
+        The hedge fetches several gateways but uses only the first valid
+        reply.  Those already-paid-for replies carry each login node's own
+        sessions, so harvesting them fills the roster on the first frame
+        instead of waiting a whole probe_interval for a standby probe.
+        """
+        if pending <= 0:
+            return
+
+        def worker() -> None:
+            deadline = self._clock() + float(self.settings["state_timeout"])
+            left = pending
+            while left > 0:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    return
+                try:
+                    (gateway, state, host, _version,
+                     _entries, error) = results.get(timeout=remaining)
+                except queue.Empty:
+                    return
+                left -= 1
+                if error is not None:
+                    continue
+                try:
+                    self._store_login_node(gateway, host, state)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True,
+                         name="gateway-harvest").start()
+
+    def _merge_login_nodes(self, nodes: dict, routes: dict,
+                           skip_gateway: str | None) -> None:
+        """Add every other configured login node's own sessions to the table.
+
+        The winning gateway already contributes its own; the rest come from the
+        standby probes.  Entries are keyed by resolved host so two aliases for
+        the same login node (a round-robin name and its concrete host) do not
+        produce two identical rows.
+        """
+        now = self._clock()
+        with self._lock:
+            harvested = {
+                gateway: dict(entry)
+                for gateway, entry in self._login_nodes.items()
+                if gateway != skip_gateway
+                and now - float(entry.get("at") or 0.0) <= _LOGIN_NODE_TTL
+            }
+        seen_hosts = {
+            str(item.get("gateway_route", {}).get("login_host") or "")
+            for item in nodes.values() if isinstance(item, dict)
+        }
+        seen_hosts.discard("")
+        for gateway in self._gateways:
+            entry = harvested.get(gateway)
+            if entry is None:
+                continue
+            host = str(entry.get("host") or "")
+            if host and host in seen_hosts:
+                continue
+            display = _login_key(gateway, host, set(nodes))
+            if display in nodes:
+                continue
+            item = copy.deepcopy(entry["item"])
+            item["socket"] = ""
+            item["gateway_route"] = {
+                "gateway": gateway,
+                "target": "localhost",
+                "fixed": True,
+                "login_host": host,
+            }
+            nodes[display] = item
+            routes[display] = Route(gateway, "localhost", True)
+            if host:
+                seen_hosts.add(host)
 
     def _health_payload(self) -> dict:
         now = self._clock()
@@ -852,8 +974,17 @@ class GatewayPool:
                 "target": source_name,
                 "fixed": fixed,
             }
+            if fixed:
+                # Lets the standby merge below recognise this login node by
+                # host and skip a duplicate row for another alias of it.
+                item["gateway_route"]["login_host"] = remote_host or ""
             nodes[display] = item
             routes[display] = Route(route_gateway, source_name, fixed)
+        # Keep the winner in the roster too.  Leadership moves between fetches,
+        # and without this the outgoing winner would vanish from the table
+        # until a standby probe happened to pick it up again.
+        self._store_login_node(gateway, remote_host, state)
+        self._merge_login_nodes(nodes, routes, gateway)
         nodes["localhost"] = self._local_state_loader()
         routes["localhost"] = Route(None, "localhost", True)
         decorated["nodes"] = nodes
@@ -915,6 +1046,9 @@ class GatewayPool:
                 "keepalive": {},
                 "keepalive_health": {},
             }
+        # Standby probes can still be landing while the active gateway is
+        # down, so keep listing the login nodes we can still hear from.
+        self._merge_login_nodes(cached["nodes"], {}, None)
         cached["nodes"]["localhost"] = self._local_state_loader()
         gateway_info = self._health_payload()
         previous = cached.get("gateway")
@@ -1021,6 +1155,8 @@ class GatewayPool:
                         self._last_error = ""
                     self._cache_state(decorated)
                     self._schedule_backup_probes(gateway)
+                    self._harvest_race_losers(
+                        results, len(started) - completed)
                     return True, decorated
             else:
                 last_error = _safe_error(error)

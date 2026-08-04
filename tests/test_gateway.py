@@ -77,7 +77,9 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(gateway._safe_error("bad\x1b[2J\nnext"), "bad [2J next")
 
 
-class GatewayPoolTests(unittest.TestCase):
+class _PoolFixture:
+    """Cache paths redirected to a temp dir, plus a ready-made pool."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.patchers = [
@@ -100,6 +102,8 @@ class GatewayPoolTests(unittest.TestCase):
         return gateway.GatewayPool(
             client_settings(**overrides), local_state_loader=local_node)
 
+
+class GatewayPoolTests(_PoolFixture, unittest.TestCase):
     def test_response_parser_ignores_login_banner_but_requires_marker(self):
         payload = {"protocol": 1, "ok": True, "host": "login1"}
         raw = ("banner\n" + gateway.PROTOCOL_PREFIX
@@ -164,19 +168,25 @@ class GatewayPoolTests(unittest.TestCase):
 
     def test_successful_active_route_keeps_standby_master_warm(self):
         pool = self.pool()
-        standby_ping = threading.Event()
+        standby_probe = threading.Event()
+        seen = {}
 
         def rpc(name, payload, _timeout=None):
-            if payload["action"] == "ping":
-                self.assertEqual(name, "login2")
-                standby_ping.set()
-                return {"ok": True}
+            if name == "login2":
+                seen.update(payload)
+                standby_probe.set()
+                return {"ok": True, "state": remote_state(), "host": "login2"}
             return {"ok": True, "state": remote_state(), "host": "login1"}
 
         with mock.patch.object(pool, "_rpc_gateway", side_effect=rpc):
             ok, _ = pool.fetch_state()
-            self.assertTrue(standby_ping.wait(0.5))
+            self.assertTrue(standby_probe.wait(0.5))
         self.assertTrue(ok)
+        # The standby probe must still start a stopped login-node daemon; the
+        # "state" action does that as well as carrying its tmux sessions.
+        self.assertEqual(seen.get("action"), "state")
+        self.assertIs(seen.get("ensure_daemon"), True)
+
 
     def test_all_gateways_down_returns_last_good_cache_and_local_sessions(self):
         pool = self.pool(state_timeout=0.1, hedge_delay=0.0)
@@ -424,6 +434,155 @@ class GatewayPoolTests(unittest.TestCase):
                          ["login1", "login2"])
         self.assertTrue(results[0]["ok"])
         self.assertFalse(results[1]["ok"])
+
+
+class LoginNodeRosterTests(_PoolFixture, unittest.TestCase):
+    """Every configured login node runs its own daemon and its own tmux
+    sessions.  Only one gateway wins the state race, so the others are
+    harvested by the standby probe and merged into the table."""
+
+    @staticmethod
+    def _login_rows(state):
+        return sorted(name for name in state["nodes"]
+                      if name.startswith("login--"))
+
+    def _pool_with_clock(self, **overrides):
+        """A pool on a fake clock, seeded *after* the clock is installed so the
+        recorded timestamp and the TTL comparison share one time source."""
+        now = [1000.0]
+        pool = self.pool(**overrides)
+        pool._clock = lambda: now[0]
+        self._seed(pool)
+
+        def advance(seconds):
+            now[0] += seconds
+
+        return pool, advance
+
+    @staticmethod
+    def _seed(pool):
+        pool._record_login_node("login2", {
+            "ok": True, "host": "login2",
+            "state": {"nodes": {"localhost": {
+                "alive": True, "socket": "/remote/ctl/local", "info": {},
+                "sessions": [["standby-work", "1"]]}}},
+        })
+
+    def _pool_with_roster(self, **overrides):
+        pool = self.pool(**overrides)
+        self._seed(pool)
+        return pool
+
+    def test_standby_login_node_sessions_are_listed(self):
+        pool = self._pool_with_roster()
+        state = pool._decorate_state(remote_state(), "login1", "login1")
+        self.assertEqual(self._login_rows(state), ["login--login1",
+                                                   "login--login2"])
+        self.assertEqual(
+            state["nodes"]["login--login2"]["sessions"], [["standby-work", "1"]])
+
+    def test_standby_login_node_routes_through_its_own_gateway(self):
+        pool = self._pool_with_roster()
+        pool._decorate_state(remote_state(), "login1", "login1")
+        route = pool._route_for("login--login2")
+        self.assertEqual(route.gateway, "login2")
+        self.assertEqual(route.target, "localhost")
+        self.assertTrue(route.fixed)
+
+    def test_active_gateway_is_not_duplicated_by_the_roster(self):
+        pool = self.pool()
+        pool._record_login_node("login1", {
+            "ok": True, "host": "login1",
+            "state": {"nodes": {"localhost": {
+                "alive": True, "sessions": [["stale", "1"]]}}},
+        })
+        state = pool._decorate_state(remote_state(), "login1", "login1")
+        self.assertEqual(self._login_rows(state), ["login--login1"])
+        # The live race result wins over the harvested copy.
+        self.assertEqual(
+            state["nodes"]["login--login1"]["sessions"], [["login-work", "1"]])
+
+    def test_two_aliases_for_one_login_host_collapse_to_one_row(self):
+        """A round-robin alias can resolve to a host another alias already
+        names; listing it twice would show the same sessions under two rows."""
+        pool = self.pool(gateways=("login1", "login2", "rr"))
+        pool._record_login_node("rr", {
+            "ok": True, "host": "login1",
+            "state": {"nodes": {"localhost": {
+                "alive": True, "sessions": [["login-work", "1"]]}}},
+        })
+        state = pool._decorate_state(remote_state(), "login1", "login1")
+        self.assertEqual(self._login_rows(state), ["login--login1"])
+
+    def test_unreachable_gateway_is_dropped_from_the_roster(self):
+        pool = self._pool_with_roster()
+        pool._record_login_node("login2", {"ok": False, "reason": "timed out"})
+        state = pool._decorate_state(remote_state(), "login1", "login1")
+        self.assertEqual(self._login_rows(state), ["login--login1"])
+
+    def test_fresh_roster_entries_are_kept(self):
+        pool, advance = self._pool_with_clock()
+        advance(gateway._LOGIN_NODE_TTL - 1.0)
+        state = pool._decorate_state(remote_state(), "login1", "login1")
+        self.assertEqual(self._login_rows(state),
+                         ["login--login1", "login--login2"])
+
+    def test_stale_roster_entries_age_out(self):
+        pool, advance = self._pool_with_clock()
+        advance(gateway._LOGIN_NODE_TTL + 1.0)
+        state = pool._decorate_state(remote_state(), "login1", "login1")
+        self.assertEqual(self._login_rows(state), ["login--login1"])
+
+    def test_roster_survives_an_active_gateway_outage(self):
+        """With every gateway failing the dashboard falls back to cache; the
+        login nodes we can still hear from should stay listed."""
+        pool = self._pool_with_roster(state_timeout=0.1, hedge_delay=0.0)
+        pool._last_state = pool._decorate_state(
+            remote_state(), "login1", "login1")
+        state = pool._cached_or_empty_state("all gateways down")
+        self.assertIn("login--login2", state["nodes"])
+        self.assertEqual(
+            pool._route_for("login--login2").gateway, "login2")
+
+    def test_race_losers_are_harvested_without_extra_rpcs(self):
+        """The hedge already paid for the losing gateways' replies, so their
+        login sessions should be kept rather than thrown away and re-fetched a
+        whole probe_interval later."""
+        pool = self.pool(hedge_delay=0.0)
+        actions = []
+
+        def rpc(name, payload, _timeout=None):
+            actions.append(payload["action"])
+            if name == "login1":
+                time.sleep(0.05)      # force login2 to win the race
+            return {"ok": True, "state": remote_state(), "host": name}
+
+        with mock.patch.object(pool, "_rpc_gateway", side_effect=rpc):
+            ok, _ = pool.fetch_state()
+            deadline = time.monotonic() + 2.0
+            while (len(pool._login_nodes) < 2
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+        self.assertTrue(ok)
+        self.assertEqual(sorted(pool._login_nodes), ["login1", "login2"])
+        self.assertEqual(actions.count("state"), 2)
+
+    def test_outgoing_winner_stays_listed_after_leadership_moves(self):
+        pool = self.pool()
+        pool._decorate_state(remote_state(), "login1", "login1")
+        state = pool._decorate_state(remote_state(), "login2", "login2")
+        self.assertEqual(self._login_rows(state),
+                         ["login--login1", "login--login2"])
+        self.assertEqual(pool._route_for("login--login1").gateway, "login1")
+
+    def test_malformed_probe_replies_are_ignored(self):
+        pool = self.pool()
+        for reply in (None, {}, {"ok": True}, {"ok": True, "state": {}},
+                      {"ok": True, "state": {"nodes": {}}},
+                      {"ok": True, "state": {"nodes": {"localhost": "x"}}}):
+            pool._record_login_node("login2", reply)
+        state = pool._decorate_state(remote_state(), "login1", "login1")
+        self.assertEqual(self._login_rows(state), ["login--login1"])
 
 
 class AgentTests(unittest.TestCase):
