@@ -68,6 +68,8 @@ _DAEMON_LAUNCH_SLOTS = threading.Semaphore(1)
 _FRONTEND_COMMAND_CLEANUP_GRACE = 2.0
 _OFFLINE_SESSION = '\x00autotmux:offline'
 _START_SHELL_SESSION = '\x00autotmux:start-shell'
+# Display prefix the gateway pool gives a login node (see gateway._login_key).
+_LOGIN_NODE_PREFIX = 'login--'
 _UI_FILE_READ_TIMEOUT = 2.5
 _STATE_FILE_LIMIT = 8 * 1024 * 1024
 _SNAPSHOT_FILE_LIMIT = 64 * 1024 * 1024
@@ -300,12 +302,74 @@ def _valid_node(node: str) -> bool:
     return isinstance(node, str) and bool(_NODE_RE.fullmatch(node))
 
 
+def _node_label(node: str) -> str:
+    """Compact display name for a node.
+
+    A fully-qualified login host runs to ~37 characters, and the table sizes
+    NODE to its widest value -- so one such row pushed SESSION, the column
+    users actually navigate by, clean off a narrow terminal. Routing always
+    uses the real name from the row tuple; this is display only.
+    """
+    name = str(node)
+    if name.startswith(_LOGIN_NODE_PREFIX):
+        host = name[len(_LOGIN_NODE_PREFIX):]
+        return 'login:' + (host.split('.', 1)[0] or host)
+    return name.split('.', 1)[0] or name
+
+
+def _time_left_label(value) -> str:
+    """Slurm's ``D-HH:MM:SS`` in a form that costs 5 columns instead of 10.
+
+    The exact second of a walltime that ends tomorrow is noise; the magnitude
+    is what the user acts on, and the space it frees is what lets LOAD and
+    STATUS fit beside it at all.
+    """
+    text = str(value or '').strip()
+    if not text or text in {'-', '?'}:
+        return text or ''
+    seconds = keepalive.parse_time_left(text)
+    if seconds is None:
+        return text
+    if seconds == math.inf:
+        return '∞'
+    seconds = int(seconds)
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f'{days}d{hours}h' if hours else f'{days}d'
+    if hours:
+        return f'{hours}h{minutes:02d}' if minutes else f'{hours}h'
+    return f'{minutes}m'
+
+
+def _load_label(load, cpus) -> str:
+    """One cell for "how busy" and "how big": ``4.4/12``.
+
+    Two separate columns spent a separator and a header on a number that is
+    only meaningful next to the other one.
+    """
+    load = str(load or '').strip()
+    cpus = str(cpus or '').strip()
+    try:
+        # One decimal: the second is false precision on a 1-minute average,
+        # and it is a column the table cannot spare.
+        load = f'{float(load):.1f}'
+    except ValueError:
+        pass
+    if load and cpus:
+        return f'{load}/{cpus}'
+    return load or cpus or ''
+
+
 def _session_label(session: str) -> str:
     """Visible label for an internal row target token."""
     if session == _OFFLINE_SESSION:
         return '<offline>'
     if session == _START_SHELL_SESSION:
-        return '<Start Shell>'
+        # Short on purpose: the placeholder appears on every node without a
+        # session, so its width sets the SESSION column for the whole table.
+        return '<shell>'
     return str(session)
 
 
@@ -2604,6 +2668,9 @@ class ConnectionManager(ModalScreen[dict | None]):
 
 
 class AutotmuxApp(App):
+    # Without this the header reads "AutotmuxApp", i.e. the class name.
+    TITLE = 'atmux'
+
     def get_driver_class(self):
         base = super().get_driver_class()
         try:
@@ -2619,12 +2686,14 @@ class AutotmuxApp(App):
         height: 1fr;
     }
     #left_pane {
-        width: 45%;
+        /* Seven columns need ~66 cells. At 45% they did not get them, so the
+           table silently clipped LOAD and STATUS off the right edge. */
+        width: 56%;
         height: 100%;
         border-right: solid $primary;
     }
     #right_pane_scroll {
-        width: 55%;
+        width: 44%;
         background: $surface;
         padding: 0 1;
     }
@@ -2699,8 +2768,10 @@ class AutotmuxApp(App):
         self.table.cursor_type = "row"
         # IDLE leads: STATUS is the first thing a narrow terminal truncates, so
         # a hint parked there is invisible exactly when the table is crowded.
+        # Seven columns, not eight: CPU folds into LOAD as "load/cpus", which
+        # is the only form either number is read in anyway.
         self.table.add_columns(
-            "IDLE", "NODE", "SESSION", "WIN", "TIME", "CPU", "LOAD", "STATUS")
+            "IDLE", "NODE", "SESSION", "WIN", "LEFT", "LOAD", "STATUS")
 
         self.log_view = self.query_one("#right_pane", Static)
         self.jobs_view = self.query_one("#jobs_panel", Static)
@@ -2917,14 +2988,14 @@ class AutotmuxApp(App):
 
     def _update_row_cells(self, i: int, r) -> bool:
         """Update only the volatile cells of row i in place. Display columns
-        are IDLE0 NODE1 SESSION2 WIN3 TIME4 CPU5 LOAD6 STATUS7, mapped from the
+        are IDLE0 NODE1 SESSION2 WIN3 LEFT4 LOAD5 STATUS6, mapped from the
         row tuple (node, session, wins, time, status, cpu, load). Returns False
         if any cell write raised (so the caller can avoid caching a sig that
         doesn't match what's actually on screen)."""
         marker, status = _split_idle_marker(r[4])
         ok = True
-        for col, val in ((0, marker), (3, r[2]), (4, r[3]),
-                         (5, r[5]), (6, r[6]), (7, status)):
+        for col, val in ((0, marker), (3, r[2]), (4, _time_left_label(r[3])),
+                         (5, _load_label(r[6], r[5])), (6, status)):
             coord = Coordinate(i, col)
             cell = _idle_cell(val) if col == 0 else _literal_cell(val)
             try:
@@ -3066,8 +3137,8 @@ class AutotmuxApp(App):
             self.table.add_row(
                 _idle_cell(marker),
                 *(_literal_cell(value) for value in (
-                    r[0], _session_label(r[1]), r[2], r[3], r[5], r[6],
-                    status)),
+                    _node_label(r[0]), _session_label(r[1]), r[2],
+                    _time_left_label(r[3]), _load_label(r[6], r[5]), status)),
             )
 
         if rows:

@@ -187,7 +187,7 @@ class BuildSessionRowsTests(unittest.TestCase):
         rows = autotmux.build_session_rows(state)
         self.assertEqual(rows[0][1], autotmux._START_SHELL_SESSION)
         self.assertEqual(
-            autotmux._session_label(rows[0][1]), '<Start Shell>')
+            autotmux._session_label(rows[0][1]), '<shell>')
 
     def test_real_session_named_like_placeholder_remains_real(self):
         state = {'nodes': {'h1': {
@@ -745,6 +745,59 @@ class IdleMarkerTests(unittest.TestCase):
             ('● 2h', 'DEGRADED: connect timeout'))
         self.assertEqual(autotmux._split_idle_marker('Active'), ('', 'Active'))
         self.assertEqual(autotmux._split_idle_marker(''), ('', ''))
+
+
+class CompactCellTests(unittest.TestCase):
+    """The table has to fit seven columns beside a preview pane, so each cell
+    is written for width. None of these affect routing -- the row tuple keeps
+    the real values."""
+
+    def test_login_nodes_lose_the_cluster_domain(self):
+        self.assertEqual(
+            autotmux._node_label('login--holylogin06.rc.fas.harvard.edu'),
+            'login:holylogin06')
+
+    def test_compute_nodes_are_left_alone(self):
+        self.assertEqual(autotmux._node_label('holygpu8a11104'),
+                         'holygpu8a11104')
+        self.assertEqual(autotmux._node_label('localhost'), 'localhost')
+
+    def test_node_label_never_returns_empty_for_a_named_node(self):
+        for node in ('login--login1', 'node.with.dots', 'x'):
+            with self.subTest(node=node):
+                self.assertTrue(autotmux._node_label(node))
+
+    def test_time_left_is_reduced_to_a_magnitude(self):
+        cases = {
+            '1-01:47:12': '1d1h', '1-00:00:00': '1d', '2:05:30': '2h05',
+            '59:30': '59m', '0:45': '0m', 'UNLIMITED': '∞',
+        }
+        for raw, want in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(autotmux._time_left_label(raw), want)
+
+    def test_unparseable_time_is_shown_as_given(self):
+        """Better an odd-looking cell than a confidently wrong duration."""
+        for raw in ('-', 'N/A', 'garbage', ''):
+            with self.subTest(raw=raw):
+                self.assertEqual(autotmux._time_left_label(raw), raw)
+
+    def test_load_and_cpus_share_one_cell(self):
+        self.assertEqual(autotmux._load_label('4.44', '12'), '4.4/12')
+        self.assertEqual(autotmux._load_label('65.88', '1'), '65.9/1')
+
+    def test_load_cell_degrades_when_a_half_is_missing(self):
+        self.assertEqual(autotmux._load_label('', '12'), '12')
+        self.assertEqual(autotmux._load_label('4.4', ''), '4.4')
+        self.assertEqual(autotmux._load_label('', ''), '')
+        self.assertEqual(autotmux._load_label('n/a', '12'), 'n/a/12')
+
+    def test_start_shell_placeholder_is_short(self):
+        """It appears on every session-less node, so its width sets the
+        SESSION column for the whole table."""
+        label = autotmux._session_label(autotmux._START_SHELL_SESSION)
+        self.assertEqual(label, '<shell>')
+        self.assertLessEqual(len(label), 8)
 
 
 class IdleThresholdConfigTests(unittest.TestCase):

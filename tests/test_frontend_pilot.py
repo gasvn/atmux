@@ -449,8 +449,8 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 new_state['nodes']['gpu1']['info']['load'] = '7.77'
                 app._refresh_table(new_state)
                 await pilot.pause()
-                # LOAD is display column index 6 (IDLE leads); row 0 is gpu1.
-                self.assertEqual(str(app.table.get_cell_at(Coordinate(0, 6))), '7.77')
+                # LOAD is display column 5 and now carries load/cpus.
+                self.assertEqual(str(app.table.get_cell_at(Coordinate(0, 5))), '7.8')
                 self.assertEqual(app._last_structural_sig, sig_before,
                                  "load-only change must not trigger a structural rebuild")
 
@@ -1079,7 +1079,7 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers[0], 'IDLE')
         self.assertEqual(
             headers,
-            ['IDLE', 'NODE', 'SESSION', 'WIN', 'TIME', 'CPU', 'LOAD', 'STATUS'])
+            ['IDLE', 'NODE', 'SESSION', 'WIN', 'LEFT', 'LOAD', 'STATUS'])
 
     async def test_marker_moves_out_of_status_into_the_lead_cell(self):
         _, rows = await self._render(self.IDLE_STATE)
@@ -1114,9 +1114,9 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
             row = names.index('quiet')
             self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 0))),
                              '● 2h')
+            self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 5))),
+                             '10.0')
             self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 6))),
-                             '9.99')
-            self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 7))),
                              'Active')
 
 
