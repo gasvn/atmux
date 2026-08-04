@@ -690,6 +690,82 @@ class ExternalControlPathTests(_PoolFixture, unittest.TestCase):
         self.assertIn("ControlMaster=auto", pool._ssh_argv("login1"))
 
 
+class SharedMasterKeepaliveTests(_PoolFixture, unittest.TestCase):
+    """Keepalive options on a multiplexed session are ignored -- the master
+    owns the TCP stream.  Riding someone else's master therefore silently
+    replaces our hang budget with theirs, which is how an unstable network
+    turns into a dashboard that never comes back."""
+
+    @staticmethod
+    def _ssh_g(interval, count):
+        lines = []
+        if interval is not None:
+            lines.append(f"serveraliveinterval {interval}")
+        if count is not None:
+            lines.append(f"serveralivecountmax {count}")
+        lines.append("controlmaster auto")
+        return SimpleNamespace(
+            returncode=0, stdout="\n".join(lines).encode())
+
+    def _pool(self, external=True):
+        return self.pool(control_path="/tmp/cm-%n") if external else self.pool()
+
+    def test_budget_is_interval_times_count(self):
+        pool = self._pool()
+        with mock.patch.object(gateway.subprocess, "run",
+                               return_value=self._ssh_g(60, 30)):
+            self.assertEqual(pool.master_keepalive_seconds("login1"), 1800.0)
+
+    def test_a_slow_shared_master_is_reported(self):
+        pool = self._pool()
+        with mock.patch.object(gateway.subprocess, "run",
+                               return_value=self._ssh_g(60, 30)):
+            warning = pool.keepalive_warning("login1")
+        self.assertIn("1800", warning)
+        self.assertIn("45", warning)   # our own 15 x 3 budget
+
+    def test_a_comparable_shared_master_is_not_reported(self):
+        pool = self._pool()
+        with mock.patch.object(gateway.subprocess, "run",
+                               return_value=self._ssh_g(15, 4)):
+            self.assertEqual(pool.keepalive_warning("login1"), "")
+
+    def test_nothing_is_reported_when_we_own_the_master(self):
+        """Our own masters carry our own settings, so there is nothing to say
+        even if the user's ssh_config is lax."""
+        pool = self._pool(external=False)
+        with mock.patch.object(gateway.subprocess, "run",
+                               return_value=self._ssh_g(60, 30)) as run:
+            self.assertEqual(pool.keepalive_warning("login1"), "")
+        run.assert_not_called()
+
+    def test_unreadable_or_malformed_output_is_not_guessed_at(self):
+        pool = self._pool()
+        cases = [
+            SimpleNamespace(returncode=1, stdout=b""),
+            self._ssh_g(None, None),
+            self._ssh_g("abc", 3),
+            self._ssh_g(0, 3),
+            self._ssh_g(60, None),
+        ]
+        for case in cases:
+            with self.subTest(case=case.stdout):
+                with mock.patch.object(gateway.subprocess, "run",
+                                       return_value=case):
+                    self.assertIsNone(pool.master_keepalive_seconds("login1"))
+                    self.assertEqual(pool.keepalive_warning("login1"), "")
+
+    def test_a_stuck_ssh_g_cannot_wedge_the_caller(self):
+        pool = self._pool()
+        with mock.patch.object(
+                gateway.subprocess, "run",
+                side_effect=gateway.subprocess.TimeoutExpired("ssh", 5)):
+            self.assertIsNone(pool.master_keepalive_seconds("login1"))
+        with mock.patch.object(gateway.subprocess, "run",
+                               side_effect=OSError("no ssh")):
+            self.assertIsNone(pool.master_keepalive_seconds("login1"))
+
+
 class ClientControlPathConfigTests(unittest.TestCase):
     def test_valid_values_are_expanded(self):
         self.assertEqual(

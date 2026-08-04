@@ -4461,6 +4461,15 @@ def main():
                 print(f'✓ {name}: {detail}')
             else:
                 print(f"✗ {name}: {result.get('error') or 'unavailable'}")
+            # A reachable gateway can still hang for a long time if the master
+            # we share is slow to notice a dead peer, so say so here rather
+            # than leaving the user to guess during the next outage.
+            try:
+                warning = _GATEWAY_POOL.keepalive_warning(name)
+            except Exception:
+                warning = ''
+            if warning:
+                print(f'  ⚠ {warning}')
         sys.exit(0 if all(result.get('ok') for result in results) else 1)
     if args.attach:
         sys.exit(_direct_attach(args.attach))

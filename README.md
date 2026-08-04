@@ -157,6 +157,24 @@ reach.
 With this set, `atmux --gateway-login` reports which masters are missing rather
 than trying to open them; renew them with whichever tool owns them.
 
+**Check the shared master's keepalive.** Keepalive options on a multiplexed
+session are ignored — the master owns the TCP stream, so its `ServerAlive`
+budget, not AutoTmux's, decides how long a stalled network blocks every channel
+riding it. A master configured with `ServerAliveInterval 60` and
+`ServerAliveCountMax 30` takes half an hour to notice a dead peer, and until it
+does, previews, state refreshes, and attaches all hang. Give the master a bound
+you can live with:
+
+```
+Host login1 login2 login3
+  ServerAliveInterval 15
+  ServerAliveCountMax 4      # give up after ~60s, not 30 minutes
+```
+
+`atmux --gateway-check` reports the effective budget when it is far longer than
+AutoTmux's own. Existing masters keep the settings they started with, so
+restart them after changing this.
+
 If login requires MFA, a password, or keyboard-interactive authentication,
 bootstrap the login ControlMasters explicitly:
 

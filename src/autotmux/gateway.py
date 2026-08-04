@@ -345,6 +345,57 @@ class GatewayPool:
                 "-o", f"ControlPersist={persist}",
                 "-o", f"ControlPath={control_path}"]
 
+    def master_keepalive_seconds(self, gateway: str) -> float | None:
+        """How long the master we ride takes to notice a dead peer.
+
+        Keepalive options on a multiplexed session are ignored: the master owns
+        the TCP stream, so *its* ServerAlive budget is what actually bounds a
+        hang.  When that master belongs to another tool, our own settings are
+        silently ineffective and a stalled network can block every channel for
+        as long as the owner allows.  ``ssh -G`` resolves the effective values
+        without opening a connection.
+        """
+        try:
+            result = subprocess.run(
+                ["ssh", "-G", gateway], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        interval = count = None
+        for line in result.stdout.decode("utf-8", "replace").splitlines():
+            key, _, value = line.strip().partition(" ")
+            key = key.lower()
+            if key not in ("serveraliveinterval", "serveralivecountmax"):
+                continue
+            try:
+                parsed = int(value.strip())
+            except ValueError:
+                return None
+            if key == "serveraliveinterval":
+                interval = parsed
+            else:
+                count = parsed
+        if not interval or count is None or interval < 0 or count < 0:
+            return None
+        return float(interval * count)
+
+    def keepalive_warning(self, gateway: str) -> str:
+        """Explain an external master that would outlast our own hang budget."""
+        if not self.external_control_path():
+            return ""
+        actual = self.master_keepalive_seconds(gateway)
+        if actual is None:
+            return ""
+        budget = (float(self.settings["server_alive_int"])
+                  * float(self.settings["server_alive_max"]))
+        if actual <= max(budget * 2, budget + 60):
+            return ""
+        return (f"shared master detects a dead network after {actual:.0f}s "
+                f"(AutoTmux alone would use {budget:.0f}s); a stalled link can "
+                f"block this gateway for that long")
+
     def _control_path(self, gateway: str) -> str:
         external = self.external_control_path()
         if external:
