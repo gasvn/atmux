@@ -200,6 +200,121 @@ atmux --login-mode                       # force original native mode
 atmux --gateway-mode                     # force configured local mode
 ```
 
+### Agent-assisted local deployment runbook
+
+This runbook is intended for a terminal/coding agent configuring AutoTmux on
+behalf of a user. The goal is a local multi-login-node client without asking the
+user to hand-edit AutoTmux or SSH configuration files.
+
+#### 1. Establish the deployment boundary
+
+- Perform the **local client** installation on the user's laptop/workstation,
+  not inside a cluster login-node SSH session. Check the hostname and the
+  `SSH_CONNECTION`, `SSH_CLIENT`, and `SSH_TTY` environment variables before
+  claiming local deployment is complete.
+- Existing login-node mode must remain usable. Do not replace or remove the
+  login-side installation.
+- Do not edit `~/.ssh/config`, terminate tmux servers/sessions, cancel Slurm
+  jobs, or kill an active `atmux` frontend without explicit user permission.
+- Preserve dirty Git worktrees. Inspect `git status` before pulling or
+  installing from an existing checkout.
+
+#### 2. Install the local client without changing shell configuration
+
+Python 3.10 or newer and an OpenSSH client are required. A checkout-local
+virtual environment keeps the installation isolated and lets the user invoke
+AutoTmux by absolute path without modifying `PATH`:
+
+```bash
+git clone https://github.com/gasvn/atmux.git ~/autotmux
+python3 -m venv ~/autotmux/.venv
+~/autotmux/.venv/bin/python -m pip install --upgrade pip
+~/autotmux/.venv/bin/python -m pip install -e ~/autotmux
+~/autotmux/.venv/bin/atmux --version
+```
+
+For an existing clean checkout, update with Git rather than cloning over it:
+
+```bash
+git -C ~/autotmux status --short
+git -C ~/autotmux pull --ff-only origin main
+~/autotmux/.venv/bin/python -m pip install -e ~/autotmux
+```
+
+#### 3. Verify every existing SSH alias and remote agent
+
+Use the aliases already defined on the **local machine**. For each selected
+login node, verify passwordless/background access and the remote agent:
+
+```bash
+ssh -o BatchMode=yes login1 true
+ssh -o BatchMode=yes login1 'atmux-agent --version'
+```
+
+Repeat for `login2`, `login3`, and so on. The local `atmux` version and every
+remote `atmux-agent` version should match. On clusters with a shared home and
+software environment, install the login-side package only once. Otherwise,
+install the same version on each login node.
+
+If `atmux-agent` works interactively but is not in the non-interactive SSH
+`PATH`, determine its absolute login-side path. Do not modify shell startup
+files just for AutoTmux; enter that absolute path in the TUI's **Remote agent
+command (advanced)** field instead.
+
+#### 4. Configure gateways through the TUI
+
+Launch the connection manager explicitly:
+
+```bash
+~/autotmux/.venv/bin/atmux --connections
+```
+
+Then:
+
+1. Select every desired login alias with Space.
+2. Enter undiscovered aliases in **Additional SSH aliases**.
+3. Keep `atmux-agent` as the remote command, or enter the absolute path found
+   in the previous step.
+4. Choose **Test** and require a `✓` plus latency for every intended gateway.
+5. Choose **Save** or press `Ctrl+S`.
+
+The TUI owns and writes `~/.config/autotmux/connections.json`; neither the user
+nor the assisting agent needs to edit it manually. Press `g` in the dashboard
+to change the pool later.
+
+#### 5. Validate and hand off
+
+```bash
+~/autotmux/.venv/bin/atmux --gateway-check
+~/autotmux/.venv/bin/atmux
+```
+
+Acceptance criteria:
+
+- `--gateway-check` reports every intended alias healthy with a latency;
+- the dashboard shows `login--HOST` and the expected compute-node sessions;
+- ordinary login-node `atmux` still starts in native login mode;
+- no SSH password prompt appears during background refreshes;
+- after an upgrade, any already-running frontend is exited normally and
+  relaunched before testing new interactive behavior.
+
+Passwordless key users normally skip `--gateway-login`. For MFA or
+keyboard-interactive accounts, save the pool first and then run:
+
+```bash
+~/autotmux/.venv/bin/atmux --gateway-login
+```
+
+For a non-persistent smoke test, the agent may use explicit gateways without
+writing connection state:
+
+```bash
+~/autotmux/.venv/bin/atmux \
+  --gateway login1 \
+  --gateway login2 \
+  --gateway login3
+```
+
 Local mode displays the laptop as `localhost` and the selected login host as
 `login--HOST`; compute-node names are unchanged. Interactive traffic follows:
 
