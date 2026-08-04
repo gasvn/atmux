@@ -98,21 +98,76 @@ def _proc_stat(pid: int) -> tuple[str, str] | None:
         return None
 
 
+# struct proc_bsdinfo from <sys/proc_info.h>: the fields we need are the
+# process status, the parent pid, and the start time, which is what makes a
+# PID-reuse token trustworthy.  Offsets are fixed ABI on Darwin.
+_DARWIN_BSDINFO_SIZE = 136
+_DARWIN_PROC_PIDTBSDINFO = 3
+_DARWIN_SZOMB = 5
+
+
+def _darwin_proc_stat(pid: int) -> tuple[str, str] | None:
+    """``(state, start_time)`` on Darwin, mirroring ``_proc_stat``.
+
+    Darwin has no ``/proc``, which used to leave every caller here without a
+    PID-reuse token -- and a missing token is not a harmless degradation: it
+    makes the pre-warm helper refuse to start at all.
+    """
+    if sys.platform != 'darwin':
+        return None
+    try:
+        import ctypes
+
+        libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+        buf = ctypes.create_string_buffer(_DARWIN_BSDINFO_SIZE)
+        written = libproc.proc_pidinfo(
+            ctypes.c_int(int(pid)), ctypes.c_int(_DARWIN_PROC_PIDTBSDINFO),
+            ctypes.c_uint64(0), buf, ctypes.c_int(_DARWIN_BSDINFO_SIZE))
+        if written != _DARWIN_BSDINFO_SIZE:
+            return None
+        raw = buf.raw
+        status = int.from_bytes(raw[4:8], sys.byteorder)
+        start_sec = int.from_bytes(raw[120:128], sys.byteorder)
+        start_usec = int.from_bytes(raw[128:136], sys.byteorder)
+    except Exception:
+        return None
+    state = 'Z' if status == _DARWIN_SZOMB else 'R'
+    return state, f'{start_sec}.{start_usec:06d}'
+
+
+def _darwin_parent_pid(pid: int) -> int | None:
+    if sys.platform != 'darwin':
+        return None
+    try:
+        import ctypes
+
+        libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+        buf = ctypes.create_string_buffer(_DARWIN_BSDINFO_SIZE)
+        written = libproc.proc_pidinfo(
+            ctypes.c_int(int(pid)), ctypes.c_int(_DARWIN_PROC_PIDTBSDINFO),
+            ctypes.c_uint64(0), buf, ctypes.c_int(_DARWIN_BSDINFO_SIZE))
+        if written != _DARWIN_BSDINFO_SIZE:
+            return None
+        return int.from_bytes(buf.raw[16:20], sys.byteorder)
+    except Exception:
+        return None
+
+
 def process_token(pid: int) -> str | None:
-    """Return a PID-reuse token, or ``None`` where ``/proc`` is unavailable."""
-    stat = _proc_stat(pid)
+    """Return a PID-reuse token, or ``None`` where the OS will not report one."""
+    stat = _proc_stat(pid) or _darwin_proc_stat(pid)
     return stat[1] if stat else None
 
 
 def process_parent_pid(pid: int) -> int | None:
-    """Return a Linux process's current parent PID."""
+    """Return a process's current parent PID."""
     try:
         with open(f'/proc/{int(pid)}/stat', encoding='ascii') as f:
             raw = f.read()
         tail = raw[raw.rindex(')') + 2:].split()
         return int(tail[1])
     except (OSError, ValueError, IndexError):
-        return None
+        return _darwin_parent_pid(pid)
 
 
 def pid_running(pid: int) -> bool:
@@ -124,8 +179,61 @@ def pid_running(pid: int) -> bool:
         os.kill(pid, 0)
     except (OSError, TypeError, ValueError):
         return False
-    stat = _proc_stat(pid)
+    stat = _proc_stat(pid) or _darwin_proc_stat(pid)
     return stat is None or stat[0] != 'Z'
+
+
+def _sysctl_cmdline(pid: int) -> list[bytes] | None:
+    """Read a process's argv on Darwin, where ``/proc`` does not exist.
+
+    Without this the identity check below has no argv to inspect and degrades
+    to "any live PID is the daemon", which lets a stale PID file aim ``atd
+    stop`` at an unrelated process.  ``KERN_PROCARGS2`` is the same source
+    ``ps`` reads, so it yields the true argv rather than a re-quoted string.
+
+    Layout: a 4-byte argc, the NUL-terminated executable path, alignment NULs,
+    then argc NUL-terminated arguments (the environment follows those).
+    """
+    if sys.platform != 'darwin':
+        return None
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        ctl_kern, kern_argmax, kern_procargs2 = 1, 8, 49
+
+        size = ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+        argmax = ctypes.c_int(0)
+        mib = (ctypes.c_int * 2)(ctl_kern, kern_argmax)
+        if libc.sysctl(mib, 2, ctypes.byref(argmax), ctypes.byref(size),
+                       None, 0) != 0 or argmax.value <= 0:
+            return None
+
+        buf = ctypes.create_string_buffer(argmax.value)
+        size = ctypes.c_size_t(argmax.value)
+        mib = (ctypes.c_int * 3)(ctl_kern, kern_procargs2, int(pid))
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            # ESRCH for a dead process; EINVAL for one we may not inspect.
+            return None
+        raw = buf.raw[:size.value]
+    except Exception:
+        return None
+
+    if len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    if argc < 0:
+        return None
+    rest = raw[4:]
+    # Skip the exec path and the alignment NULs that pad it.
+    end = rest.find(b'\x00')
+    if end < 0:
+        return None
+    rest = rest[end:].lstrip(b'\x00')
+    args = rest.split(b'\x00')[:argc]
+    if len(args) < argc:
+        return None
+    return [part for part in args if part]
 
 
 def _cmdline(pid: int) -> list[bytes] | None:
@@ -138,7 +246,7 @@ def _cmdline(pid: int) -> list[bytes] | None:
             with open(f'/proc/{int(pid)}/cmdline', 'rb') as f:
                 raw = f.read()
         except OSError:
-            return None
+            return _sysctl_cmdline(pid)
         if raw or attempt == 4:
             return [part for part in raw.split(b'\x00') if part]
         time.sleep(0.005)

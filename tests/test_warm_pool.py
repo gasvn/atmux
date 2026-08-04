@@ -4,6 +4,7 @@ We can't test against a real ssh master in unit tests, so we exercise the
 pool with a fake `ssh` script (a shell loop that echoes back what the user
 sends, simulating the bash-prompt-then-exec flow).
 """
+import fcntl
 import os
 import select
 import shutil
@@ -36,6 +37,19 @@ SSH_STUB = textwrap.dedent('''\
         eval "$line"
     done
 ''')
+
+
+# Darwin leaks kernel-internal status bits through F_GETFL -- FWASWRITTEN
+# (0x10000) appears as soon as an fd is written to. They are not user-settable,
+# so a raw equality check would report a restore failure for a flag the proxy
+# neither set nor can clear. Compare only what a caller can actually own.
+_SETTABLE_FL = (os.O_ACCMODE | os.O_NONBLOCK | os.O_APPEND
+                | getattr(os, 'O_ASYNC', 0) | getattr(os, 'O_SYNC', 0)
+                | getattr(os, 'O_DSYNC', 0))
+
+
+def _settable_flags(fd: int) -> int:
+    return fcntl.fcntl(fd, fcntl.F_GETFL) & _SETTABLE_FL
 
 
 def _install_ssh_stub(tmpdir: str) -> str:
@@ -524,10 +538,8 @@ class TerminalSizeSyncTests(unittest.TestCase):
         latencies = []
         restored_flags = []
         local_master_open = [True]
-        expected_local_flags = autotmux.fcntl.fcntl(
-            local_slave, autotmux.fcntl.F_GETFL)
-        expected_remote_flags = autotmux.fcntl.fcntl(
-            remote_master, autotmux.fcntl.F_GETFL)
+        expected_local_flags = _settable_flags(local_slave)
+        expected_remote_flags = _settable_flags(remote_master)
         script = (
             "import os, threading, time, tty\n"
             "report = int(os.environ['REPORT_FD'])\n"
@@ -598,10 +610,9 @@ class TerminalSizeSyncTests(unittest.TestCase):
             driver.join(timeout=5)
             self.assertFalse(driver.is_alive())
             restored_flags.extend((
-                autotmux.fcntl.fcntl(0, autotmux.fcntl.F_GETFL),
-                autotmux.fcntl.fcntl(1, autotmux.fcntl.F_GETFL),
-                autotmux.fcntl.fcntl(
-                    remote_master, autotmux.fcntl.F_GETFL),
+                _settable_flags(0),
+                _settable_flags(1),
+                _settable_flags(remote_master),
             ))
         finally:
             os.dup2(saved_stdin, 0)

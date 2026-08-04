@@ -21,11 +21,26 @@ class PickBaseTests(unittest.TestCase):
             os.environ['XDG_RUNTIME_DIR'] = self._saved
 
     def test_uses_xdg_when_set_and_writable(self):
-        with tempfile.TemporaryDirectory() as td:
+        # Keep the directory short: the default temp location is a handful of
+        # characters on Linux but ~55 under /var/folders on macOS, which is
+        # long enough that _pick_base() correctly rejects it for socket length
+        # and falls back to /tmp -- testing the wrong branch.
+        with tempfile.TemporaryDirectory(dir='/tmp') as td:
             os.environ['XDG_RUNTIME_DIR'] = td
             base = paths._pick_base()
             self.assertEqual(base, os.path.join(td, 'autotmux'))
             self.assertTrue(os.path.isdir(base))
+
+    def test_falls_back_when_xdg_is_too_deep_for_a_socket(self):
+        """A usable but deeply nested XDG dir must not strand every SSH master
+        behind a ControlPath that cannot fit in a sockaddr_un."""
+        with tempfile.TemporaryDirectory(dir='/tmp') as td:
+            deep = os.path.join(td, 'd' * 60)
+            os.makedirs(deep, 0o700)
+            os.environ['XDG_RUNTIME_DIR'] = deep
+            self.assertTrue(paths._usable_xdg_runtime_dir(deep))
+            self.assertEqual(
+                paths._pick_base(), f'/tmp/autotmux_{os.getuid()}')
 
     def test_falls_back_to_tmp_when_xdg_unset(self):
         os.environ.pop('XDG_RUNTIME_DIR', None)

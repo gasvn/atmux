@@ -14,6 +14,58 @@ from unittest import mock
 from autotmux import lifecycle
 
 
+class ProcessPrimitiveTests(unittest.TestCase):
+    """argv, start-time token, and parent pid must work on every platform.
+
+    These back the identity check that decides whether a PID from a stale file
+    may be signalled, and the pre-warm helper refuses to start without a token.
+    Where they return nothing, AutoTmux either signals blindly or loses the
+    fast attach path entirely -- so "no /proc" must not mean "no answer".
+    """
+
+    def _child(self, *extra):
+        proc = subprocess.Popen(
+            [sys.executable, '-c', 'import time; time.sleep(30)', *extra])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        for _ in range(100):          # let exec settle
+            if lifecycle.process_cmdline(proc.pid):
+                break
+            time.sleep(0.01)
+        return proc
+
+    def test_cmdline_reports_exact_argv(self):
+        proc = self._child('arg with spaces', '--flag')
+        argv = lifecycle.process_cmdline(proc.pid)
+        self.assertIsNotNone(argv)
+        # Space-joined output (what `ps` gives) could not express this.
+        self.assertIn('arg with spaces', argv)
+        self.assertIn('--flag', argv)
+        self.assertTrue(os.path.basename(argv[0]).startswith('python'))
+
+    def test_token_identifies_a_process_and_is_stable(self):
+        proc = self._child()
+        token = lifecycle.process_token(proc.pid)
+        self.assertTrue(token)
+        self.assertEqual(token, lifecycle.process_token(proc.pid))
+        self.assertNotEqual(token, lifecycle.process_token(os.getpid()))
+
+    def test_parent_pid_is_reported(self):
+        proc = self._child()
+        self.assertEqual(lifecycle.process_parent_pid(proc.pid), os.getpid())
+        self.assertEqual(
+            lifecycle.process_parent_pid(os.getpid()), os.getppid())
+
+    def test_dead_process_yields_nothing(self):
+        proc = subprocess.Popen([sys.executable, '-c', 'pass'])
+        proc.wait()
+        gone = 2 ** 22 - 1            # above any live pid on both platforms
+        self.assertIsNone(lifecycle.process_token(gone))
+        self.assertIsNone(lifecycle.process_parent_pid(gone))
+        self.assertIsNone(lifecycle.process_cmdline(gone))
+        self.assertFalse(lifecycle.pid_running(gone))
+
+
 class ProcessIdentityTests(unittest.TestCase):
     def test_argument_substring_does_not_impersonate_daemon(self):
         proc = subprocess.Popen([
@@ -146,7 +198,16 @@ class LockTests(unittest.TestCase):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 self.assertTrue(lifecycle.lock_is_held(path))
-                self.assertEqual(lifecycle.lock_owner_pid(path), os.getpid())
+                # Owner discovery reads /proc/locks, which only Linux has.
+                # Elsewhere the documented answer is "unknown" and callers
+                # fall back to the advisory PID file -- but it must never
+                # name some *other* process, which is what would make a
+                # controller signal the wrong pid.
+                owner = lifecycle.lock_owner_pid(path)
+                if os.path.exists('/proc/locks'):
+                    self.assertEqual(owner, os.getpid())
+                else:
+                    self.assertIn(owner, (os.getpid(), None))
             finally:
                 os.close(fd)
             self.assertFalse(lifecycle.lock_is_held(path))
