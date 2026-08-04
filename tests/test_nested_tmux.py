@@ -44,6 +44,15 @@ class NestedTmuxTransparentTests(unittest.TestCase):
             shutil.rmtree(self.tmpdir, ignore_errors=True)
             autotmux.GUARD_FILE = self._prev_guard
             self.skipTest(f'tmux server unavailable in this sandbox: {exc.stderr.strip()}')
+        # tmux 3.4 changed the built-in escape-time default from 500 ms to
+        # 10 ms, which is already at/below what AutoTmux leases. Pin the
+        # pre-lease value so restore assertions test the lease rather than
+        # whichever tmux the machine happens to ship.
+        self.original_escape_time = '500'
+        subprocess.run(
+            ['tmux', '-S', self.sock, 'set-option', '-s', 'escape-time',
+             self.original_escape_time],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Point the helpers at our isolated server via $TMUX (they parse the
         # socket from its first field).
         self._prev_tmux = os.environ.get('TMUX')
@@ -241,7 +250,8 @@ class NestedTmuxTransparentTests(unittest.TestCase):
             self.assertEqual(self._session_opt('key-table'), '')
             self.assertEqual(self._session_opt('prefix'), '')
             self.assertEqual(self._session_opt('prefix2'), '')
-            self.assertEqual(self._server_opt('escape-time'), '500')
+            self.assertEqual(self._server_opt('escape-time'),
+                             self.original_escape_time)
             self.assertEqual(
                 self._global_opt(self.context['latency_state_key']), '')
             self.assertTrue(autotmux._tmux_restore())
@@ -380,7 +390,8 @@ class NestedTmuxTransparentTests(unittest.TestCase):
             self.assertNotEqual(self._opt('prefix'), 'None')
             self.assertEqual(self._session_opt('prefix2'), '')
             self.assertEqual(self._opt('key-table'), 'root')
-            self.assertEqual(self._server_opt('escape-time'), '500')
+            self.assertEqual(self._server_opt('escape-time'),
+                             self.original_escape_time)
         finally:
             for proc in (first, second):
                 if proc is not None and proc.poll() is None:
@@ -434,7 +445,8 @@ class NestedTmuxTransparentTests(unittest.TestCase):
 
             self._release_owner(second)
             second = None
-            self.assertEqual(self._server_opt('escape-time'), '500')
+            self.assertEqual(self._server_opt('escape-time'),
+                             self.original_escape_time)
         finally:
             for proc in (first, second):
                 if proc is not None and proc.poll() is None:
@@ -493,6 +505,10 @@ class WillNestLogicTests(unittest.TestCase):
         self.assertEqual(context['session'], '$7')
 
     def test_step_aside_is_one_bounded_tmux_transaction(self):
+        # Stepping aside only happens inside tmux, so the outer identity has to
+        # come from the test rather than from whether the suite itself was
+        # launched from a tmux pane.
+        os.environ['TMUX'] = '/tmp/x,0,0'
         options = {name: None for name in autotmux._OUTER_TMUX_OPTIONS}
         with mock.patch.object(
                 autotmux, '_outer_tmux_snapshot', return_value=(options, None)), \
@@ -511,6 +527,7 @@ class WillNestLogicTests(unittest.TestCase):
         self.assertIn('status', argv)
 
     def test_restore_transaction_is_followed_by_best_effort_size_refresh(self):
+        os.environ['TMUX'] = '/tmp/x,0,0'
         context = autotmux._outer_tmux_context()
         original = {
             'prefix': 'C-a', 'prefix2': 'C-z',
@@ -543,6 +560,7 @@ class WillNestLogicTests(unittest.TestCase):
         self.assertIsNone(autotmux._outer_tmux_state)
 
     def test_missing_metadata_is_not_silently_accepted_while_transparent(self):
+        os.environ['TMUX'] = '/tmp/x,0,0'
         context = autotmux._outer_tmux_context()
         original = {name: None for name in autotmux._OUTER_TMUX_OPTIONS}
         autotmux._outer_tmux_state = {
