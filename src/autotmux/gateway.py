@@ -44,6 +44,14 @@ _INTERACTIVE_CONTROL_PERSIST = 300
 # Drop a standby login node from the table once its harvested sessions age out,
 # so an unreachable gateway stops advertising a stale session list.
 _LOGIN_NODE_TTL = 300.0
+# Hedge once a reply is this many times its own gateway's usual round trip,
+# capped so a pathologically slow link still fails over in bounded time.
+_HEDGE_FACTOR = 2.5
+_HEDGE_CEILING = 3.0
+# Abandon a sticky gateway only for a route that is both proportionally and
+# absolutely faster, so the pool cannot flap between near-equal links.
+_STICKY_YIELD_RATIO = 0.6
+_STICKY_YIELD_FLOOR_MS = 150.0
 
 
 def interactive_ssh_options() -> list[str]:
@@ -663,6 +671,25 @@ class GatewayPool:
                 proc.returncode)
         return self._parse_response(stdout)
 
+    def _hedge_delay_for(self, gateway: str) -> float:
+        """How long to wait for ``gateway`` before racing the others.
+
+        A fixed delay is wrong on both sides of the only interesting question:
+        set it below the normal round trip and every refresh fans out to every
+        gateway (four RPCs where one would do); set it high enough to avoid
+        that on a slow link and a genuinely dead gateway stalls the dashboard.
+
+        The pool already tracks an EWMA per gateway, so scale it: hedge once a
+        reply is clearly late for *this* link rather than late by a constant
+        chosen on someone else's network. The configured value stays the floor.
+        """
+        floor = float(self.settings["hedge_delay"])
+        with self._lock:
+            latency = self._health.get(gateway, {}).get("ewma_ms")
+        if not isinstance(latency, (int, float)) or latency <= 0:
+            return floor
+        return max(floor, min(_HEDGE_CEILING, latency / 1000.0 * _HEDGE_FACTOR))
+
     def _record_success(self, gateway: str, elapsed: float) -> None:
         elapsed_ms = max(0.0, elapsed * 1000.0)
         with self._lock:
@@ -744,6 +771,28 @@ class GatewayPool:
         finally:
             slot.release()
 
+    @staticmethod
+    def _clearly_faster(challenger: str, active: str, health: dict) -> bool:
+        """Whether ``challenger`` beats ``active`` by enough to switch mid-lease.
+
+        Both a ratio and an absolute floor: a 40% win on a 20 ms link is
+        noise, while the same ratio on a second-long link is worth taking.
+        """
+        if challenger == active:
+            return False
+
+        def latency(name):
+            value = health.get(name, {}).get("ewma_ms")
+            return (float(value)
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool) and value > 0 else None)
+
+        new, current = latency(challenger), latency(active)
+        if new is None or current is None:
+            return False
+        return (new <= current * _STICKY_YIELD_RATIO
+                and current - new >= _STICKY_YIELD_FLOOR_MS)
+
     def _candidate_gateways(self, fixed: str | None = None) -> list[str]:
         if fixed is not None:
             return [fixed] if fixed in self._gateways else []
@@ -764,7 +813,11 @@ class GatewayPool:
             return value, self._gateways.index(gateway)
 
         ordered = sorted(eligible, key=score)
-        if sticky and active in ordered:
+        if sticky and active in ordered and not self._clearly_faster(
+                ordered[0], active, health):
+            # Stickiness exists to stop the pool flapping between gateways of
+            # near-equal latency, not to sit on a slow one for a whole TTL
+            # after a better route has been measured.
             ordered.remove(active)
             ordered.insert(0, active)
         elif active in ordered and health[active].get("ewma_ms") is None:
@@ -1224,7 +1277,7 @@ class GatewayPool:
             return True, self._cached_or_empty_state("no configured gateway is eligible")
         launch(candidates[0])
         remaining = list(candidates[1:])
-        first_wait = min(float(self.settings["hedge_delay"]), timeout)
+        first_wait = min(self._hedge_delay_for(candidates[0]), timeout)
         last_error = ""
         while self._clock() < deadline:
             wait_for = max(0.01, min(

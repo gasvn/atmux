@@ -10,7 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from autotmux import agent, cli, config, gateway
+from autotmux import agent, cli, config, gateway, notify
 
 
 def client_settings(gateways=("login1", "login2"), **overrides):
@@ -586,6 +586,151 @@ class LoginNodeRosterTests(_PoolFixture, unittest.TestCase):
             pool._record_login_node("login2", reply)
         state = pool._decorate_state(remote_state(), "login1", "login1")
         self.assertEqual(self._login_rows(state), ["login--login1"])
+
+
+class HedgeAndStickyTests(_PoolFixture, unittest.TestCase):
+    """Racing every gateway on every refresh is waste, and sitting on a slow
+    one for a whole lease is the opposite waste. Both are decided from the
+    latency the pool already measures."""
+
+    def _pool_with_latency(self, latencies, **overrides):
+        pool = self.pool(**overrides)
+        for gateway, ms in latencies.items():
+            pool._health[gateway]['ewma_ms'] = ms
+        return pool
+
+    def test_hedge_window_scales_with_the_measured_round_trip(self):
+        pool = self._pool_with_latency({'login1': 500.0}, hedge_delay=0.25)
+        # 500 ms * 2.5 = 1.25 s, not the 0.25 s floor that would fan out on
+        # every single refresh.
+        self.assertAlmostEqual(pool._hedge_delay_for('login1'), 1.25, places=2)
+
+    def test_configured_delay_is_a_floor_not_a_target(self):
+        pool = self._pool_with_latency({'login1': 10.0}, hedge_delay=0.25)
+        self.assertAlmostEqual(pool._hedge_delay_for('login1'), 0.25, places=2)
+
+    def test_hedge_window_is_capped(self):
+        pool = self._pool_with_latency({'login1': 60_000.0})
+        self.assertLessEqual(pool._hedge_delay_for('login1'),
+                             gateway._HEDGE_CEILING)
+
+    def test_an_unmeasured_gateway_uses_the_configured_delay(self):
+        pool = self.pool(hedge_delay=0.4)
+        self.assertAlmostEqual(pool._hedge_delay_for('login1'), 0.4, places=2)
+
+    def test_lowest_latency_gateway_is_tried_first(self):
+        pool = self._pool_with_latency({'login1': 900.0, 'login2': 200.0})
+        self.assertEqual(pool._candidate_gateways()[0], 'login2')
+
+    def test_sticky_holds_through_a_near_tie(self):
+        pool = self._pool_with_latency({'login1': 567.0, 'login2': 396.0})
+        pool._set_active('login1')
+        self.assertEqual(pool._candidate_gateways()[0], 'login1')
+
+    def test_sticky_yields_to_a_clearly_faster_route(self):
+        pool = self._pool_with_latency({'login1': 900.0, 'login2': 200.0})
+        pool._set_active('login1')
+        self.assertEqual(pool._candidate_gateways()[0], 'login2')
+
+    def test_a_small_absolute_win_is_treated_as_noise(self):
+        """On a fast LAN a 60% ratio can still be a 30 ms difference."""
+        health = {'a': {'ewma_ms': 20.0}, 'b': {'ewma_ms': 50.0}}
+        self.assertFalse(gateway.GatewayPool._clearly_faster('a', 'b', health))
+
+    def test_unmeasured_latency_never_forces_a_switch(self):
+        health = {'a': {'ewma_ms': None}, 'b': {'ewma_ms': 900.0}}
+        self.assertFalse(gateway.GatewayPool._clearly_faster('a', 'b', health))
+        self.assertFalse(gateway.GatewayPool._clearly_faster('b', 'a', health))
+
+    def test_a_healthy_primary_is_not_raced(self):
+        """The waste this fixes: one RPC per refresh, not one per gateway.
+
+        Standby probing is stubbed out so this measures the race alone; that
+        runs on its own much slower interval.
+        """
+        pool = self._pool_with_latency(
+            {'login1': 500.0, 'login2': 500.0}, hedge_delay=0.25)
+        pool._set_active('login1')
+        seen = []
+
+        def rpc(name, _payload, _timeout=None):
+            seen.append(name)
+            return {'ok': True, 'state': remote_state(), 'host': name}
+
+        with mock.patch.object(pool, '_rpc_gateway', side_effect=rpc), \
+             mock.patch.object(pool, '_schedule_backup_probes'):
+            ok, _ = pool.fetch_state()
+        self.assertTrue(ok)
+        self.assertEqual(seen, ['login1'])
+
+    def test_a_silent_primary_still_gets_raced(self):
+        """Hedging must not be traded away: a gateway that goes quiet has to
+        fail over, it just should not be assumed slow at 0.25 s."""
+        pool = self._pool_with_latency(
+            {'login1': 10.0, 'login2': 10.0}, hedge_delay=0.05,
+            state_timeout=2.0)
+        pool._set_active('login1')
+        seen = []
+
+        def rpc(name, _payload, _timeout=None):
+            seen.append(name)
+            if name == 'login1':
+                time.sleep(1.0)          # silent, not failed
+            return {'ok': True, 'state': remote_state(), 'host': name}
+
+        with mock.patch.object(pool, '_rpc_gateway', side_effect=rpc), \
+             mock.patch.object(pool, '_schedule_backup_probes'):
+            ok, _ = pool.fetch_state()
+        self.assertTrue(ok)
+        self.assertIn('login2', seen)
+
+
+class JobReminderClaimTests(unittest.TestCase):
+    """One daemon runs per login node against the same squeue, so without a
+    shared record every one of them announces the same job."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.temp.name, 'notified.json')
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_only_the_first_daemon_announces(self):
+        self.assertTrue(notify.claim_job(self.path, '42'))
+        self.assertFalse(notify.claim_job(self.path, '42'))
+        self.assertFalse(notify.claim_job(self.path, '42'))
+
+    def test_distinct_jobs_are_independent(self):
+        self.assertTrue(notify.claim_job(self.path, '42'))
+        self.assertTrue(notify.claim_job(self.path, '43'))
+
+    def test_claims_expire(self):
+        self.assertTrue(notify.claim_job(self.path, '42'))
+        self.assertTrue(notify.claim_job(self.path, '42', ttl=0))
+
+    def test_the_record_is_created_with_its_directory(self):
+        nested = os.path.join(self.temp.name, 'cfg', 'notified.json')
+        self.assertTrue(notify.claim_job(nested, '42'))
+        self.assertTrue(os.path.exists(nested))
+
+    def test_an_unusable_record_fails_open(self):
+        """A duplicate reminder is a far smaller harm than a silent one."""
+        self.assertTrue(
+            notify.claim_job('/nonexistent-dir/notified.json', '42'))
+
+    def test_a_corrupt_record_does_not_suppress_the_reminder(self):
+        for junk in ('not json', '[]', 'null', ''):
+            with open(self.path, 'w') as handle:
+                handle.write(junk)
+            with self.subTest(junk=junk):
+                self.assertTrue(notify.claim_job(self.path, '42'))
+
+    def test_the_record_stays_bounded(self):
+        for i in range(200):
+            notify.claim_job(self.path, str(i))
+        with open(self.path) as handle:
+            self.assertLessEqual(len(json.load(handle)), notify._CLAIM_LIMIT)
 
 
 class LocalSessionIdleTests(unittest.TestCase):

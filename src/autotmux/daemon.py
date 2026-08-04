@@ -1298,6 +1298,13 @@ def _notify_expiring_jobs(node_infos: dict) -> None:
 
     def deliver(job: dict) -> None:
         job_id = str(job.get('job_id') or '')
+        # Every login node's daemon polls the same squeue and reaches this
+        # point together; the shared claim decides which one actually speaks.
+        if not notify.claim_job(config.NOTIFY_CLAIM_PATH, job_id):
+            with _notify_lock:
+                _notified_jobs.add(job_id)
+            log.info(f'job {job_id} reminder already sent by another daemon')
+            return
         text = notify.build_message(job, job['remaining'])
         ok, error = notify.post(
             _notify_cfg['webhook_url'], text, float(_notify_cfg['timeout']))

@@ -12,11 +12,16 @@ must never delay or break the poll loop that drives the dashboard.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import logging
 import math
+import os
+import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -149,6 +154,77 @@ def jobs_from_state(state: dict) -> list[dict]:
             'node': node,
         }
     return list(jobs.values())
+
+
+CLAIM_TTL = 7 * 24 * 3600
+_CLAIM_LIMIT = 4096
+
+
+def claim_job(path: str, job_id: str, *, ttl: float = CLAIM_TTL,
+              now: float | None = None) -> bool:
+    """Whether *this* daemon is the one that should announce ``job_id``.
+
+    Runtime state is node-local, but a cluster runs one daemon per login node
+    against the same ``squeue`` -- so every one of them reaches the same
+    conclusion at the same moment and, without a shared record, the user gets
+    one message per login node. The record lives on shared home beside the
+    other config, guarded by the same advisory lock the keep-alive registry
+    uses.
+
+    Fails open: if the record cannot be read or written, the reminder is still
+    sent. A duplicate message is a far smaller harm than a silent one.
+    """
+    job_id = str(job_id)
+    wall = time.time() if now is None else float(now)
+    directory = os.path.dirname(path)
+    try:
+        if directory:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+        lock_fd = os.open(f'{path}.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as error:
+        log.warning(f'reminder claim unavailable ({error}); sending anyway')
+        return True
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with open(path, encoding='utf-8') as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            record = {}
+        if not isinstance(record, dict):
+            record = {}
+        # Drop expired entries so a long-lived home does not accumulate every
+        # JobID the user has ever run.
+        fresh = {
+            key: value for key, value in list(record.items())[:_CLAIM_LIMIT]
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and wall - float(value) < ttl
+        }
+        if job_id in fresh:
+            return False
+        fresh[job_id] = wall
+        tmp = f'{path}.{os.getpid()}.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as handle:
+                json.dump(fresh, handle)
+            os.replace(tmp, path)
+        except OSError as error:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            log.warning(f'could not record reminder claim ({error}); '
+                        'sending anyway')
+        return True
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EAGAIN):
+            log.warning(f'reminder claim failed ({error}); sending anyway')
+        return True
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
 
 
 def post(url: str, text: str, timeout: float) -> tuple[bool, str]:

@@ -28,6 +28,14 @@ KEEPALIVE_PATH = os.environ.get(
     os.path.expanduser('~/.config/autotmux/keepalive.json'),
 )
 
+# Which job expiry reminders have already been announced. Shared home, not the
+# node-local runtime dir: one daemon runs per login node and they all reach the
+# same conclusion at once, so the record has to be visible to all of them.
+NOTIFY_CLAIM_PATH = os.environ.get(
+    'AUTOTMUX_NOTIFY_CLAIM',
+    os.path.expanduser('~/.config/autotmux/notified-jobs.json'),
+)
+
 # Gateway choices made in the TUI live separately from the hand-written
 # daemon configuration.  This keeps the common local-client workflow out of
 # TOML entirely while preserving config.toml as an advanced/compatible input.
