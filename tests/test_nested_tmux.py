@@ -44,15 +44,6 @@ class NestedTmuxTransparentTests(unittest.TestCase):
             shutil.rmtree(self.tmpdir, ignore_errors=True)
             autotmux.GUARD_FILE = self._prev_guard
             self.skipTest(f'tmux server unavailable in this sandbox: {exc.stderr.strip()}')
-        # tmux 3.4 changed the built-in escape-time default from 500 ms to
-        # 10 ms, which is already at/below what AutoTmux leases. Pin the
-        # pre-lease value so restore assertions test the lease rather than
-        # whichever tmux the machine happens to ship.
-        self.original_escape_time = '500'
-        subprocess.run(
-            ['tmux', '-S', self.sock, 'set-option', '-s', 'escape-time',
-             self.original_escape_time],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Point the helpers at our isolated server via $TMUX (they parse the
         # socket from its first field).
         self._prev_tmux = os.environ.get('TMUX')
@@ -98,6 +89,21 @@ class NestedTmuxTransparentTests(unittest.TestCase):
         return subprocess.run(
             ['tmux', '-S', self.sock, 'show-options', '-g', '-v', name],
             capture_output=True, text=True).stdout.strip()
+
+    def _pin_escape_time(self, value: str = '500') -> str:
+        """Give this test a known pre-lease escape-time.
+
+        tmux 3.4 lowered the built-in default from 500 ms to 10 ms, which is
+        already at the value AutoTmux leases -- so a test that assumed the old
+        default stopped exercising the restore at all. Only the tests that
+        assert a restored value call this: escape-time changes how long tmux
+        waits while parsing escape sequences, so setting it for the whole class
+        would perturb the PTY timing tests.
+        """
+        subprocess.run(
+            ['tmux', '-S', self.sock, 'set-option', '-s', 'escape-time', value],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return value
 
     def _root_f12(self) -> str:
         r = subprocess.run(['tmux', '-S', self.sock, 'list-keys', '-T', 'root'],
@@ -202,6 +208,7 @@ class NestedTmuxTransparentTests(unittest.TestCase):
         self.assertIn('-u', recovery)
 
     def test_f12_actually_recovers_attached_outer_client(self):
+        original = self._pin_escape_time()
         subprocess.run(
             ['tmux', '-S', self.sock, 'respawn-pane', '-k', '-t', 'outer',
              'cat -v'], check=True)
@@ -251,7 +258,7 @@ class NestedTmuxTransparentTests(unittest.TestCase):
             self.assertEqual(self._session_opt('prefix'), '')
             self.assertEqual(self._session_opt('prefix2'), '')
             self.assertEqual(self._server_opt('escape-time'),
-                             self.original_escape_time)
+                             original)
             self.assertEqual(
                 self._global_opt(self.context['latency_state_key']), '')
             self.assertTrue(autotmux._tmux_restore())
@@ -356,6 +363,7 @@ class NestedTmuxTransparentTests(unittest.TestCase):
 
     def test_concurrent_processes_restore_only_after_last_detach(self):
         """One window detaching must not kill shortcuts in another window."""
+        original = self._pin_escape_time()
         first = second = None
         try:
             first = self._spawn_lease_owner()
@@ -391,7 +399,7 @@ class NestedTmuxTransparentTests(unittest.TestCase):
             self.assertEqual(self._session_opt('prefix2'), '')
             self.assertEqual(self._opt('key-table'), 'root')
             self.assertEqual(self._server_opt('escape-time'),
-                             self.original_escape_time)
+                             original)
         finally:
             for proc in (first, second):
                 if proc is not None and proc.poll() is None:
@@ -417,6 +425,7 @@ class NestedTmuxTransparentTests(unittest.TestCase):
 
     def test_escape_time_lease_is_shared_across_outer_sessions(self):
         """A detach in session $0 must not slow a still-nested session $1."""
+        original = self._pin_escape_time()
         subprocess.run(
             ['tmux', '-S', self.sock, 'new-session', '-d', '-s', 'other'],
             check=True)
@@ -446,7 +455,7 @@ class NestedTmuxTransparentTests(unittest.TestCase):
             self._release_owner(second)
             second = None
             self.assertEqual(self._server_opt('escape-time'),
-                             self.original_escape_time)
+                             original)
         finally:
             for proc in (first, second):
                 if proc is not None and proc.poll() is None:
