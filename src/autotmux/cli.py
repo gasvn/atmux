@@ -3205,12 +3205,21 @@ class AutotmuxApp(App):
         gateway_info = state.get('gateway') if isinstance(state, dict) else None
         gateway_active = (gateway_info.get('active')
                           if isinstance(gateway_info, dict) else '')
-        gateway_mode = (isinstance(gateway_info, dict)
-                        and gateway_info.get('mode') == 'gateway')
+        # Whether this is a gateway client is decided by how the process was
+        # configured, not by whether a fetch has landed yet.  State carries no
+        # gateway marker until the first RPC returns, so trusting the marker
+        # alone made a gateway client fall through to the native branch below
+        # and advertise a local daemon it never runs.
+        gateway_mode = ((isinstance(gateway_info, dict)
+                         and gateway_info.get('mode') == 'gateway')
+                        or _gateway_mode())
         if self._crash_looping:
             return "⚠ daemon crash-looping — run `atd status`"
         if not state.get('nodes'):
             if gateway_mode:
+                if not isinstance(gateway_info, dict):
+                    # First fetch still in flight; nothing has failed yet.
+                    return "connecting to login gateway…"
                 reason = ' '.join(str(
                     gateway_info.get('last_error') or
                     'no login gateway is reachable').split())[:100]

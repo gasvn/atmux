@@ -931,5 +931,86 @@ class KeepAliveToggleTests(unittest.IsolatedAsyncioTestCase):
             app._ka_registry_names.assert_not_called()
 
 
+class StatusSubtitleTests(unittest.TestCase):
+    """`_status_subtitle` picks the message for an empty dashboard.
+
+    A gateway client runs no local daemon, so it must never be told to go
+    inspect one.  The gateway marker only appears once a fetch has landed, so
+    the mode has to come from how the process was configured.
+    """
+
+    @staticmethod
+    def _subtitle(state, *, gateway_mode, crash_looping=False,
+                  recovery_inflight=False):
+        stub = SimpleNamespace(
+            _crash_looping=crash_looping,
+            _recovery_inflight=recovery_inflight,
+            _daemon_age_seconds=lambda *a, **k: 0.0,
+        )
+        with mock.patch.object(autotmux, '_gateway_mode',
+                               return_value=gateway_mode):
+            return autotmux.AutotmuxApp._status_subtitle(
+                stub, state, [], '?')
+
+    def test_gateway_client_never_points_at_a_local_daemon(self):
+        """The regression: before the first RPC lands the state has no gateway
+        marker, which used to fall through to the native branch."""
+        subtitle = self._subtitle({}, gateway_mode=True)
+        self.assertNotIn('daemon', subtitle)
+        self.assertNotIn('atd status', subtitle)
+        self.assertIn('gateway', subtitle)
+
+    def test_gateway_failure_reports_the_reason(self):
+        state = {'nodes': {}, 'gateway': {
+            'mode': 'gateway', 'last_error': 'gateway RPC timed out'}}
+        subtitle = self._subtitle(state, gateway_mode=True)
+        self.assertIn('gateway unavailable', subtitle)
+        self.assertIn('gateway RPC timed out', subtitle)
+
+    def test_gateway_failure_falls_back_to_a_generic_reason(self):
+        state = {'nodes': {}, 'gateway': {'mode': 'gateway'}}
+        self.assertIn('no login gateway is reachable',
+                      self._subtitle(state, gateway_mode=True))
+
+    def test_pending_fetch_is_distinct_from_a_failed_one(self):
+        """'Not answered yet' and 'answered with an error' must not read the
+        same, or a slow first connect looks like an outage."""
+        pending = self._subtitle({}, gateway_mode=True)
+        failed = self._subtitle(
+            {'nodes': {}, 'gateway': {'mode': 'gateway',
+                                      'last_error': 'boom'}},
+            gateway_mode=True)
+        self.assertNotEqual(pending, failed)
+        self.assertNotIn('⚠', pending)
+        self.assertIn('⚠', failed)
+
+    def test_native_mode_still_waits_on_its_local_daemon(self):
+        subtitle = self._subtitle({}, gateway_mode=False)
+        self.assertIn('waiting for daemon', subtitle)
+        self.assertIn('atd status', subtitle)
+
+    def test_native_mode_reports_an_in_flight_restart(self):
+        self.assertEqual(
+            self._subtitle({}, gateway_mode=False, recovery_inflight=True),
+            'starting daemon…')
+
+    def test_crash_loop_wins_over_every_other_message(self):
+        for gateway_mode in (True, False):
+            with self.subTest(gateway_mode=gateway_mode):
+                self.assertIn('crash-looping', self._subtitle(
+                    {}, gateway_mode=gateway_mode, crash_looping=True))
+
+    def test_populated_gateway_state_is_unaffected(self):
+        """Nodes present -> the empty-dashboard branch must not fire at all."""
+        state = {
+            'nodes': SYNTH_STATE['nodes'],
+            'gateway': {'mode': 'gateway', 'active': 'login1'},
+            'updated': '2026-01-01 00:00:00',
+        }
+        subtitle = self._subtitle(state, gateway_mode=True)
+        self.assertNotIn('waiting for daemon', subtitle)
+        self.assertNotIn('connecting to login gateway', subtitle)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
