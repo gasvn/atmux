@@ -284,6 +284,16 @@ network_backoff_base = 2   # first shared node-network retry delay
 network_backoff_cap  = 60  # maximum shared node-network retry delay
 warm_orphan_interval = 30  # seconds between identity-safe warm-child sweeps
 
+[notify]
+# Reminder before a Slurm job hits its time limit. Sent by the daemon on the
+# login node, so it still arrives when the dashboard is closed. Off until a
+# webhook is set.
+webhook_url = ""           # Slack incoming webhook, or anything accepting
+                           # {"text": "..."} (Discord, Teams, ntfy, relays)
+enabled     = true         # honoured only once webhook_url is set
+lead_time   = 3600         # seconds before expiry to send the reminder
+timeout     = 10           # seconds to wait for the webhook
+
 [keepalive]
 enabled        = true      # master switch; existing opt-ins remain stored
 lead_time      = 900       # renew this many seconds before expiry
@@ -387,6 +397,40 @@ higher, without editing `tmux.conf`; an already-lower value is preserved. This
 removes the default 500 ms ambiguity delay that makes Vim/Alt/function-key
 sequences feel stuck, especially when tmux is nested. The STATUS column still
 shows `⚠ ESC Nms` if tuning was unavailable and the value remains above 50 ms.
+
+### Idle session hints
+
+tmux records when each session last saw activity, so the daemon reports it for
+free alongside the session list. A session quiet for more than five minutes
+gets a coloured dot and its age in the STATUS column — yellow up to an hour,
+red beyond it:
+
+```
+gpu1   train    2   1-23:45:29   ● 15m Active
+gpu2   sweep    1   4:02:11      ● 2h Active
+gpu3   build    1   6:20:00      Active
+```
+
+Idle time is measured against the *node's* clock, sampled in the same command
+as the activity stamps, so it stays correct when the laptop and the cluster
+disagree about the time. The dot is decoration only: the session name stays
+exactly what `Enter` attaches to.
+
+### Job expiry reminders
+
+Point `[notify].webhook_url` at a Slack incoming webhook — or anything that
+accepts `{"text": "..."}`, such as Discord, Teams, ntfy, or a relay into
+WhatsApp/SMS — and the daemon sends one message per job as it enters its final
+`lead_time` seconds:
+
+```
+AutoTmux: Slurm job train (4172318) on holygpu8a11104 ends in 58m.
+```
+
+It runs on the login node, so reminders arrive whether or not the dashboard is
+open. Each job is announced once; a job whose remaining time Slurm cannot
+report is skipped rather than guessed at, and a failed POST is retried on the
+next poll instead of being silently dropped.
 
 ### Keep-alive auto-renew
 

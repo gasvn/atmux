@@ -614,17 +614,20 @@ class SessionPayloadTests(unittest.TestCase):
         self.assertIn('_atmux_escape -gt 10', script)
 
     def test_noise_and_old_text_marker_cannot_create_phantom_sessions(self):
+        # Lines are activity:windows:name, so the name is free to look like a
+        # section marker without shifting any field.
         payload = (
             'remote profile banner\n'
             + d._SESSION_SECTION
-            + '---NODEINFO---:2\nmain:1\n'
+            + '900:2:---NODEINFO---\n990:1:main\n'
             + d._NODEINFO_SECTION
-            + '\n8\n0.50, 0.25, 0.10\n'
+            + '\n8\n0.50, 0.25, 0.10\n1000\n'
             + d._TMUXINFO_SECTION
             + '\n500\n'
         )
         sessions, nproc, load, escape_time = d._parse_session_payload(payload)
-        self.assertEqual(sessions, [['---NODEINFO---', '2'], ['main', '1']])
+        self.assertEqual(
+            sessions, [['---NODEINFO---', '2', 100], ['main', '1', 10]])
         self.assertEqual(nproc, '8')
         self.assertEqual(load, '0.50')
         self.assertEqual(escape_time, '500')

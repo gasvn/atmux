@@ -2194,17 +2194,23 @@ def build_session_rows(state: dict) -> list:
         added = False
         if sessions:
             for s in sessions:
+                idle = None
                 if isinstance(s, (list, tuple)):
                     if not s:
                         continue
                     name = str(s[0])
                     wins = str(s[1]) if len(s) > 1 else '?'
+                    if len(s) > 2:
+                        idle = _coerce_idle_seconds(s[2])
                 elif isinstance(s, str):
                     name, wins = s, '?'
                 else:
                     continue
                 status = (f'DEGRADED: {last_error[:30]}'
                           if last_error else 'Active')
+                marker = _idle_marker(idle)
+                if marker:
+                    status = f'{marker} {status}'
                 if latency_warning:
                     status = f'{status} · {latency_warning}'
                 if network_warning:
@@ -2221,9 +2227,76 @@ def build_session_rows(state: dict) -> list:
     return rows
 
 
+# A pane nobody has touched for a while is usually a finished run or a shell
+# waiting on a prompt.  Surfacing that costs nothing -- tmux already tracks the
+# last activity per session -- and saves opening each one to check.
+IDLE_HINT_SECONDS = 300
+IDLE_STALE_SECONDS = 3600
+_IDLE_DOT = '●'
+_IDLE_STYLES = {'idle': 'yellow', 'stale': 'red'}
+
+
+def _coerce_idle_seconds(value):
+    """Accept only a real, finite, non-negative idle count."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return int(value)
+
+
+def _idle_tier(idle) -> str:
+    idle = _coerce_idle_seconds(idle)
+    if idle is None or idle < IDLE_HINT_SECONDS:
+        return ''
+    return 'stale' if idle >= IDLE_STALE_SECONDS else 'idle'
+
+
+def _format_idle(idle: int) -> str:
+    if idle >= 86400:
+        return f'{idle // 86400}d'
+    if idle >= 3600:
+        return f'{idle // 3600}h'
+    return f'{idle // 60}m'
+
+
+def _idle_marker(idle) -> str:
+    """``● 12m`` once a session has been quiet past the hint threshold."""
+    if not _idle_tier(idle):
+        return ''
+    return f'{_IDLE_DOT} {_format_idle(_coerce_idle_seconds(idle))}'
+
+
 def _literal_cell(value) -> rich.text.Text:
     """A DataTable renderable that never interprets user text as markup."""
     return rich.text.Text(str(value))
+
+
+def _status_cell(value) -> rich.text.Text:
+    """STATUS, with a leading idle dot coloured by how long it has been quiet.
+
+    Only the dot is styled: the rest stays literal so a session's own text can
+    never be read as markup.
+    """
+    text = str(value)
+    cell = rich.text.Text(text)
+    if text.startswith(_IDLE_DOT):
+        tier = 'stale' if _looks_stale(text) else 'idle'
+        cell.stylize(_IDLE_STYLES[tier], 0, len(_IDLE_DOT))
+    return cell
+
+
+def _looks_stale(text: str) -> bool:
+    """Whether a rendered marker represents the longer, redder tier."""
+    unit = text[len(_IDLE_DOT):].strip().split()[0] if len(text) > 1 else ''
+    if unit.endswith(('h', 'd')):
+        return True
+    if unit.endswith('m'):
+        try:
+            return int(unit[:-1]) * 60 >= IDLE_STALE_SECONDS
+        except ValueError:
+            return False
+    return False
 
 
 class ClickToAttachDataTable(DataTable):
@@ -2782,9 +2855,10 @@ class AutotmuxApp(App):
         ok = True
         for col, val in ((2, r[2]), (3, r[3]), (4, r[5]), (5, r[6]), (6, r[4])):
             coord = Coordinate(i, col)
+            cell = _status_cell(val) if col == 6 else _literal_cell(val)
             try:
                 if str(self.table.get_cell_at(coord)) != str(val):
-                    self.table.update_cell_at(coord, _literal_cell(val))
+                    self.table.update_cell_at(coord, cell)
             except Exception:
                 ok = False
         return ok
@@ -2880,13 +2954,11 @@ class AutotmuxApp(App):
         self.table.clear()
         for r in rows:
             # row layout: (node, session, wins, time, status, cpu, load)
-            self.table.add_row(*(
-                _literal_cell(value)
-                for value in (
-                    r[0], _session_label(r[1]), r[2], r[3],
-                    r[5], r[6], r[4],
-                )
-            ))
+            self.table.add_row(
+                *(_literal_cell(value) for value in (
+                    r[0], _session_label(r[1]), r[2], r[3], r[5], r[6])),
+                _status_cell(r[4]),
+            )
 
         if rows:
             new_idx = 0

@@ -40,7 +40,7 @@ import weakref
 from logging.handlers import RotatingFileHandler
 
 from autotmux import (
-    __version__, config, ipc, keepalive, lifecycle, network, paths,
+    __version__, config, ipc, keepalive, lifecycle, network, notify, paths,
     warm_registry,
 )
 
@@ -134,6 +134,13 @@ _cfg = dict(config.DEFAULTS)
 # batch scripts before their allocation expires. Driven from _squeue_loop.
 _keepalive_mgr = keepalive.KeepAliveManager(config.KEEPALIVE_PATH,
                                             dict(config.KEEPALIVE_DEFAULTS))
+
+# Reminders for jobs nearing their time limit.  The daemon outlives the TUI, so
+# this keeps working after the dashboard is closed -- which is when a warning
+# is actually worth sending.
+_notify_cfg = dict(config.NOTIFY_DEFAULTS)
+_notified_jobs: set[str] = set()
+_notify_lock = threading.Lock()
 
 # ── tunables (overridable via ~/.config/autotmux/config.toml) ───────────────
 SQUEUE_INTERVAL       = _cfg['squeue_interval']
@@ -1090,7 +1097,7 @@ def _load_runtime_configuration(timeout: float = 3.0) -> bool:
     process that already has helper threads.  A wedged loader is a capped daemon
     thread and defaults keep the service usable.
     """
-    global _cfg, _keepalive_mgr, _USER
+    global _cfg, _keepalive_mgr, _USER, _notify_cfg
     global SQUEUE_INTERVAL, HEALTH_INTERVAL, DEEP_PROBE_TIMEOUT
     global CONNECT_TIMEOUT, CTL_PERSIST, SQUEUE_TIMEOUT, SNAPSHOT_INTERVAL
     global SESSION_INTERVAL, SERVER_ALIVE_INT, SERVER_ALIVE_MAX
@@ -1107,6 +1114,7 @@ def _load_runtime_configuration(timeout: float = 3.0) -> bool:
         try:
             cfg_result['daemon'] = config.load()
             cfg_result['keepalive'] = config.load_keepalive()
+            cfg_result['notify'] = config.load_notify()
         except BaseException as error:
             cfg_result['error'] = error
         finally:
@@ -1136,9 +1144,11 @@ def _load_runtime_configuration(timeout: float = 3.0) -> bool:
     if cfg_done.is_set() and 'daemon' in cfg_result:
         _cfg = cfg_result['daemon']
         ka_cfg = cfg_result['keepalive']
+        _notify_cfg = cfg_result['notify']
     else:
         _cfg = dict(config.DEFAULTS)
         ka_cfg = dict(config.KEEPALIVE_DEFAULTS)
+        _notify_cfg = dict(config.NOTIFY_DEFAULTS)
         log.warning('configuration load timed out or failed; using defaults')
     if user_done.is_set() and isinstance(user_result.get('value'), str):
         _USER = user_result['value']
@@ -1257,12 +1267,64 @@ def _get_squeue_text(args: list[str]) -> str:
         return f'(squeue error: {e})'
 
 
+def _notify_expiring_jobs(node_infos: dict) -> None:
+    """Send one reminder per job entering its final `lead_time` seconds.
+
+    Called only with a complete squeue view: a partial poll says nothing about
+    a job's remaining time and must not trigger an alarm.  Delivery runs on a
+    detached thread so a slow or unreachable webhook cannot stall discovery,
+    and a job is recorded as announced only once a POST actually succeeds.
+    """
+    if not _notify_cfg.get('enabled') or not _notify_cfg.get('webhook_url'):
+        return
+    # One job can own several nodes; announce the job, not each node.
+    jobs = {}
+    for node, info in (node_infos or {}).items():
+        if not isinstance(info, dict):
+            continue
+        job_id = str(info.get('job_id') or '').strip()
+        if job_id and job_id not in jobs:
+            jobs[job_id] = {**info, 'node': node}
+    with _notify_lock:
+        already = set(_notified_jobs)
+        # Forget jobs that have left the queue so the set cannot grow forever.
+        _notified_jobs.intersection_update(jobs)
+    try:
+        due = notify.due_jobs(
+            jobs.values(), float(_notify_cfg['lead_time']), already)
+    except Exception as error:
+        log.warning(f'job reminder check failed: {error}')
+        return
+
+    def deliver(job: dict) -> None:
+        job_id = str(job.get('job_id') or '')
+        text = notify.build_message(job, job['remaining'])
+        ok, error = notify.post(
+            _notify_cfg['webhook_url'], text, float(_notify_cfg['timeout']))
+        if ok:
+            with _notify_lock:
+                _notified_jobs.add(job_id)
+            log.info(f'sent expiry reminder for job {job_id}')
+        else:
+            # Leave it unrecorded so the next poll retries.
+            log.warning(f'job {job_id} reminder not delivered: {error}')
+
+    for job in due:
+        try:
+            threading.Thread(target=deliver, args=(job,), daemon=True,
+                             name=f"notify-{job.get('job_id')}").start()
+        except RuntimeError as error:
+            log.warning(f'could not start reminder thread: {error}')
+
+
 def _squeue_loop():
     """Periodically discover nodes, spin up masters, refresh job listings."""
     last_set: frozenset = frozenset()
     while not _stop_event.is_set():
         try:
             node_infos, discovery_complete = _discover_nodes()
+            if discovery_complete:
+                _notify_expiring_jobs(node_infos)
             # Preserve fields populated by the session loop only for the same
             # job, and never treat incomplete controller data as node loss.
             gone, known_nodes = _merge_discovery(
@@ -2437,19 +2499,37 @@ def _parse_session_payload(out: str) -> tuple[list, str, str, str]:
     node_text, found, tmux_text = info_text.partition(_TMUXINFO_SECTION)
     if not found:
         raise ValueError('missing tmux-info payload marker')
+    info_lines = [line.strip() for line in node_text.splitlines() if line.strip()]
+    nproc = info_lines[0] if info_lines else ''
+    load = info_lines[1].split(',')[0].strip() if len(info_lines) >= 2 else ''
+    # The remote clock, sampled in the same command as the activity stamps.
+    # Comparing against our own clock instead would report nonsense whenever
+    # the two hosts disagree.
+    try:
+        remote_now = int(info_lines[2]) if len(info_lines) >= 3 else None
+    except ValueError:
+        remote_now = None
     sessions = []
     for line in sessions_text.splitlines():
         line = line.strip()
         if not line:
             continue
-        if ':' in line:
-            name, _, wins = line.partition(':')
-            sessions.append([name, wins or '?'])
+        # activity:windows:name — name is last so it may contain ':'.
+        parts = line.split(':', 2)
+        if len(parts) == 3:
+            activity, wins, name = parts
         else:
-            sessions.append([line, '?'])
-    info_lines = [line.strip() for line in node_text.splitlines() if line.strip()]
-    nproc = info_lines[0] if info_lines else ''
-    load = info_lines[1].split(',')[0].strip() if len(info_lines) >= 2 else ''
+            activity, wins, name = '', '?', line
+        idle = None
+        if remote_now is not None:
+            try:
+                idle = max(0, remote_now - int(activity))
+            except ValueError:
+                idle = None
+        entry = [name, wins or '?']
+        if idle is not None:
+            entry.append(idle)
+        sessions.append(entry)
     tmux_lines = [line.strip() for line in tmux_text.splitlines() if line.strip()]
     escape_time = tmux_lines[0] if tmux_lines else ''
     if not escape_time.isdigit():
@@ -2470,12 +2550,18 @@ def _session_probe_script() -> str:
         " tmux set-option -s escape-time 10 >/dev/null 2>&1 || true;"
         " fi ;; esac;"
         "printf '\\000AUTOTMUX_SESSIONS\\000';"
-        "tmux list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null;"
+        # Activity and window count lead so a session name may contain ':'.
+        # #{session_activity} is the epoch of the session's last activity, read
+        # on the same host as the clock below so the two always agree.
+        "tmux list-sessions"
+        " -F '#{session_activity}:#{session_windows}:#{session_name}'"
+        " 2>/dev/null;"
         " printf '\\000AUTOTMUX_NODEINFO\\000\\n';"
         # Keep nproc on its own line even on failure so a load value cannot
         # slide into the CPU slot.
         " (nproc 2>/dev/null || echo '?');"
         " LC_ALL=C uptime | sed -n 's/.*load average: //p';"
+        " (date +%s 2>/dev/null || echo '?');"
         " printf '\\000AUTOTMUX_TMUXINFO\\000\\n';"
         " (tmux show-options -s -v escape-time 2>/dev/null || echo '?');"
         " exit 0"

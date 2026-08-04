@@ -53,6 +53,20 @@ KEEPALIVE_DEFAULTS = {
     'submit_timeout': 60,   # seconds to wait for sbatch to return
 }
 
+# Reminders for jobs nearing their time limit.  Off until a webhook is set:
+# the daemon must never post anywhere the user has not named.
+NOTIFY_DEFAULTS = {
+    'enabled': True,        # honoured only once webhook_url is set
+    'webhook_url': '',      # Slack-shaped {"text": ...} endpoint
+    'lead_time': 3600,      # seconds before expiry to send the reminder
+    'timeout': 10,          # seconds to wait for the webhook
+}
+
+_NOTIFY_NUMBER_RULES = {
+    'lead_time': (float, 60.0, 86_400.0),
+    'timeout':   (float, 1.0, 120.0),
+}
+
 # Defaults mirror the current daemon.py constants exactly.
 DEFAULTS = {
     'squeue_interval': 30,
@@ -558,3 +572,76 @@ def load_keepalive() -> dict:
             value = KEEPALIVE_DEFAULTS[key]
         cfg[key] = min(maximum, max(minimum, int(value)))
     return cfg
+
+
+def _notify_webhook_url(value) -> str | None:
+    """Validate the reminder endpoint.
+
+    Only http(s) is accepted: the daemon posts this without further inspection,
+    so a ``file:``/``ftp:`` URL would turn a config typo into an unexpected
+    local read.  Control characters cannot appear in a real URL and would let a
+    malformed value smear across the daemon log.
+    """
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if not url:
+        return ''
+    if _CONTROL_CHARS.search(url) or len(url) > 2048:
+        return None
+    if not url.startswith(('http://', 'https://')):
+        return None
+    return url
+
+
+def _notify_normalized(cfg: dict) -> dict:
+    """No endpoint means nothing to post to, whatever ``enabled`` says.
+
+    Applied on every return path so a caller can trust ``enabled`` alone and
+    never has to re-check the URL.
+    """
+    if not cfg.get('webhook_url'):
+        cfg['enabled'] = False
+    return cfg
+
+
+def load_notify() -> dict:
+    """Return NOTIFY_DEFAULTS merged with the ``[notify]`` table. Never raises."""
+    cfg = dict(NOTIFY_DEFAULTS)
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            return _notify_normalized(cfg)
+    if not os.path.exists(CONFIG_PATH):
+        return _notify_normalized(cfg)
+    try:
+        with open(CONFIG_PATH, 'rb') as f:
+            data = tomllib.load(f)
+    except Exception as e:
+        log.warning(f'failed to parse {CONFIG_PATH}: {e}; using notify defaults')
+        return _notify_normalized(cfg)
+    section = data.get('notify', {})
+    if not isinstance(section, dict):
+        log.warning('ignoring invalid [notify] config (expected a table)')
+        return _notify_normalized(cfg)
+
+    if 'enabled' in section:
+        if isinstance(section['enabled'], bool):
+            cfg['enabled'] = section['enabled']
+        else:
+            log.warning('ignoring invalid notify enabled (expected a boolean)')
+    if 'webhook_url' in section:
+        url = _notify_webhook_url(section['webhook_url'])
+        if url is None:
+            log.warning('ignoring invalid notify webhook_url '
+                        '(expected an http(s) URL)')
+        else:
+            cfg['webhook_url'] = url
+    for key, rule in _NOTIFY_NUMBER_RULES.items():
+        if key in section:
+            cfg[key] = _validated_number(
+                key, section[key], NOTIFY_DEFAULTS[key], rule)
+    return _notify_normalized(cfg)

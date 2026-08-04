@@ -659,5 +659,110 @@ class DaemonBookkeepingTests(unittest.TestCase):
         d._record_error('__nope__', 'something')
 
 
+def _probe_payload(sessions: str, info: str) -> str:
+    return ('login banner' + d._SESSION_SECTION + sessions
+            + d._NODEINFO_SECTION + '\n' + info + d._TMUXINFO_SECTION + '\n10\n')
+
+
+class SessionActivityParsingTests(unittest.TestCase):
+    """The probe reports each session's last-activity stamp and the remote
+    clock, sampled together so idle time never depends on clock agreement
+    between the laptop and the node."""
+
+    NOW = 1_000_000
+
+    def _sessions(self, sessions_text, clock=True):
+        info = f'8\n0.50, 0.40, 0.30\n' + (f'{self.NOW}\n' if clock else '')
+        return d._parse_session_payload(_probe_payload(sessions_text, info))[0]
+
+    def test_idle_is_measured_against_the_remote_clock(self):
+        rows = self._sessions(
+            f'{self.NOW - 60}:2:fresh\n{self.NOW - 900}:1:quiet\n')
+        self.assertEqual(rows, [['fresh', '2', 60], ['quiet', '1', 900]])
+
+    def test_session_name_may_contain_colons(self):
+        """Activity and window count lead precisely so the name can hold ':'."""
+        rows = self._sessions(f'{self.NOW - 5}:1:proj:sub:run\n')
+        self.assertEqual(rows, [['proj:sub:run', '1', 5]])
+
+    def test_activity_in_the_future_never_reports_negative_idle(self):
+        rows = self._sessions(f'{self.NOW + 120}:1:skewed\n')
+        self.assertEqual(rows, [['skewed', '1', 0]])
+
+    def test_older_daemon_without_a_clock_line_still_parses(self):
+        self.assertEqual(
+            self._sessions(f'{self.NOW - 60}:2:fresh\n', clock=False),
+            [['fresh', '2']])
+
+    def test_unparsable_activity_is_dropped_not_guessed(self):
+        self.assertEqual(self._sessions('nope:2:fresh\n'), [['fresh', '2']])
+        self.assertEqual(self._sessions('bare-name\n'), [['bare-name', '?']])
+
+
+class IdleMarkerTests(unittest.TestCase):
+    def test_quiet_sessions_are_marked_only_past_the_threshold(self):
+        self.assertEqual(autotmux._idle_marker(autotmux.IDLE_HINT_SECONDS - 1), '')
+        self.assertEqual(autotmux._idle_marker(autotmux.IDLE_HINT_SECONDS), '● 5m')
+        self.assertEqual(autotmux._idle_marker(900), '● 15m')
+        self.assertEqual(autotmux._idle_marker(7200), '● 2h')
+        self.assertEqual(autotmux._idle_marker(90_000), '● 1d')
+
+    def test_nonsense_idle_values_never_produce_a_marker(self):
+        for value in (None, -1, True, False, 'x', float('nan'), float('inf')):
+            with self.subTest(value=value):
+                self.assertEqual(autotmux._idle_marker(value), '')
+
+    def test_colour_escalates_with_age_and_is_scoped_to_the_dot(self):
+        quiet = autotmux._status_cell('● 15m Active')
+        stale = autotmux._status_cell('● 2h Active')
+        self.assertEqual([(s.start, s.end) for s in quiet.spans], [(0, 1)])
+        self.assertEqual(str(quiet.spans[0].style), 'yellow')
+        self.assertEqual(str(stale.spans[0].style), 'red')
+        # An hour expressed in minutes is the same tier as one expressed in h.
+        self.assertEqual(
+            str(autotmux._status_cell('● 60m Active').spans[0].style), 'red')
+
+    def test_ordinary_status_text_is_left_unstyled(self):
+        for text in ('Active', 'OFFLINE: boom', 'No sessions'):
+            self.assertEqual(autotmux._status_cell(text).spans, [])
+
+
+class IdleRowTests(unittest.TestCase):
+    @staticmethod
+    def _state(session_entry):
+        return {'nodes': {'gpu1': {
+            'alive': True, 'socket': '/tmp/x', 'info': {}, 'last_error': '',
+            'sessions': [session_entry]}}}
+
+    def test_quiet_session_gets_a_dot_in_status(self):
+        row = autotmux.build_session_rows(self._state(['train', '2', 900]))[0]
+        self.assertEqual(row[4], '● 15m Active')
+
+    def test_busy_session_status_is_unchanged(self):
+        row = autotmux.build_session_rows(self._state(['train', '2', 30]))[0]
+        self.assertEqual(row[4], 'Active')
+
+    def test_the_dot_never_leaks_into_the_attach_target(self):
+        """STATUS is decoration; row[1] is what Enter attaches to."""
+        row = autotmux.build_session_rows(self._state(['train', '2', 9000]))[0]
+        self.assertEqual(row[1], 'train')
+        self.assertNotIn(autotmux._IDLE_DOT, row[1])
+
+    def test_rows_stay_seven_wide_for_the_table(self):
+        self.assertEqual(
+            len(autotmux.build_session_rows(self._state(['t', '1', 900]))[0]), 7)
+
+    def test_entries_without_idle_data_render_as_before(self):
+        row = autotmux.build_session_rows(self._state(['train', '2']))[0]
+        self.assertEqual((row[1], row[4]), ('train', 'Active'))
+
+    def test_degraded_node_keeps_its_reason_alongside_the_dot(self):
+        state = self._state(['train', '2', 900])
+        state['nodes']['gpu1']['last_error'] = 'connect timeout'
+        self.assertEqual(
+            autotmux.build_session_rows(state)[0][4],
+            '● 15m DEGRADED: connect timeout')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
