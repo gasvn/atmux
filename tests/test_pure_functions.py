@@ -731,6 +731,44 @@ class IdleMarkerTests(unittest.TestCase):
             self.assertEqual(autotmux._status_cell(text).spans, [])
 
 
+class IdleThresholdConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = (autotmux.IDLE_HINT_SECONDS, autotmux.IDLE_STALE_SECONDS)
+
+    def tearDown(self):
+        autotmux.IDLE_HINT_SECONDS, autotmux.IDLE_STALE_SECONDS = self._saved
+
+    def _apply(self, body: str):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, 'config.toml')
+            with open(path, 'w') as handle:
+                handle.write(body)
+            with mock.patch.object(autotmux.config, 'CONFIG_PATH', path):
+                autotmux._apply_idle_thresholds()
+        return autotmux.IDLE_HINT_SECONDS, autotmux.IDLE_STALE_SECONDS
+
+    def test_thresholds_come_from_config(self):
+        self.assertEqual(
+            self._apply('[client]\nidle_hint = 60\nidle_stale = 120\n'),
+            (60, 120))
+
+    def test_a_stale_tier_below_the_hint_is_lifted(self):
+        """Otherwise every flagged session would render in the red tier."""
+        self.assertEqual(
+            self._apply('[client]\nidle_hint = 600\nidle_stale = 60\n'),
+            (600, 600))
+
+    def test_out_of_range_values_fall_back(self):
+        self.assertEqual(self._apply('[client]\nidle_hint = -5\n')[0], 300)
+
+    def test_absent_config_keeps_the_defaults(self):
+        self.assertEqual(self._apply('[client]\ngateways = ["a"]\n'),
+                         (300, 3600))
+
+    def test_a_broken_config_never_raises(self):
+        self.assertEqual(self._apply('[client\nbroken'), (300, 3600))
+
+
 class IdleRowTests(unittest.TestCase):
     @staticmethod
     def _state(session_entry):

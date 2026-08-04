@@ -128,6 +128,9 @@ server_alive_max = 3
 
 # Reuse SSH masters owned by something else instead of opening our own.
 # control_path = "~/.ssh/cm-2fa-%n"
+
+idle_hint = 300     # seconds of tmux quiet before a session is flagged
+idle_stale = 3600   # seconds before the flag escalates to the red tier
 ```
 
 ### Reusing externally managed SSH masters
@@ -530,7 +533,8 @@ gpu3   build    1   6:20:00      Active
 Idle time is measured against the *node's* clock, sampled in the same command
 as the activity stamps, so it stays correct when the laptop and the cluster
 disagree about the time. The dot is decoration only: the session name stays
-exactly what `Enter` attaches to.
+exactly what `Enter` attaches to. Both thresholds are `[client]` settings —
+`idle_hint` and `idle_stale`.
 
 ### Job expiry reminders
 

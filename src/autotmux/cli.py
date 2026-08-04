@@ -2268,6 +2268,24 @@ _IDLE_DOT = '●'
 _IDLE_STYLES = {'idle': 'yellow', 'stale': 'red'}
 
 
+def _apply_idle_thresholds() -> None:
+    """Adopt the configured idle thresholds, if the config can be read.
+
+    Kept as module state because ``build_session_rows`` is a plain function
+    shared by the TUI and its tests; a failed read simply leaves the defaults.
+    """
+    global IDLE_HINT_SECONDS, IDLE_STALE_SECONDS
+    try:
+        cfg = config.load_client()
+        hint = int(cfg['idle_hint'])
+        stale = int(cfg['idle_stale'])
+    except Exception:
+        return
+    IDLE_HINT_SECONDS = hint
+    # A "stale" tier below the hint would colour every flagged session red.
+    IDLE_STALE_SECONDS = max(stale, hint)
+
+
 def _coerce_idle_seconds(value):
     """Accept only a real, finite, non-negative idle count."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -2647,6 +2665,7 @@ class AutotmuxApp(App):
         except Exception:
             self._notify_cfg = dict(config.NOTIFY_DEFAULTS)
         self._warned_jobs = _load_warned_jobs()
+        _apply_idle_thresholds()
         # A timed-out NFS registry read keeps running on its daemon thread.
         # Single-flight it so manual/timer refreshes cannot strand all eight
         # general I/O slots behind the same unavailable mount.

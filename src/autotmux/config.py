@@ -116,6 +116,9 @@ CLIENT_DEFAULTS = {
     # OpenSSH expands the usual tokens, so "~/.ssh/cm-2fa-%n" resolves %n to
     # the gateway alias.
     'control_path': '',
+    # How long a tmux session must be quiet before the list flags it.
+    'idle_hint': 300,
+    'idle_stale': 3600,
 }
 
 _CLIENT_NUMBER_RULES = {
@@ -129,6 +132,8 @@ _CLIENT_NUMBER_RULES = {
     'control_persist':   (int,   1,   86_400),
     'server_alive_int':  (int,   1,   3_600),
     'server_alive_max':  (int,   1,   100),
+    'idle_hint':         (int,   10,  86_400),
+    'idle_stale':        (int,   10,  604_800),
 }
 
 # SSH destinations are argv items, never shell fragments.  Supporting ordinary
