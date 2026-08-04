@@ -152,27 +152,35 @@ class NotifyConfigTests(unittest.TestCase):
             with mock.patch.object(config, 'CONFIG_PATH', path):
                 return config.load_notify()
 
-    def test_absent_section_leaves_the_feature_off(self):
+    def test_desktop_works_without_any_webhook(self):
+        """The desktop route needs no endpoint, so an unset URL must not
+        silence it -- only the webhook route depends on webhook_url."""
         cfg = self._load('[client]\ngateways = ["a"]\n')
-        self.assertFalse(cfg['enabled'])
+        self.assertTrue(cfg['enabled'])
+        self.assertTrue(cfg['desktop'])
         self.assertEqual(cfg['webhook_url'], '')
 
-    def test_a_url_enables_it(self):
+    def test_a_url_configures_the_webhook_route(self):
         cfg = self._load(
             '[notify]\nwebhook_url = "https://hooks.slack.com/x"\n')
         self.assertTrue(cfg['enabled'])
         self.assertEqual(cfg['webhook_url'], 'https://hooks.slack.com/x')
         self.assertEqual(cfg['lead_time'], 3600)
 
-    def test_enabled_without_a_url_stays_off(self):
-        """Nothing to post to, so honouring `enabled` would only log errors."""
-        cfg = self._load('[notify]\nenabled = true\n')
-        self.assertFalse(cfg['enabled'])
-
-    def test_explicitly_disabled_stays_off_even_with_a_url(self):
+    def test_master_switch_silences_every_route(self):
         cfg = self._load(
             '[notify]\nenabled = false\nwebhook_url = "https://x.test/h"\n')
         self.assertFalse(cfg['enabled'])
+
+    def test_desktop_can_be_turned_off_on_its_own(self):
+        cfg = self._load('[notify]\ndesktop = false\n')
+        self.assertTrue(cfg['enabled'])
+        self.assertFalse(cfg['desktop'])
+
+    def test_non_boolean_flags_are_ignored(self):
+        cfg = self._load('[notify]\nenabled = "yes"\ndesktop = 1\n')
+        self.assertTrue(cfg['enabled'])
+        self.assertTrue(cfg['desktop'])
 
     def test_non_http_urls_are_rejected(self):
         """The daemon POSTs this unexamined; a file:/ftp: typo must not turn
@@ -185,7 +193,6 @@ class NotifyConfigTests(unittest.TestCase):
             with self.subTest(literal=literal):
                 cfg = self._load(f'[notify]\nwebhook_url = {literal}\n')
                 self.assertEqual(cfg['webhook_url'], '')
-                self.assertFalse(cfg['enabled'])
 
     def test_out_of_range_numbers_fall_back_to_defaults(self):
         cfg = self._load('[notify]\nwebhook_url = "https://x.test/h"\n'
@@ -195,7 +202,91 @@ class NotifyConfigTests(unittest.TestCase):
 
     def test_a_broken_config_file_never_raises(self):
         cfg = self._load('[notify\nnot toml at all')
-        self.assertFalse(cfg['enabled'])
+        self.assertEqual(cfg['webhook_url'], '')
+        self.assertEqual(cfg['lead_time'], 3600)
+
+
+class LocalNotifyTests(unittest.TestCase):
+    """Desktop popup on whichever machine runs the TUI."""
+
+    def _argv(self, platform, title='AutoTmux', text='ends in 45m'):
+        with mock.patch.object(notify.sys, 'platform', platform):
+            return notify.local_notify_argv(title, text)
+
+    def test_macos_uses_osascript(self):
+        argv = self._argv('darwin')
+        self.assertEqual(argv[:2], ['osascript', '-e'])
+        self.assertIn('display notification "ends in 45m"', argv[2])
+        self.assertIn('with title "AutoTmux"', argv[2])
+
+    def test_linux_uses_notify_send(self):
+        self.assertEqual(self._argv('linux'),
+                         ['notify-send', 'AutoTmux', 'ends in 45m'])
+
+    def test_unsupported_platform_yields_nothing(self):
+        self.assertIsNone(self._argv('win32'))
+
+    def test_applescript_quoting_cannot_break_out_of_the_string(self):
+        """A job name is untrusted text; it must stay data, not become code."""
+        argv = self._argv('darwin', text='a" & do shell script "touch /tmp/x')
+        script = argv[2]
+        self.assertNotIn('" & do shell script "', script)
+        self.assertIn('\\"', script)
+        # Exactly one unescaped quote pair opens and closes each literal.
+        self.assertEqual(script.count('"') - script.count('\\"'), 4)
+
+    def test_newlines_are_folded_out(self):
+        argv = self._argv('linux', text='line one\nline two')
+        self.assertEqual(argv[2], 'line one line two')
+
+    def test_empty_text_is_not_announced(self):
+        self.assertIsNone(self._argv('darwin', text='   '))
+
+    def test_a_missing_backend_is_not_fatal(self):
+        with mock.patch.object(notify.subprocess, 'run',
+                               side_effect=FileNotFoundError()):
+            self.assertFalse(notify.local_notify('t', 'x'))
+
+    def test_a_hung_backend_is_bounded(self):
+        with mock.patch.object(
+                notify.subprocess, 'run',
+                side_effect=notify.subprocess.TimeoutExpired('osascript', 5)):
+            self.assertFalse(notify.local_notify('t', 'x'))
+
+
+class JobsFromStateTests(unittest.TestCase):
+    """The gateway client already receives what a reminder needs, so it can
+    warn locally without running squeue itself."""
+
+    def test_jobs_are_collected_once_per_id(self):
+        state = {'nodes': {
+            'gpu1': {'info': {'job_id': '7', 'job_name': 'train',
+                              'state': 'RUNNING', 'time': '0:30:00'}},
+            'gpu2': {'info': {'job_id': '7', 'job_name': 'train',
+                              'state': 'RUNNING', 'time': '0:30:00'}},
+            'gpu3': {'info': {'job_id': '8', 'job_name': 'other',
+                              'state': 'RUNNING', 'time': '9:00:00'}},
+        }}
+        jobs = notify.jobs_from_state(state)
+        self.assertEqual(sorted(j['job_id'] for j in jobs), ['7', '8'])
+        self.assertEqual(next(j for j in jobs if j['job_id'] == '7')['node'],
+                         'gpu1')
+
+    def test_placeholder_and_local_rows_are_skipped(self):
+        state = {'nodes': {
+            'localhost': {'info': {}},
+            'login--x': {'info': {'job_id': '-'}},
+            'broken': {'info': 'not a dict'},
+            'gpu1': {'info': {'job_id': '9', 'time': '0:10:00',
+                              'state': 'RUNNING'}},
+        }}
+        self.assertEqual([j['job_id'] for j in notify.jobs_from_state(state)],
+                         ['9'])
+
+    def test_malformed_state_yields_nothing(self):
+        for state in ({}, {'nodes': None}, {'nodes': []}, 'nope', None):
+            with self.subTest(state=state):
+                self.assertEqual(notify.jobs_from_state(state), [])
 
 
 if __name__ == '__main__':

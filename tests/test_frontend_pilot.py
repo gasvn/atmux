@@ -937,6 +937,144 @@ class KeepAliveToggleTests(unittest.IsolatedAsyncioTestCase):
             app._ka_registry_names.assert_not_called()
 
 
+JOB_STATE = {
+    'updated': '2026-08-04 12:00:00',
+    'nodes': {
+        'gpu1': {'alive': True, 'socket': '/tmp/x', 'last_error': '',
+                 'info': {'job_id': '4172318', 'job_name': 'train',
+                          'state': 'RUNNING', 'time': '0:45:00'},
+                 'sessions': [['work', '1']]},
+        'gpu2': {'alive': True, 'socket': '/tmp/y', 'last_error': '',
+                 'info': {'job_id': '999', 'job_name': 'long',
+                          'state': 'RUNNING', 'time': '8:00:00'},
+                 'sessions': [['other', '1']]},
+    },
+}
+
+
+class ExpiringJobWarningTests(unittest.IsolatedAsyncioTestCase):
+    """A job nearing its limit is announced on the machine running the TUI,
+    once, and not again after a restart."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.warned_file = os.path.join(self.temp.name, 'warned.json')
+        self._saved_launch = autotmux._launch_daemon
+        autotmux._launch_daemon = lambda: (True, '')
+        self.patchers = [
+            mock.patch.object(autotmux, '_WARNED_JOBS_FILE', self.warned_file),
+            mock.patch.object(autotmux, '_daemon_running', return_value=True),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self.patchers):
+            patcher.stop()
+        autotmux._launch_daemon = self._saved_launch
+        self.temp.cleanup()
+
+    async def _run(self, state, cfg=None):
+        """Refresh once and report (desktop calls, in-app toasts, app)."""
+        desktop, toasts = [], []
+        with mock.patch.object(
+                autotmux.notify, 'local_notify',
+                side_effect=lambda *a, **k: desktop.append(a) or True):
+            app = autotmux.AutotmuxApp()
+            if cfg is not None:
+                app._notify_cfg = cfg
+            async with app.run_test() as pilot:
+                app.notify = lambda message, **kwargs: toasts.append(message)
+                app._refresh_table(state)
+                await pilot.pause()
+                app._refresh_table(state)   # a second tick must stay quiet
+                await pilot.pause()
+        return desktop, toasts, app
+
+    async def test_a_job_near_its_limit_is_announced_once(self):
+        desktop, toasts, app = await self._run(JOB_STATE)
+        self.assertEqual(len(desktop), 1)
+        self.assertEqual(len(toasts), 1)
+        self.assertIn('4172318', toasts[0])
+        self.assertIn('45m', toasts[0])
+        self.assertEqual(app._warned_jobs, {'4172318'})
+
+    async def test_a_job_with_hours_left_is_not_announced(self):
+        state = {'nodes': {'gpu2': JOB_STATE['nodes']['gpu2']}}
+        desktop, toasts, _ = await self._run(state)
+        self.assertEqual(desktop, [])
+        self.assertEqual(toasts, [])
+
+    async def test_a_restart_does_not_re_announce(self):
+        await self._run(JOB_STATE)
+        desktop, toasts, _ = await self._run(JOB_STATE)
+        self.assertEqual(desktop, [])
+        self.assertEqual(toasts, [])
+
+    async def test_desktop_off_still_shows_the_in_app_toast(self):
+        """`desktop` silences the OS popup only; the dashboard's own banner is
+        part of the UI the user is already looking at."""
+        cfg = dict(autotmux.config.NOTIFY_DEFAULTS)
+        cfg['desktop'] = False
+        desktop, toasts, _ = await self._run(JOB_STATE, cfg)
+        self.assertEqual(desktop, [])
+        self.assertEqual(len(toasts), 1)
+        self.assertIn('4172318', toasts[0])
+
+    async def test_master_switch_silences_everything(self):
+        cfg = dict(autotmux.config.NOTIFY_DEFAULTS)
+        cfg['enabled'] = False
+        desktop, toasts, _ = await self._run(JOB_STATE, cfg)
+        self.assertEqual(desktop, [])
+        self.assertEqual(toasts, [])
+
+    async def test_a_broken_notifier_never_breaks_the_refresh(self):
+        with mock.patch.object(autotmux.notify, 'jobs_from_state',
+                               side_effect=RuntimeError('boom')):
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                app._refresh_table(JOB_STATE)      # must not raise
+                await pilot.pause()
+                self.assertTrue(app.all_sessions)
+
+
+class WarnedJobPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.temp.name, 'warned.json')
+        self.patcher = mock.patch.object(
+            autotmux, '_WARNED_JOBS_FILE', self.path)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.temp.cleanup()
+
+    def test_round_trip(self):
+        autotmux._save_warned_jobs({'1', '2'})
+        self.assertEqual(autotmux._load_warned_jobs(), {'1', '2'})
+
+    def test_missing_file_is_empty_not_an_error(self):
+        self.assertEqual(autotmux._load_warned_jobs(), set())
+
+    def test_corrupt_file_is_ignored(self):
+        for junk in ('not json', '{"a": 1}', '[[1]]', ''):
+            with open(self.path, 'w') as handle:
+                handle.write(junk)
+            with self.subTest(junk=junk):
+                self.assertIsInstance(autotmux._load_warned_jobs(), set)
+
+    def test_an_unwritable_path_never_raises(self):
+        with mock.patch.object(autotmux, '_WARNED_JOBS_FILE',
+                               '/nonexistent-dir/warned.json'):
+            autotmux._save_warned_jobs({'1'})     # must not raise
+
+    def test_the_record_is_bounded(self):
+        autotmux._save_warned_jobs({str(i) for i in range(10_000)})
+        self.assertLessEqual(
+            len(autotmux._load_warned_jobs()), autotmux._WARNED_JOBS_LIMIT)
+
+
 class StatusSubtitleTests(unittest.TestCase):
     """`_status_subtitle` picks the message for an empty dashboard.
 

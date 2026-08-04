@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import subprocess
+import sys
 import urllib.error
 import urllib.request
 
@@ -75,6 +77,78 @@ def due_jobs(jobs, lead_time: float, already_sent) -> list[dict]:
         if 0 <= remaining <= lead_time:
             due.append({**job, 'remaining': remaining})
     return due
+
+
+def _applescript_quote(value: str) -> str:
+    """Escape a Python string into an AppleScript string literal."""
+    return value.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def local_notify_argv(title: str, text: str) -> list[str] | None:
+    """The desktop-notification command for this platform, or ``None``.
+
+    The text reaches these tools as argv, never a shell string, so a session or
+    job name can never be executed.  Newlines are folded out because both
+    backends treat the body as a single line anyway.
+    """
+    title = ' '.join(str(title).split())[:120]
+    text = ' '.join(str(text).split())[:_MAX_TEXT]
+    if not text:
+        return None
+    if sys.platform == 'darwin':
+        script = (f'display notification "{_applescript_quote(text)}" '
+                  f'with title "{_applescript_quote(title)}"')
+        return ['osascript', '-e', script]
+    if sys.platform.startswith('linux'):
+        return ['notify-send', title, text]
+    return None
+
+
+def local_notify(title: str, text: str, timeout: float = 5.0) -> bool:
+    """Best-effort desktop notification on the machine running the TUI.
+
+    A laptop that is asleep or lacks a notification daemon simply gets nothing;
+    this must never raise into the refresh path that draws the dashboard.
+    """
+    argv = local_notify_argv(title, text)
+    if not argv:
+        return False
+    try:
+        result = subprocess.run(
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=timeout)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def jobs_from_state(state: dict) -> list[dict]:
+    """Collect one job record per JobID from a dashboard state document.
+
+    The gateway client already receives every field the reminder needs, so it
+    can warn locally without a Slurm query of its own.
+    """
+    jobs: dict[str, dict] = {}
+    nodes = state.get('nodes') if isinstance(state, dict) else None
+    if not isinstance(nodes, dict):
+        return []
+    for node, info in nodes.items():
+        if not isinstance(info, dict):
+            continue
+        detail = info.get('info')
+        if not isinstance(detail, dict):
+            continue
+        job_id = str(detail.get('job_id') or '').strip()
+        if not job_id or job_id == '-' or job_id in jobs:
+            continue
+        jobs[job_id] = {
+            'job_id': job_id,
+            'job_name': detail.get('job_name') or '',
+            'state': detail.get('state') or '',
+            'time': detail.get('time') or '',
+            'node': node,
+        }
+    return list(jobs.values())
 
 
 def post(url: str, text: str, timeout: float) -> tuple[bool, str]:

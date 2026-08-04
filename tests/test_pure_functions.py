@@ -418,7 +418,11 @@ class DaemonControlUXTests(unittest.TestCase):
             os.close(read_fd)
 
     def test_detached_child_startup_failure_returns_nonzero_to_caller(self):
-        with tempfile.TemporaryDirectory() as td:
+        # Keep the runtime dir short. The default temp location is deep enough
+        # on macOS that _pick_base() rejects it for socket length and silently
+        # falls back to the real /tmp base -- so the test would inspect the
+        # developer's live daemon instead of its own isolated one.
+        with tempfile.TemporaryDirectory(dir='/tmp') as td:
             runtime = os.path.join(td, 'runtime')
             os.mkdir(runtime, 0o700)
             guard = os.path.join(td, 'daemon.guard')

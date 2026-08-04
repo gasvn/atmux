@@ -60,6 +60,9 @@ NOTIFY_DEFAULTS = {
     'webhook_url': '',      # Slack-shaped {"text": ...} endpoint
     'lead_time': 3600,      # seconds before expiry to send the reminder
     'timeout': 10,          # seconds to wait for the webhook
+    # Desktop notification on whichever machine runs the TUI.  Needs no
+    # endpoint, so unlike the webhook it is on by default.
+    'desktop': True,
 }
 
 _NOTIFY_NUMBER_RULES = {
@@ -595,13 +598,12 @@ def _notify_webhook_url(value) -> str | None:
 
 
 def _notify_normalized(cfg: dict) -> dict:
-    """No endpoint means nothing to post to, whatever ``enabled`` says.
+    """Hook for cross-field rules on the reminder config.
 
-    Applied on every return path so a caller can trust ``enabled`` alone and
-    never has to re-check the URL.
+    ``enabled`` is the master switch. Each delivery route carries its own
+    precondition instead -- the webhook needs ``webhook_url``, the desktop
+    route needs nothing -- so an unset URL must not silence desktop popups.
     """
-    if not cfg.get('webhook_url'):
-        cfg['enabled'] = False
     return cfg
 
 
@@ -628,11 +630,13 @@ def load_notify() -> dict:
         log.warning('ignoring invalid [notify] config (expected a table)')
         return _notify_normalized(cfg)
 
-    if 'enabled' in section:
-        if isinstance(section['enabled'], bool):
-            cfg['enabled'] = section['enabled']
-        else:
-            log.warning('ignoring invalid notify enabled (expected a boolean)')
+    for flag in ('enabled', 'desktop'):
+        if flag in section:
+            if isinstance(section[flag], bool):
+                cfg[flag] = section[flag]
+            else:
+                log.warning(
+                    f'ignoring invalid notify {flag} (expected a boolean)')
     if 'webhook_url' in section:
         url = _notify_webhook_url(section['webhook_url'])
         if url is None:

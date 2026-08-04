@@ -45,8 +45,8 @@ import rich.text
 from autotmux import __version__
 
 from autotmux import (
-    config, gateway as gateway_client, ipc, keepalive, lifecycle, paths,
-    warm_registry,
+    config, gateway as gateway_client, ipc, keepalive, lifecycle, notify,
+    paths, warm_registry,
 )
 
 STATE_FILE = paths.STATE_FILE
@@ -1272,6 +1272,38 @@ def _read_state_checked() -> tuple[bool, dict]:
     if _GATEWAY_POOL is not None:
         return _GATEWAY_POOL.fetch_state()
     return _read_json_dict_checked(STATE_FILE, _STATE_FILE_LIMIT)
+
+
+_WARNED_JOBS_FILE = os.path.join(paths.BASE, 'warned-jobs.json')
+_WARNED_JOBS_LIMIT = 4096
+
+
+def _load_warned_jobs() -> set:
+    """JobIDs already announced, so a TUI restart does not re-announce them."""
+    try:
+        with open(_WARNED_JOBS_FILE, encoding='utf-8') as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(value, list):
+        return set()
+    return {str(item) for item in value[:_WARNED_JOBS_LIMIT]
+            if isinstance(item, (str, int)) and not isinstance(item, bool)}
+
+
+def _save_warned_jobs(job_ids) -> None:
+    """Persist announced JobIDs. Best-effort: never break a refresh."""
+    try:
+        payload = json.dumps(sorted(job_ids)[:_WARNED_JOBS_LIMIT])
+        tmp = f'{_WARNED_JOBS_FILE}.{os.getpid()}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            handle.write(payload)
+        os.replace(tmp, _WARNED_JOBS_FILE)
+    except (OSError, ValueError, TypeError):
+        try:
+            os.unlink(tmp)
+        except (OSError, NameError, UnboundLocalError):
+            pass
 
 
 def read_state() -> dict:
@@ -2608,6 +2640,13 @@ class AutotmuxApp(App):
         self._restart_attempts = []   # time.monotonic() of recent daemon restarts
         self._crash_looping = False
         self._recovery_inflight = False
+        # Job-expiry reminders shown on this machine. Config is read once:
+        # a refresh must not stat the config file on every tick.
+        try:
+            self._notify_cfg = config.load_notify()
+        except Exception:
+            self._notify_cfg = dict(config.NOTIFY_DEFAULTS)
+        self._warned_jobs = _load_warned_jobs()
         # A timed-out NFS registry read keeps running on its daemon thread.
         # Single-flight it so manual/timer refreshes cannot strand all eight
         # general I/O slots behind the same unavailable mount.
@@ -2904,6 +2943,42 @@ class AutotmuxApp(App):
             exclusive=True, group='interactive-prewarm',
         )
 
+    def _maybe_warn_expiring_jobs(self, state) -> None:
+        """Pop a desktop notification for a job nearing its time limit.
+
+        The dashboard already holds every field the reminder needs, so the
+        machine running the TUI can warn on its own -- useful when the user is
+        at the laptop rather than reading a chat webhook.  Announcements are
+        remembered on disk so restarting the TUI does not re-announce a job.
+        """
+        cfg = self._notify_cfg
+        if not cfg.get('enabled'):
+            return
+        try:
+            jobs = notify.jobs_from_state(state)
+            due = notify.due_jobs(
+                jobs, float(cfg['lead_time']), self._warned_jobs)
+        except Exception:
+            return
+        if not due:
+            return
+        live = {str(job.get('job_id')) for job in jobs}
+        # Drop jobs that have left the queue so the record cannot grow forever.
+        self._warned_jobs = {j for j in self._warned_jobs if j in live}
+        for job in due:
+            job_id = str(job.get('job_id') or '')
+            text = notify.build_message(job, job['remaining'])
+            self._warned_jobs.add(job_id)
+            # The in-app banner is this dashboard's own UI, so it shows
+            # whenever reminders are on; `desktop` governs only the OS popup,
+            # which is what a user silences when they find it intrusive.
+            self.notify(text, severity='warning', timeout=10, markup=False)
+            if cfg.get('desktop'):
+                self.run_worker(
+                    _offload(notify.local_notify, 'AutoTmux', text),
+                    exclusive=False, group='job-warning')
+        _save_warned_jobs(self._warned_jobs)
+
     def _refresh_table(self, state=None) -> None:
         self._maybe_recover_daemon()
         if state is None:
@@ -2912,6 +2987,7 @@ class AutotmuxApp(App):
             state = {}
         _apply_daemon_ssh_settings(state)
         self._last_state = state
+        self._maybe_warn_expiring_jobs(state)
         rows = build_session_rows(state)
         rows = self._decorate_keepalive(rows, state)
         updated = state.get('updated', '?')

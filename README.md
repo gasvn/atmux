@@ -288,9 +288,10 @@ warm_orphan_interval = 30  # seconds between identity-safe warm-child sweeps
 # Reminder before a Slurm job hits its time limit. Sent by the daemon on the
 # login node, so it still arrives when the dashboard is closed. Off until a
 # webhook is set.
+enabled     = true         # master switch for every reminder route
+desktop     = true         # notification on the machine running the TUI
 webhook_url = ""           # Slack incoming webhook, or anything accepting
                            # {"text": "..."} (Discord, Teams, ntfy, relays)
-enabled     = true         # honoured only once webhook_url is set
 lead_time   = 3600         # seconds before expiry to send the reminder
 timeout     = 10           # seconds to wait for the webhook
 
@@ -431,6 +432,19 @@ It runs on the login node, so reminders arrive whether or not the dashboard is
 open. Each job is announced once; a job whose remaining time Slurm cannot
 report is skipped rather than guessed at, and a failed POST is retried on the
 next poll instead of being silently dropped.
+
+There are two independent routes, so no webhook is needed to be reminded:
+
+| Route | Where it appears | Needs |
+| :--- | :--- | :--- |
+| `desktop` | Notification Centre on macOS, `notify-send` on Linux — on whichever machine runs the TUI | nothing |
+| `webhook_url` | Slack/Discord/Teams/ntfy, sent by the login-node daemon | a URL |
+
+`desktop` is on by default and covers the "I'm at my laptop" case; the webhook
+covers "I'm away from it". The dashboard also shows its own banner whenever
+reminders are enabled — `desktop = false` silences only the OS popup. Announced
+JobIDs are remembered under the runtime dir, so restarting `atmux` does not
+re-announce a job you have already been told about.
 
 ### Keep-alive auto-renew
 
