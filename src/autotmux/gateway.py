@@ -999,16 +999,29 @@ class GatewayPool:
         sessions = []
         error = ""
         try:
+            # Same field order as the remote probe -- activity and window count
+            # lead so a session name may contain ':' -- so local sessions earn
+            # the same idle hint as remote ones.
             result = subprocess.run(
                 ["tmux", "list-sessions", "-F",
-                 "#{session_name}:#{session_windows}"],
+                 "#{session_activity}:#{session_windows}:#{session_name}"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, timeout=1.5)
             if result.returncode == 0:
+                now = int(time.time())
                 for line in (result.stdout or "").splitlines():
-                    name, separator, windows = line.partition(":")
-                    if name:
-                        sessions.append([name, windows if separator else "?"])
+                    parts = line.split(":", 2)
+                    if len(parts) != 3:
+                        continue
+                    activity, windows, name = (part.strip() for part in parts)
+                    if not name:
+                        continue
+                    entry = [name, windows or "?"]
+                    try:
+                        entry.append(max(0, now - int(activity)))
+                    except ValueError:
+                        pass
+                    sessions.append(entry)
         except FileNotFoundError:
             error = "local tmux is not installed"
         except subprocess.TimeoutExpired:

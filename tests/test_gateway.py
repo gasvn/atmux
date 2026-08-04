@@ -588,6 +588,44 @@ class LoginNodeRosterTests(_PoolFixture, unittest.TestCase):
         self.assertEqual(self._login_rows(state), ["login--login1"])
 
 
+class LocalSessionIdleTests(unittest.TestCase):
+    """The laptop's own tmux sessions earn the same idle hint as remote ones,
+    and parse with the same field order so a ':' in a name is safe."""
+
+    def _sessions(self, stdout, now=1_000_000):
+        result = SimpleNamespace(returncode=0, stdout=stdout)
+        with mock.patch.object(gateway.subprocess, 'run', return_value=result), \
+             mock.patch.object(gateway.time, 'time', return_value=now):
+            return gateway.GatewayPool._local_node_state()['sessions']
+
+    def test_idle_is_reported_for_local_sessions(self):
+        self.assertEqual(
+            self._sessions('999100:2:work\n999940:1:fresh\n'),
+            [['work', '2', 900], ['fresh', '1', 60]])
+
+    def test_local_session_name_may_contain_colons(self):
+        self.assertEqual(
+            self._sessions('999995:1:proj:sub\n'), [['proj:sub', '1', 5]])
+
+    def test_clock_skew_never_yields_negative_idle(self):
+        self.assertEqual(self._sessions('1000060:1:ahead\n'),
+                         [['ahead', '1', 0]])
+
+    def test_malformed_lines_are_skipped(self):
+        self.assertEqual(self._sessions('garbage\n\n:: \n999940:1:ok\n'),
+                         [['ok', '1', 60]])
+
+    def test_unparseable_activity_still_lists_the_session(self):
+        self.assertEqual(self._sessions('nope:1:work\n'), [['work', '1']])
+
+    def test_missing_tmux_is_reported_not_raised(self):
+        with mock.patch.object(gateway.subprocess, 'run',
+                               side_effect=FileNotFoundError()):
+            state = gateway.GatewayPool._local_node_state()
+        self.assertEqual(state['sessions'], [])
+        self.assertIn('tmux', state['last_error'])
+
+
 class ExternalControlPathTests(_PoolFixture, unittest.TestCase):
     """`[client] control_path` reuses SSH masters owned by something else (an
     MFA helper, say).  AutoTmux must ride those masters for every gateway
