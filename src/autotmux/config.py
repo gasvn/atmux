@@ -55,6 +55,13 @@ NOTES_PATH = os.environ.get(
     'AUTOTMUX_NOTES',
     os.path.expanduser('~/.config/autotmux/notes.json'),
 )
+# Session lifecycle, shared by the daemon that runs the command and the agent
+# that forwards it. A name tmux will accept as a target without ambiguity: it
+# uses ':' and '.' to address windows and panes, so a session carrying either
+# can never be referred to reliably afterwards. Narrower than tmux allows.
+NEW_SESSION_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_@+-]{0,63}$')
+SESSION_VERBS = ('kill', 'new')
+
 NOTE_LIMIT = 60             # one table cell's worth
 NOTES_MAX = 500             # a personal file, not a database
 _NOTES_FILE_LIMIT = 256 * 1024

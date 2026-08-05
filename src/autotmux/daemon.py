@@ -1691,6 +1691,107 @@ def _preview_session_known(node: str, session: str) -> bool:
         )
 
 
+def _run_node_tmux(node: str, tmux_args: list[str], source: str,
+                   timeout: float = 8.0) -> tuple[bool, str]:
+    """Run one short tmux command on a node under the shared network budget.
+
+    Mirrors _capture_pane's transport handling: the same per-node lease, the
+    same rule that only SSH's own status 255 counts as a transport failure, so
+    a tmux error ("session not found") never trips the circuit breaker for the
+    whole node.
+    """
+    lease = _network_coordinator.acquire(node, source)
+    if lease is None:
+        return False, 'node is busy with other work'
+    try:
+        if node == 'localhost':
+            cmd = ['tmux'] + list(tmux_args)
+        else:
+            if not _master_alive(node):
+                lease.failure('ControlMaster unavailable')
+                return False, 'no SSH connection to the node'
+            # ssh joins remaining args into one string for the remote shell.
+            remote = 'tmux ' + ' '.join(shlex.quote(a) for a in tmux_args)
+            cmd = ['ssh', '-o', f'ControlPath={_ctl_path(node)}',
+                   '-o', 'BatchMode=yes',
+                   '-o', 'StrictHostKeyChecking=accept-new',
+                   '-o', f'ConnectTimeout={CONNECT_TIMEOUT}', node, remote]
+        result = _hard_run(cmd, timeout=timeout, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True)
+        detail = ' '.join((result.stderr or '').split())[:200]
+        if result.returncode == 0:
+            lease.success()
+            return True, ''
+        if node == 'localhost' or result.returncode != 255:
+            lease.success()
+            return False, detail or 'tmux refused the command'
+        lease.failure(detail or 'SSH command failed')
+        return False, detail or 'SSH command failed'
+    except _CommandCapacityExhausted:
+        lease.neutral()
+        return False, 'the node command pool is full'
+    except subprocess.TimeoutExpired:
+        lease.failure('tmux command timed out')
+        return False, 'tmux command timed out'
+    except Exception as error:
+        detail = ' '.join(str(error).split())[:200] or 'tmux command failed'
+        lease.failure(detail)
+        return False, detail
+
+
+def _apply_session_change(node: str, session: str, verb: str) -> None:
+    """Reflect a kill/new in the published state without waiting for a poll.
+
+    The session list refreshes every 15s; leaving a killed session on screen
+    that long makes the key look like it did nothing, and invites a second
+    press. The next real probe overwrites this either way, so an optimistic
+    edit can only be briefly wrong, never durably.
+    """
+    with _lock:
+        info = _known_nodes_info.get(node)
+        if not isinstance(info, dict):
+            return
+        sessions = [item for item in info.get('sessions', [])
+                    if isinstance(item, list) and item]
+        if verb == 'kill':
+            info['sessions'] = [item for item in sessions
+                                if item[0] != session]
+        elif not any(item[0] == session for item in sessions):
+            sessions.append([session, '1', int(time.time())])
+            info['sessions'] = sessions
+    _write_status()
+
+
+def _handle_session_request(node: str, request: dict) -> dict:
+    verb = request.get('verb')
+    session = request.get('session')
+    if verb not in config.SESSION_VERBS:
+        return {'ok': False, 'kind': 'invalid', 'reason': 'invalid session verb'}
+    if not isinstance(session, str) or not session:
+        return {'ok': False, 'kind': 'invalid', 'reason': 'invalid session'}
+    if verb == 'new':
+        if not config.NEW_SESSION_RE.fullmatch(session):
+            return {'ok': False, 'kind': 'invalid',
+                    'reason': 'name must be letters, digits, _ @ + - '
+                              '(no ":" or "." — tmux uses those for targets)'}
+        args = ['new-session', '-d', '-s', session]
+    else:
+        if len(session.encode('utf-8', errors='surrogatepass')) > 4096:
+            return {'ok': False, 'kind': 'invalid', 'reason': 'invalid session'}
+        if not _preview_session_known(node, session):
+            return {'ok': False, 'kind': 'not-found',
+                    'reason': 'tmux session no longer exists'}
+        args = ['kill-session', '-t', session]
+    ok, reason = _run_node_tmux(node, args, f'session-{verb}')
+    if not ok:
+        state = _network_coordinator.snapshot(node)
+        return {'ok': False,
+                'kind': 'busy' if state.get('busy') else 'unavailable',
+                'reason': reason or f'tmux {verb} failed', 'network': state}
+    _apply_session_change(node, session, verb)
+    return {'ok': True, 'session': session, 'verb': verb}
+
+
 def _handle_preview_request(request: dict) -> dict:
     action = request.get('action', 'preview')
     node = request.get('node')
@@ -1721,6 +1822,8 @@ def _handle_preview_request(request: dict) -> dict:
 
     if action == 'status':
         return {'ok': True, 'network': _network_coordinator.snapshot(node)}
+    if action == 'session':
+        return _handle_session_request(node, request)
     if action != 'preview':
         return {'ok': False, 'kind': 'invalid', 'reason': 'invalid action'}
     session = request.get('session')

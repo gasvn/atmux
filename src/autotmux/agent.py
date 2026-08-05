@@ -193,12 +193,25 @@ def handle_rpc(request: dict) -> dict:
                 "daemon_starting": starting}
     if action == "state":
         return _state_response()
-    if action in {"preview", "report", "status"}:
+    if action in {"preview", "report", "status", "session"}:
         node = request.get("node")
         if not isinstance(node, str) or _NODE_RE.fullmatch(node) is None:
             return {"ok": False, "kind": "invalid", "reason": "invalid node"}
         forwarded = {"action": action, "node": node}
-        if action == "preview":
+        if action == "session":
+            # The daemon validates the verb and the name; bound them here too
+            # so a malformed request never reaches it as an oversized frame.
+            verb = request.get("verb")
+            if verb not in config.SESSION_VERBS:
+                return {"ok": False, "kind": "invalid",
+                        "reason": "invalid session verb"}
+            try:
+                forwarded["session"] = _bounded_text(
+                    request.get("session"), maximum=4096, required=True)
+            except ValueError as error:
+                return {"ok": False, "kind": "invalid", "reason": str(error)}
+            forwarded["verb"] = verb
+        elif action == "preview":
             try:
                 forwarded["session"] = _bounded_text(
                     request.get("session"), maximum=4096, required=True)

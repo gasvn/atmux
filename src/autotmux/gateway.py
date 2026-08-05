@@ -1456,6 +1456,50 @@ class GatewayPool:
                 node, session, content, response.get("captured_epoch"))
         return response
 
+    def session_command(self, node: str, session: str, verb: str) -> dict:
+        """Kill or create one tmux session on a node.
+
+        Not retried on "unavailable" the way a preview is: a preview is a read
+        and costs nothing to repeat, while these change state, and a retry
+        after an ambiguous transport failure could create a second session or
+        kill something the user has since recreated.
+        """
+        if verb not in config.SESSION_VERBS:
+            return {"ok": False, "kind": "invalid",
+                    "reason": "invalid session verb"}
+        if (not isinstance(session, str) or not session
+                or len(session.encode("utf-8", "surrogatepass")) > 4096):
+            return {"ok": False, "kind": "invalid",
+                    "reason": "invalid tmux session"}
+        if node == "localhost":
+            if verb == "new" and not config.NEW_SESSION_RE.fullmatch(session):
+                return {"ok": False, "kind": "invalid",
+                        "reason": 'name must be letters, digits, _ @ + - '
+                                  '(no ":" or "." — tmux uses those for targets)'}
+            argv = (["tmux", "new-session", "-d", "-s", session]
+                    if verb == "new" else
+                    ["tmux", "kill-session", "-t", session])
+            try:
+                result = subprocess.run(
+                    argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=min(
+                        8.0, float(self.settings["state_timeout"])))
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "kind": "unavailable",
+                        "reason": f"local tmux {verb} timed out"}
+            except OSError as error:
+                return {"ok": False, "kind": "unavailable",
+                        "reason": _safe_error(error)}
+            if result.returncode != 0:
+                return {"ok": False, "kind": "not-found",
+                        "reason": _safe_error(result.stderr)
+                                  or f"local tmux {verb} failed"}
+            return {"ok": True, "session": session, "verb": verb,
+                    "gateway": "local"}
+        return self._rpc_failover(
+            {"action": "session", "session": session, "verb": verb},
+            node=node, retry_unavailable=False)
+
     def keepalive_entries(self, require_fresh: bool = False) -> list[dict]:
         with self._lock:
             cached = copy.deepcopy(self._keepalive_entries)

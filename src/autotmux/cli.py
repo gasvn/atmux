@@ -2658,17 +2658,21 @@ class NoteScreen(ModalScreen[str | None]):
     #note_hint { color: $text-muted; margin-bottom: 1; }
     """
 
-    def __init__(self, session: str, current: str) -> None:
+    def __init__(self, session: str, current: str, *,
+                 prompt: str = 'what is this run for?',
+                 hint: str = 'Enter saves · empty clears · Esc cancels') -> None:
         super().__init__()
         self._session = str(session)
         self._current = str(current or '')
+        self._prompt = str(prompt)
+        self._hint = str(hint)
 
     def compose(self) -> ComposeResult:
         with Vertical(id='note_dialog'):
-            yield Static(f'Note for {self._session}', id='note_title')
-            yield Static('Enter saves · empty clears · Esc cancels',
-                         id='note_hint')
-            yield Input(value=self._current, placeholder='what is this run for?',
+            yield Static(self._session if ' ' in self._session
+                         else f'Note for {self._session}', id='note_title')
+            yield Static(self._hint, id='note_hint')
+            yield Input(value=self._current, placeholder=self._prompt,
                         max_length=config.NOTE_LIMIT, id='note_input')
 
     def on_mount(self) -> None:
@@ -2679,6 +2683,48 @@ class NoteScreen(ModalScreen[str | None]):
 
     def action_cancel_note(self) -> None:
         self.dismiss(None)
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """A yes/no that defaults to no.
+
+    Killing a session throws away work that cannot be recovered -- the whole
+    point of these sessions is that they outlive the connection -- so the
+    destructive answer is never the one a stray keypress lands on.
+    """
+
+    BINDINGS = [
+        Binding("escape", "refuse", "Cancel"),
+        Binding("n", "refuse", "Cancel"),
+        Binding("y", "accept", "Confirm"),
+    ]
+
+    CSS = """
+    ConfirmScreen { align: center middle; background: $background 60%; }
+    #confirm_dialog {
+        width: 62; max-width: 90%; height: auto;
+        border: round $error; background: $surface; padding: 1 2;
+    }
+    #confirm_title { text-style: bold; color: $error; }
+    #confirm_hint { color: $text-muted; }
+    """
+
+    def __init__(self, title: str, detail: str) -> None:
+        super().__init__()
+        self._title = str(title)
+        self._detail = str(detail)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='confirm_dialog'):
+            yield Static(self._title, id='confirm_title')
+            yield Static(self._detail)
+            yield Static('y = yes · Esc / n = no', id='confirm_hint')
+
+    def action_accept(self) -> None:
+        self.dismiss(True)
+
+    def action_refuse(self) -> None:
+        self.dismiss(False)
 
 
 class HelpScreen(ModalScreen[None]):
@@ -3012,6 +3058,8 @@ class AutotmuxApp(App):
         Binding("j", "toggle_jobs_view", "Jobs panel"),
         Binding("g", "manage_connections", "Login nodes"),
         Binding("e", "edit_note", "Note", show=False),
+        Binding("n", "new_session", "New session", show=False),
+        Binding("x", "kill_session", "Kill session", show=False),
         Binding("question_mark", "show_help", "Help"),
         Binding("q", "app.quit", "Quit"),
         Binding("r", "refresh_table", "Refresh now", show=False),
@@ -3035,6 +3083,10 @@ class AutotmuxApp(App):
             ("o", "Attach in a separate window, keeping this table", "survives"),
             ("s", "Plain SSH shell on that node", "dies on exit"),
             ("t", "Local tmux on this machine", "survives"),
+        ]),
+        ("Sessions", [
+            ("n", "Create a named session on that node", "detached"),
+            ("x", "Kill the selected session (asks first)", "cannot undo"),
         ]),
         ("Allocation", [
             ("k", "Resubmit the batch script before walltime", "batch only"),
@@ -4433,6 +4485,84 @@ class AutotmuxApp(App):
         elif nest and not step_ok:
             self.notify('outer tmux passthrough was unavailable',
                         severity='warning', timeout=6, markup=False)
+
+    async def _session_command(self, node: str, session: str,
+                               verb: str) -> tuple[bool, str]:
+        """Ask whoever owns the node to kill or create a session."""
+        if _GATEWAY_POOL is not None:
+            response = await _offload_for(
+                float(_GATEWAY_POOL.settings['state_timeout']) + 2.0,
+                _GATEWAY_POOL.session_command, node, session, verb)
+        else:
+            response = await _offload_for(
+                12.0, ipc.request, PREVIEW_SOCKET,
+                {'action': 'session', 'node': node,
+                 'session': session, 'verb': verb}, 10.0)
+        if not isinstance(response, dict):
+            return False, 'malformed reply'
+        if response.get('ok'):
+            return True, ''
+        return False, ' '.join(
+            str(response.get('reason') or 'command refused').split())[:160]
+
+    async def action_kill_session(self) -> None:
+        node, sess = self.selected_node, self.selected_session
+        if not node or not sess or sess in (_OFFLINE_SESSION,
+                                            _START_SHELL_SESSION):
+            self.notify('select a real session to kill', severity='warning',
+                        timeout=4, markup=False)
+            return
+
+        async def finish(confirmed) -> None:
+            if not confirmed:
+                return
+            try:
+                ok, why = await self._session_command(node, sess, 'kill')
+            except Exception as error:
+                ok, why = False, ' '.join(str(error).split())[:160]
+            if ok:
+                self.notify(f'killed {_session_label(sess)} on {node}',
+                            timeout=5, markup=False)
+                await self.action_refresh_table()
+            else:
+                self.notify(f'could not kill {_session_label(sess)}: {why}',
+                            severity='error', timeout=9, markup=False)
+
+        self.push_screen(
+            ConfirmScreen(
+                f'Kill {_session_label(sess)} on {node}?',
+                'Everything running inside it is lost. This cannot be undone.'),
+            lambda confirmed: self.run_worker(finish(confirmed)))
+
+    async def action_new_session(self) -> None:
+        node = self.selected_node
+        if not node:
+            return
+        if node != 'localhost' and not _valid_node(node):
+            self.notify(f'invalid node name: {node!r}', severity='error',
+                        timeout=5, markup=False)
+            return
+
+        async def finish(name) -> None:
+            if not name or not str(name).strip():
+                return
+            wanted = str(name).strip()
+            try:
+                ok, why = await self._session_command(node, wanted, 'new')
+            except Exception as error:
+                ok, why = False, ' '.join(str(error).split())[:160]
+            if ok:
+                self.notify(f'created {wanted} on {node}', timeout=5,
+                            markup=False)
+                await self.action_refresh_table()
+            else:
+                self.notify(f'could not create {wanted}: {why}',
+                            severity='error', timeout=9, markup=False)
+
+        self.push_screen(
+            NoteScreen(f'new session on {node}', '',
+                       prompt='session name', hint='letters, digits, _ @ + -'),
+            lambda name: self.run_worker(finish(name)))
 
     async def action_edit_note(self) -> None:
         sess = self.selected_session
