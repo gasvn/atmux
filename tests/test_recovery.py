@@ -103,7 +103,9 @@ class InteractiveCommandTests(unittest.TestCase):
             returncode, error = cli._run_user_command(['tmux', 'attach'])
         self.assertEqual(returncode, 127)
         self.assertIn('tmux', error)
-        self.assertIn('No such file', error)
+        # Not the raw strerror: "tmux: No such file or directory" reads as a
+        # missing session, when it is nearly always a PATH problem.
+        self.assertIn('not on PATH', error)
 
     def test_nonzero_status_is_reported_after_terminal_redraw(self):
         app = cli.AutotmuxApp()

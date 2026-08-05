@@ -8,6 +8,7 @@ run only after the user explicitly presses Enter, s, or o.
 import asyncio
 from dataclasses import dataclass
 import enum
+import errno
 import fcntl
 from functools import partial
 import hashlib
@@ -341,6 +342,28 @@ def _time_left_label(value) -> str:
     if hours:
         return f'{hours}h{minutes:02d}' if minutes else f'{hours}h'
     return f'{minutes}m'
+
+
+def _gateway_health_note(items) -> str:
+    """What to say about the gateways we are *not* using, which is usually
+    nothing.
+
+    The old text was ``1/4 healthy``, which read as "three are broken" when in
+    fact three had simply never been needed: sticky routing sends every request
+    to one gateway, so the others hold no successful probe and are counted
+    ``unknown``.  Saying nothing while nothing is wrong matches the STATUS
+    column, and leaves a warning here meaning what a warning should.
+    """
+    if not isinstance(items, list):
+        return ''
+    down = sorted(
+        str(entry.get('name') or '?')
+        for entry in items
+        if isinstance(entry, dict) and entry.get('state') in ('backoff', 'probing')
+    )
+    if not down:
+        return ''
+    return f" · ⚠ unreachable: {', '.join(down)}"
 
 
 def _load_label(load, cpus) -> str:
@@ -1220,6 +1243,13 @@ def _run_user_command(argv) -> tuple[int, str]:
         return subprocess.call(argv), ''
     except OSError as error:
         command = os.path.basename(str(argv[0])) if argv else 'command'
+        if error.errno == errno.ENOENT:
+            # "tmux: No such file or directory" reads as a missing *session*.
+            # It is nearly always a PATH problem instead, and a surprising one:
+            # a window opened from a GUI (a clicked atmux:// link, an editor's
+            # terminal) inherits /usr/bin:/bin and not the user's PATH.
+            return 127, (f'{command} is not on PATH — install it, or launch '
+                         f'atmux from a shell where {command} works')
         detail = error.strerror or str(error)
         return 127, f'{command}: {detail}'
 
@@ -2257,9 +2287,9 @@ def build_session_rows(state: dict) -> list:
     """Turn daemon state into a flat list of display rows.
 
     Each row: (node, session, wins, time_left, status, cpu, load)
-    `cpu` is the nproc the slurm allocation gave us; `load` is the 1-min
-    load average. Together they tell the user whether attaching will be
-    snappy or sluggish.
+    `cpu` is how many processors the machine has and `load` is its 1-min load
+    average -- both node-wide, so dividing one by the other means something.
+    Together they tell the user whether attaching will be snappy or sluggish.
     """
     rows = []
     if not isinstance(state, dict):
@@ -2790,6 +2820,14 @@ class AutotmuxApp(App):
     # Without this the header reads "AutotmuxApp", i.e. the class name.
     TITLE = 'atmux'
 
+    # Textual's palette is always the rightmost thing in the footer, so its
+    # "^p palette" was pushing the app's own keys off the end below ~125
+    # columns -- "q Quit" rendered as "q Q". This app registers no commands of
+    # its own, so the palette only ever offered Textual's built-ins, and it was
+    # the one footer entry `?` did not explain. Dropping it buys back the width
+    # that the documented keys need.
+    ENABLE_COMMAND_PALETTE = False
+
     def get_driver_class(self):
         base = super().get_driver_class()
         try:
@@ -2839,7 +2877,7 @@ class AutotmuxApp(App):
     # so the visible row stays readable on a narrow terminal.
     BINDINGS = [
         Binding("s", "open_shell", "SSH to node"),
-        Binding("o", "new_window", "Attach in new window"),
+        Binding("o", "new_window", "New window"),
         Binding("k", "toggle_keepalive", "Auto-renew job"),
         Binding("j", "toggle_jobs_view", "Jobs panel"),
         Binding("g", "manage_connections", "Login nodes"),
@@ -2894,7 +2932,7 @@ class AutotmuxApp(App):
         ("LEFT", "Time until Slurm ends the job"),
         ("·N", "That session has N windows (hidden when 1)"),
         ("STATUS", "Only fills in when something is wrong"),
-        ("LOAD", "1-min load / cores; 35.0/1 is oversubscribed"),
+        ("LOAD", "1-min load / cores; near cores means busy"),
     ]
 
     title = reactive(f"AutoTmux v{__version__}")
@@ -3750,8 +3788,6 @@ class AutotmuxApp(App):
         if recovering:
             extra += f" · ⚠ network recovery: {', '.join(sorted(recovering))}"
         if gateway_mode:
-            total = gateway_info.get('total', 0)
-            healthy = gateway_info.get('healthy', 0)
             via = gateway_active or 'selecting…'
             gateway_items = gateway_info.get('items', [])
             if not isinstance(gateway_items, list):
@@ -3762,7 +3798,8 @@ class AutotmuxApp(App):
             latency = item.get('latency_ms') if isinstance(item, dict) else None
             latency_text = (f' {float(latency):.0f}ms'
                             if isinstance(latency, (int, float)) else '')
-            extra += f" · gateway {via}{latency_text} · {healthy}/{total} healthy"
+            extra += f" · gateway {via}{latency_text}"
+            extra += _gateway_health_note(gateway_items)
             agent_version = gateway_info.get('agent_version')
             if (isinstance(agent_version, str) and agent_version
                     and agent_version != __version__):

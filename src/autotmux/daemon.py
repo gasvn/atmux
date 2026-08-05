@@ -2627,9 +2627,16 @@ def _session_probe_script() -> str:
         " -F '#{session_activity}:#{session_windows}:#{session_name}'"
         " 2>/dev/null;"
         " printf '\\000AUTOTMUX_NODEINFO\\000\\n';"
-        # Keep nproc on its own line even on failure so a load value cannot
-        # slide into the CPU slot.
-        " (nproc 2>/dev/null || echo '?');"
+        # Keep the CPU count on its own line even on failure so a load value
+        # cannot slide into the CPU slot.
+        #
+        # --all, not plain nproc: nproc reports the CPUs this process may run
+        # on, and an SSH session adopted into a job's cgroup sees as few as 1.
+        # The load average on the next line is node-wide, so pairing it with an
+        # affinity-limited count made an idle 96-core node read as "4.2/1",
+        # four times oversubscribed. Both numbers now describe the machine.
+        " (nproc --all 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null"
+        " || echo '?');"
         " LC_ALL=C uptime | sed -n 's/.*load average: //p';"
         " (date +%s 2>/dev/null || echo '?');"
         " printf '\\000AUTOTMUX_TMUXINFO\\000\\n';"

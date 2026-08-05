@@ -1197,12 +1197,37 @@ class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
         shown = {b.key: b.description
                  for b in autotmux.AutotmuxApp.BINDINGS if b.show}
         self.assertEqual(shown['s'], 'SSH to node')
-        self.assertEqual(shown['o'], 'Attach in new window')
+        # Shortened from "Attach in new window", which alone pushed the footer
+        # past 120 columns and made Textual clip "q Quit" to "q Q".
+        self.assertEqual(shown['o'], 'New window')
         self.assertEqual(shown['k'], 'Auto-renew job')
         self.assertEqual(shown['g'], 'Login nodes')
         for description in shown.values():
             self.assertEqual(description, description.strip())
             self.assertTrue(description[:1].isupper() or description[:1] == '↑')
+
+    def test_the_footer_fits_a_realistic_terminal(self):
+        """A clipped footer turns "q Quit" into "q Q", which reads as a typo.
+
+        Textual lays each shown binding out as `key description` with a space
+        either side and clips whatever overflows, silently. This measures the
+        same arithmetic so a future label cannot quietly push a key off the end.
+        """
+        # The footer prints the key *symbol*, not the binding's name, so
+        # `question_mark` costs one column and not thirteen.
+        symbols = {'enter': '⏎', 'question_mark': '?'}
+        shown = [b for b in autotmux.AutotmuxApp.BINDINGS if b.show]
+        width = sum(len(symbols.get(b.key, b.key)) + 1 + len(b.description) + 2
+                    for b in shown)
+        # `enter` is advertised by the table, not the app, so add it back.
+        width += len('⏎') + 1 + len('Attach') + 2
+        self.assertLessEqual(width, 110, f'footer needs {width} columns')
+
+    def test_the_command_palette_is_off(self):
+        """It sat rightmost in the footer, pushing the app's own keys off, and
+        was the one entry `?` could not explain -- this app registers no
+        commands, so it only ever offered Textual's built-ins."""
+        self.assertFalse(autotmux.AutotmuxApp.ENABLE_COMMAND_PALETTE)
 
     def test_rare_keys_are_hidden_but_still_bound(self):
         by_key = {b.key: b for b in autotmux.AutotmuxApp.BINDINGS}

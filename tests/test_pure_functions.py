@@ -792,6 +792,19 @@ class CompactCellTests(unittest.TestCase):
         self.assertEqual(autotmux._load_label('', ''), '')
         self.assertEqual(autotmux._load_label('n/a', '12'), 'n/a/12')
 
+    def test_cpu_count_is_probed_machine_wide(self):
+        """The load average is node-wide, so the divisor has to be too.
+
+        Plain `nproc` reports the CPUs the calling process may run on, and an
+        SSH session adopted into a Slurm job's cgroup sees as few as one -- so
+        an idle 96-core node reported `4.2/1` and read as four times
+        oversubscribed.
+        """
+        script = d._session_probe_script()
+        self.assertIn('nproc --all', script)
+        # And a machine without GNU coreutils still answers with something.
+        self.assertIn('getconf _NPROCESSORS_ONLN', script)
+
     def test_an_uneventful_status_is_left_blank(self):
         """"Active" on every healthy row is a constant that buries the rows
         which do have something to report."""
@@ -827,6 +840,49 @@ class CompactCellTests(unittest.TestCase):
         label = autotmux._session_label(autotmux._START_SHELL_SESSION)
         self.assertEqual(label, '<shell>')
         self.assertLessEqual(len(label), 8)
+
+
+class GatewayHealthNoteTests(unittest.TestCase):
+    """The subtitle used to say `1/4 healthy` whenever three gateways had
+    simply never been needed, which reads as three broken ones."""
+
+    def test_silent_when_nothing_has_failed(self):
+        items = [{'name': 'k6', 'state': 'healthy'},
+                 {'name': 'k7', 'state': 'unknown'},
+                 {'name': 'b8', 'state': 'unknown'}]
+        self.assertEqual(autotmux._gateway_health_note(items), '')
+
+    def test_names_the_gateways_that_are_actually_failing(self):
+        items = [{'name': 'k6', 'state': 'healthy'},
+                 {'name': 'k7', 'state': 'backoff'},
+                 {'name': 'b8', 'state': 'probing'}]
+        note = autotmux._gateway_health_note(items)
+        self.assertIn('b8', note)
+        self.assertIn('k7', note)
+        self.assertNotIn('k6', note)
+
+    def test_shrugs_at_a_malformed_payload(self):
+        for items in (None, 'nope', [None, 3, {'state': 'backoff'}]):
+            self.assertNotIn('None', autotmux._gateway_health_note(items))
+
+
+class MissingBinaryMessageTests(unittest.TestCase):
+    def test_enoent_explains_itself(self):
+        """`tmux: No such file or directory` reads as a missing *session*."""
+        with mock.patch.object(
+                autotmux.subprocess, 'call',
+                side_effect=FileNotFoundError(2, 'No such file or directory')):
+            code, error = autotmux._run_user_command(['/opt/bin/tmux', 'ls'])
+        self.assertEqual(code, 127)
+        self.assertIn('tmux is not on PATH', error)
+        self.assertNotIn('No such file or directory', error)
+
+    def test_other_errors_keep_their_own_words(self):
+        with mock.patch.object(autotmux.subprocess, 'call',
+                               side_effect=PermissionError(13, 'Permission denied')):
+            code, error = autotmux._run_user_command(['/opt/bin/tmux'])
+        self.assertEqual(code, 127)
+        self.assertIn('Permission denied', error)
 
 
 class IdleThresholdConfigTests(unittest.TestCase):
