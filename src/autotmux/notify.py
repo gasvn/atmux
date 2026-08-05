@@ -304,6 +304,48 @@ def parse_attach_url(url: str) -> tuple[str, str] | None:
     return node, session
 
 
+# CSI sequences, OSC strings (which tmux emits for titles), and lone two-byte
+# escapes. A captured pane is full of these and none of them mean anything in
+# a chat message.
+_ANSI_RE = re.compile(
+    r'\x1b\[[0-9;?]*[ -/]*[@-~]'
+    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'
+    r'|\x1b[@-Z\\-_]')
+_CONTROL_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
+
+TAIL_LIMIT = 120
+
+
+def last_output_line(content, limit: int = TAIL_LIMIT) -> str:
+    """The last line of a pane that actually says something.
+
+    "Session X has been quiet for 15m" tells you to go and look; the line it
+    stopped on usually tells you whether you need to.  ``Epoch 40/40 done`` and
+    ``CUDA out of memory`` call for very different responses.
+
+    Everything a terminal puts on screen that is not text -- colour, cursor
+    moves, title sequences -- is removed rather than escaped, and the result is
+    capped, because it is going into a chat message.
+
+    This reads a screen, not a log, so it answers well for the batch jobs the
+    idle notice exists for and poorly for a full-screen program, whose bottom
+    line is a status bar no matter what it has been doing.  There is no fixing
+    that from here: for a TUI the last line genuinely is the status bar.
+    """
+    if not isinstance(content, str) or not content:
+        return ''
+    for raw in reversed(content.splitlines()[-200:]):
+        line = _CONTROL_RE.sub('', _ANSI_RE.sub('', raw))
+        line = ' '.join(line.split())
+        # Require a letter or a digit somewhere. Rules, borders, spinners and
+        # bare prompts are the last thing on screen often enough to be worth
+        # stepping over, and none of them say anything.
+        if line and any(ch.isalnum() for ch in line):
+            limit = max(8, int(limit))
+            return line if len(line) <= limit else line[:limit - 1] + '…'
+    return ''
+
+
 def build_idle_message(entry: dict, *, link: bool = False) -> str:
     """Say what stopped and for how long, and why that is worth a look.
 
@@ -318,6 +360,9 @@ def build_idle_message(entry: dict, *, link: bool = False) -> str:
     job_part = f' (job {job})' if job else ''
     text = (f'AutoTmux: tmux session {session} on {node}{job_part} has shown '
             f'no output for {quiet} — it has probably finished or stalled.')
+    tail = str(entry.get('tail') or '').strip()
+    if tail:
+        text += f'\nLast line: {tail}'
     if link:
         url = attach_url(node, session)
         if url:

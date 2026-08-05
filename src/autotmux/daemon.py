@@ -1327,6 +1327,25 @@ def _notify_expiring_jobs(node_infos: dict) -> None:
             log.warning(f'could not start reminder thread: {error}')
 
 
+def _idle_tail(entry: dict) -> str:
+    """The line the session stopped on, or '' if it cannot be had cheaply.
+
+    Runs on the delivery thread, once per quiet spell rather than per poll, and
+    under the same per-node network budget as everything else -- so a node that
+    is already struggling spends nothing here. A notice with no quoted line is
+    the old notice, which is still worth sending; a notice delayed behind a
+    hanging capture is not.
+    """
+    if not _notify_cfg.get('idle_tail'):
+        return ''
+    try:
+        content = _capture_pane(entry['node'], entry['session'], 'idle-notice')
+        return notify.last_output_line(content)
+    except Exception as error:
+        log.warning(f'idle notice tail unavailable: {error}')
+        return ''
+
+
 def _notify_idle_sessions(node: str, info: dict) -> None:
     """Announce a session that has stopped producing output.
 
@@ -1365,7 +1384,8 @@ def _notify_idle_sessions(node: str, info: dict) -> None:
                                 ttl=float(_notify_cfg['idle_cooldown'])):
             return
         text = notify.build_idle_message(
-            entry, link=bool(_notify_cfg.get('attach_link')))
+            {**entry, 'tail': _idle_tail(entry)},
+            link=bool(_notify_cfg.get('attach_link')))
         ok, error = notify.post(
             _notify_cfg['webhook_url'], text, float(_notify_cfg['timeout']))
         if ok:

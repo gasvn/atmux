@@ -79,6 +79,12 @@ NOTIFY_DEFAULTS = {
     # Desktop notification on whichever machine runs the TUI.  Needs no
     # endpoint, so unlike the webhook it is on by default.
     'desktop': True,
+    # Quote the line the session stopped on. "Epoch 40/40 done" and "CUDA out
+    # of memory" are the same event to the idle check and completely different
+    # to the reader, so this is most of what makes the notice actionable. It
+    # does mean one line of terminal output leaves the cluster, so it is a
+    # separate switch from the notice itself.
+    'idle_tail': True,
 }
 
 _NOTIFY_NUMBER_RULES = {
@@ -669,7 +675,7 @@ def load_notify() -> dict:
         log.warning('ignoring invalid [notify] config (expected a table)')
         return _notify_normalized(cfg)
 
-    for flag in ('enabled', 'desktop', 'attach_link'):
+    for flag in ('enabled', 'desktop', 'attach_link', 'idle_tail'):
         if flag in section:
             if isinstance(section[flag], bool):
                 cfg[flag] = section[flag]

@@ -129,6 +129,83 @@ class IdleSessionTests(unittest.TestCase):
     def test_the_message_survives_missing_fields(self):
         self.assertTrue(notify.build_idle_message({}))
 
+    def test_the_message_quotes_the_line_it_stopped_on(self):
+        entry = {'node': 'gpu1', 'session': 'train', 'idle': 900,
+                 'tail': 'CUDA out of memory'}
+        self.assertIn('Last line: CUDA out of memory',
+                      notify.build_idle_message(entry))
+
+    def test_no_tail_means_the_message_it_always_was(self):
+        for tail in ('', '   ', None):
+            entry = {'node': 'gpu1', 'session': 'train', 'idle': 900,
+                     'tail': tail}
+            self.assertNotIn('Last line', notify.build_idle_message(entry))
+
+
+class LastOutputLineTests(unittest.TestCase):
+    """Whether a run finished or died is in the line it stopped on, and that
+    line is raw terminal bytes on its way into a chat message."""
+
+    def test_takes_the_last_line_with_words_in_it(self):
+        pane = 'Epoch 39/40\nEpoch 40/40 done\n\n   \n'
+        self.assertEqual(notify.last_output_line(pane), 'Epoch 40/40 done')
+
+    def test_strips_colour_and_cursor_sequences(self):
+        pane = '\x1b[1;32mtrain\x1b[0m: \x1b[Kloss 0.31\x1b[?25h'
+        self.assertEqual(notify.last_output_line(pane), 'train: loss 0.31')
+
+    def test_strips_title_sequences_tmux_emits(self):
+        for terminator in ('\x07', '\x1b\\'):
+            pane = f'\x1b]0;bash{terminator}real output'
+            self.assertEqual(notify.last_output_line(pane), 'real output')
+
+    def test_control_characters_never_reach_the_message(self):
+        # A chat client would render these as mojibake.
+        self.assertEqual(notify.last_output_line('a\x00b\x08c\x7fd'), 'abcd')
+
+    def test_a_progress_bar_reports_its_final_state(self):
+        # A bar redraws by returning to column 0, so the useful number is the
+        # last thing written rather than the first. splitlines() treats the
+        # carriage return as a break, which lands on exactly that.
+        pane = 'training\n 10%|## \r 50%|##### \r100%|##########| 40/40'
+        self.assertEqual(notify.last_output_line(pane),
+                         '100%|##########| 40/40')
+
+    def test_whitespace_is_collapsed(self):
+        self.assertEqual(notify.last_output_line('a\t\t b     c'), 'a b c')
+
+    def test_long_lines_are_capped(self):
+        got = notify.last_output_line('x' * 500)
+        self.assertEqual(len(got), notify.TAIL_LIMIT)
+        self.assertTrue(got.endswith('…'))
+
+    def test_a_silly_limit_cannot_produce_a_negative_slice(self):
+        for limit in (0, -5, 1):
+            self.assertLessEqual(len(notify.last_output_line('y' * 50, limit)),
+                                 8)
+
+    def test_borders_spinners_and_bare_prompts_are_stepped_over(self):
+        # These are the last thing on screen often enough to matter, and none
+        # of them say anything about the run.
+        pane = 'Saved checkpoint 40\n────────────\n❯\n  ⠋  \n│  │\n'
+        self.assertEqual(notify.last_output_line(pane), 'Saved checkpoint 40')
+
+    def test_a_bordered_line_with_words_still_counts(self):
+        self.assertEqual(notify.last_output_line('── extend ──'), '── extend ──')
+
+    def test_a_pane_with_nothing_in_it_yields_nothing(self):
+        for pane in ('', '   \n\n\t\n', '\x1b[0m\x1b[0m', None, 42, b'bytes'):
+            self.assertEqual(notify.last_output_line(pane), '')
+
+    def test_only_the_tail_of_a_huge_pane_is_scanned(self):
+        # A capture is a screenful, but nothing stops it being far bigger, and
+        # walking all of it on the delivery thread is wasted work. 200 lines is
+        # several screens past where the answer can be.
+        pane = '\n'.join(['old'] * 5000 + ['   '] * 201)
+        self.assertEqual(notify.last_output_line(pane), '')
+        pane = '\n'.join(['old'] * 5000 + ['   '] * 150)
+        self.assertEqual(notify.last_output_line(pane), 'old')
+
 
 class AttachUrlTests(unittest.TestCase):
     """The link arrives from a chat message, so anyone who can post to the
@@ -390,6 +467,40 @@ class IdleAnnouncementTests(unittest.TestCase):
         self._poll(5)
         self._poll(900)
         self.assertEqual(len(self.sent), 1)
+
+    def test_the_notice_quotes_the_line_the_session_stopped_on(self):
+        with mock.patch.object(daemon, '_capture_pane',
+                               return_value='setup\n\x1b[31mCUDA OOM\x1b[0m\n'):
+            self._poll(900)
+        self.assertIn('Last line: CUDA OOM', self.sent[0])
+
+    def test_idle_tail_can_be_turned_off(self):
+        """One line of terminal output leaving the cluster is its own decision,
+        separate from wanting the notice at all."""
+        daemon._notify_cfg['idle_tail'] = False
+        with mock.patch.object(daemon, '_capture_pane') as capture:
+            self._poll(900)
+        capture.assert_not_called()
+        self.assertIn('finished or stalled', self.sent[0])
+        self.assertNotIn('Last line', self.sent[0])
+
+    def test_an_unavailable_capture_still_sends_the_notice(self):
+        """The quiet session is the news; the quoted line is a bonus, and a
+        node too busy to answer a capture is exactly when it matters most."""
+        for index, outcome in enumerate(({'return_value': None},
+                                         {'side_effect': OSError('no route')})):
+            with self.subTest(outcome=outcome):
+                self.sent.clear()
+                daemon._idle_announced.clear()
+                # A fresh claim file per case: the shared claim is what stops a
+                # second announcement, and it would mask the second case.
+                with mock.patch.object(config, 'NOTIFY_CLAIM_PATH',
+                                       os.path.join(self.temp.name,
+                                                    f'claim{index}.json')):
+                    with mock.patch.object(daemon, '_capture_pane', **outcome):
+                        self._poll(900)
+                self.assertEqual(len(self.sent), 1)
+                self.assertNotIn('Last line', self.sent[0])
 
     def test_nothing_is_sent_without_a_webhook(self):
         daemon._notify_cfg['webhook_url'] = ''

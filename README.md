@@ -585,7 +585,31 @@ daemon says so:
 ```
 AutoTmux: tmux session train on holygpu8a11104 (job sweep) has shown no
 output for 15m — it has probably finished or stalled.
+Last line: Epoch 40/40 done — checkpoint saved to runs/sweep/final.pt
 ```
+
+The quoted line is what makes the notice actionable: `Epoch 40/40 done` and
+`CUDA out of memory` are the same event to the idle check and completely
+different to you. It is taken once per quiet spell, not per poll, and a node
+too busy to answer the capture still gets its notice — just without the line.
+
+It does mean one line of terminal output leaves the cluster, so it is a
+separate switch from the notice itself:
+
+```toml
+[notify]
+idle_tail = false          # notice only, no quoted output
+```
+
+What is quoted is the last line with words in it — rules, borders, spinners
+and bare prompts are stepped over — stripped of colour, cursor and title
+sequences and capped at 120 characters. A progress bar reports its final state
+rather than its first, because the redraws are what the capture sees.
+
+This reads a screen, not a log, so it answers well for the batch jobs the
+notice exists for and poorly for a full-screen program: a session running an
+editor or another TUI quotes that program's status bar, because for a TUI the
+last line genuinely is the status bar. Click through to the pane for those.
 
 Announced once per quiet spell, and re-armed as soon as the session produces
 output again, so a long-lived job is not re-announced every poll while one
