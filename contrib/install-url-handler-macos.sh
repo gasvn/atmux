@@ -43,9 +43,15 @@ else
         end tell'
 fi
 
+# iTerm2 and Terminal.app exec the command as argv rather than handing it to a
+# shell, so a bare `quoted form of` path arrives with its quotes intact and the
+# binary is not found -- the window opens and dies immediately. Wrap it in an
+# explicit `/bin/sh -c` instead; the inner quoting is what keeps the URL, which
+# is untrusted, from being reinterpreted.
 cat > "${BUILD}/handler.applescript" <<APPLESCRIPT
 on open location this_URL
-    set theCommand to quoted form of "${ATMUX}" & " --open-url " & quoted form of this_URL
+    set inner to quoted form of "${ATMUX}" & " --open-url " & quoted form of this_URL
+    set theCommand to "/bin/sh -c " & quoted form of ("exec " & inner)
     ${OPEN_CMD}
 end open location
 APPLESCRIPT
