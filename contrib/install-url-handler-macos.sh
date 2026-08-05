@@ -26,6 +26,7 @@ fi
 ATMUX="$(cd "$(dirname "${ATMUX}")" && pwd)/$(basename "${ATMUX}")"
 
 APP="${HOME}/Applications/AutoTmux URL Handler.app"
+BUNDLE_ID="com.autotmux.urlhandler"
 BUILD="$(mktemp -d)"
 trap 'rm -rf "${BUILD}"' EXIT
 
@@ -52,7 +53,16 @@ cat > "${BUILD}/handler.applescript" <<APPLESCRIPT
 on open location this_URL
     set inner to quoted form of "${ATMUX}" & " --open-url " & quoted form of this_URL
     set theCommand to "/bin/sh -c " & quoted form of ("exec " & inner)
-    ${OPEN_CMD}
+    try
+        ${OPEN_CMD}
+    on error errMsg
+        -- The likeliest failure is macOS withholding automation consent, which
+        -- is silent from the user's side: the terminal comes forward but no
+        -- session opens. Leave a breadcrumb rather than nothing.
+        do shell script "printf '%s\n' " & quoted form of errMsg & ¬
+            " >> /tmp/atmux-url-handler.log"
+        display notification errMsg with title "AutoTmux link failed"
+    end try
 end open location
 APPLESCRIPT
 
@@ -60,14 +70,23 @@ mkdir -p "${HOME}/Applications"
 rm -rf "${APP}"
 osacompile -o "${APP}" "${BUILD}/handler.applescript"
 
-# osacompile writes a plain applet; declare the scheme it should receive.
+# osacompile writes a plain applet with no bundle identifier. macOS records
+# automation consent per identifier, so without one the permission can be
+# neither prompted for nor remembered -- opening a session then fails with
+# "Not authorized to send Apple events", and no dialog ever appears.
+#
+# LSBackgroundOnly is deliberately NOT set for the same reason: a background-
+# only app cannot present the consent dialog.
 /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes array' \
     -c 'Add :CFBundleURLTypes:0 dict' \
     -c 'Add :CFBundleURLTypes:0:CFBundleURLName string AutoTmux' \
     -c 'Add :CFBundleURLTypes:0:CFBundleURLSchemes array' \
     -c 'Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string atmux' \
-    -c 'Add :LSBackgroundOnly bool true' \
+    -c "Add :CFBundleIdentifier string ${BUNDLE_ID}" \
     "${APP}/Contents/Info.plist" >/dev/null
+
+# Re-sign after editing the bundle, or the identity TCC keys on is stale.
+codesign --force --sign - "${APP}" >/dev/null 2>&1 || true
 
 # Tell LaunchServices about it now rather than at some later rescan.
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
