@@ -792,6 +792,35 @@ class CompactCellTests(unittest.TestCase):
         self.assertEqual(autotmux._load_label('', ''), '')
         self.assertEqual(autotmux._load_label('n/a', '12'), 'n/a/12')
 
+    def test_an_uneventful_status_is_left_blank(self):
+        """"Active" on every healthy row is a constant that buries the rows
+        which do have something to report."""
+        self.assertEqual(autotmux._status_text('Active'), '')
+        self.assertEqual(autotmux._status_text('No sessions'), '')
+
+    def test_anything_worth_reading_is_kept(self):
+        for text in ('OFFLINE: connect timeout', 'DEGRADED: boom',
+                     '⚠ ESC 500ms'):
+            with self.subTest(text=text):
+                self.assertEqual(autotmux._status_text(text), text)
+
+    def test_a_warning_survives_without_its_baseline(self):
+        self.assertEqual(
+            autotmux._status_text('Active · ⚠ NET retry 5s'), '⚠ NET retry 5s')
+        self.assertEqual(
+            autotmux._status_text('No sessions · ⚠ NET retry 5s'),
+            '⚠ NET retry 5s')
+
+    def test_window_count_rides_on_the_session_name(self):
+        self.assertEqual(autotmux._session_cell('train', '1'), 'train')
+        self.assertEqual(autotmux._session_cell('train', '3'), 'train ·3')
+
+    def test_an_unknown_window_count_adds_nothing(self):
+        for windows in ('-', '?', '', None, 'x'):
+            with self.subTest(windows=windows):
+                self.assertEqual(
+                    autotmux._session_cell('train', windows), 'train')
+
     def test_start_shell_placeholder_is_short(self):
         """It appears on every session-less node, so its width sets the
         SESSION column for the whole table."""

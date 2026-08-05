@@ -2402,6 +2402,30 @@ def _literal_cell(value) -> rich.text.Text:
     return rich.text.Text(str(value))
 
 
+# A healthy row says "Active" and a session-less one says "No sessions" --
+# both already visible from the session name or the <shell> placeholder.
+_QUIET_STATUSES = ('Active', 'No sessions')
+
+
+def _status_text(status) -> str:
+    """STATUS with the uneventful baseline removed.
+
+    Repeating "Active" down every row spends the column on a constant and
+    buries the rows that do have something to report. Anything that is not
+    the baseline -- OFFLINE, DEGRADED, an escape-time or network warning --
+    is kept verbatim.
+    """
+    text = str(status).strip()
+    if text in _QUIET_STATUSES:
+        return ''
+    for quiet in _QUIET_STATUSES:
+        prefix = f'{quiet} · '
+        if text.startswith(prefix):
+            # Keep the warning, drop the baseline it was appended to.
+            return text[len(prefix):]
+    return text
+
+
 def _split_idle_marker(status) -> tuple[str, str]:
     """Separate a leading ``● 15m`` marker from the rest of the STATUS text."""
     text = str(status)
@@ -2869,6 +2893,7 @@ class AutotmuxApp(App):
         ("IDLE", "Quiet time: yellow past 5m, red past 1h"),
         ("LEFT", "Time until Slurm ends the job"),
         ("·N", "That session has N windows (hidden when 1)"),
+        ("STATUS", "Only fills in when something is wrong"),
         ("LOAD", "1-min load / cores; 35.0/1 is oversubscribed"),
     ]
 
@@ -3156,6 +3181,7 @@ class AutotmuxApp(App):
         if any cell write raised (so the caller can avoid caching a sig that
         doesn't match what's actually on screen)."""
         marker, status = _split_idle_marker(r[4])
+        status = _status_text(status)
         ok = True
         for col, val in ((0, marker), (3, _time_left_label(r[3])),
                          (4, _load_label(r[6], r[5])), (5, status)):
@@ -3297,6 +3323,7 @@ class AutotmuxApp(App):
         for r in rows:
             # row layout: (node, session, wins, time, status, cpu, load)
             marker, status = _split_idle_marker(r[4])
+            status = _status_text(status)
             self.table.add_row(
                 _idle_cell(marker),
                 *(_literal_cell(value) for value in (

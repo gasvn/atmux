@@ -1084,13 +1084,30 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_marker_moves_out_of_status_into_the_lead_cell(self):
         _, rows = await self._render(self.IDLE_STATE)
         self.assertEqual(str(rows['quiet'][0]), '● 15m')
-        # Not duplicated: STATUS keeps only the state itself.
-        self.assertEqual(str(rows['quiet'][-1]), 'Active')
+        # Not duplicated, and a healthy row leaves STATUS empty.
+        self.assertEqual(str(rows['quiet'][-1]), '')
+
+    async def test_a_troubled_row_still_reports_in_status(self):
+        """Quieting the healthy baseline must not quiet the rows that matter."""
+        state = json.loads(json.dumps(self.IDLE_STATE))
+        state['nodes']['gpu1']['last_error'] = 'connect timeout'
+        _, rows = await self._render(state)
+        self.assertIn('DEGRADED', str(rows['quiet'][-1]))
+        self.assertIn('connect timeout', str(rows['quiet'][-1]))
+
+    async def test_an_offline_node_still_reports_in_status(self):
+        state = json.loads(json.dumps(self.IDLE_STATE))
+        state['nodes']['gpu1']['alive'] = False
+        state['nodes']['gpu1']['last_error'] = 'master down'
+        _, rows = await self._render(state)
+        offline = next(cells for name, cells in rows.items()
+                       if 'offline' in name)
+        self.assertIn('OFFLINE', str(offline[-1]))
 
     async def test_a_busy_session_has_an_empty_lead_cell(self):
         _, rows = await self._render(self.IDLE_STATE)
         self.assertEqual(str(rows['busy'][0]), '')
-        self.assertEqual(str(rows['busy'][-1]), 'Active')
+        self.assertEqual(str(rows['busy'][-1]), '')
 
     async def test_the_dot_is_coloured_by_tier(self):
         _, rows = await self._render(self.IDLE_STATE)
@@ -1117,7 +1134,7 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 4))),
                              '10.0')
             self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 5))),
-                             'Active')
+                             '')
 
 
 class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
@@ -1193,7 +1210,8 @@ class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
 
     def test_the_non_obvious_columns_are_explained(self):
         documented = {name for name, _ in autotmux.AutotmuxApp.HELP_COLUMNS}
-        self.assertEqual(documented, {'IDLE', 'LEFT', 'LOAD', '·N'})
+        self.assertEqual(documented,
+                         {'IDLE', 'LEFT', 'LOAD', '·N', 'STATUS'})
 
     async def test_question_mark_opens_and_closes_help(self):
         app = autotmux.AutotmuxApp()
