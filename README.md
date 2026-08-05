@@ -477,6 +477,7 @@ legacy `/tmp` pid file so you don't end up with two daemons.
 | **e** | Label the session with what it is for | selected row |
 | **n** | Create a named tmux session (detached) | selected row's node |
 | **x** | Kill the selected session — asks first | selected row |
+| **v** | Read its output including scrollback, without attaching | selected row |
 | **k** | Toggle Slurm auto-renew before the walltime ends | selected row's job |
 | **j** | Switch the bottom panel: running / pending jobs | all jobs |
 | **g** | Choose which login nodes to route through | whole session |
@@ -730,6 +731,34 @@ link that cannot open leaves the terminal in the foreground and nothing else.
 
 Leave `attach_link = false` (the default) if you read reminders anywhere the
 scheme is not installed; a dead link is worse than none.
+
+### Reading a session without attaching
+
+`v` opens the selected session's output with its scrollback, scrolled to the
+end. The preview beside the table is one screen — that is all a poll should
+ever pay for — but working out why something died usually means reading
+further back, and attaching to look resizes the session to your terminal and
+disturbs whatever is still running in it.
+
+A full-screen program (an editor, another TUI) has no scrollback to show: it
+draws on the alternate screen, so one screen is genuinely all there is.
+
+### Job start notices
+
+The daemon says when a job is nearly over and when a session has gone quiet;
+`job_start` closes the third case — something you queued has finally got a
+node:
+
+```
+AutoTmux: Slurm job train (4172318) is now running on holygpu8a11104.
+```
+
+The first complete poll after a daemon starts is *seeded* rather than
+announced, or restarting would announce every job that happened to be running
+— four times over, once per login node. A job that starts while every daemon
+is down therefore goes unannounced, which is the right way round. Set
+`job_start = false` to turn it off; it is separate from the others because it
+fires on good news rather than on something wanting attention.
 
 ### Job expiry reminders
 

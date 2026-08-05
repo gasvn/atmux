@@ -463,7 +463,10 @@ class PreviewCoordinatorTests(unittest.TestCase):
 
         self.assertTrue(response['ok'])
         self.assertEqual(response['content'], 'pane output')
-        capture.assert_called_once_with('gpu1', 'train', source='preview')
+        # history=0: the poll preview is one screen. Scrollback is only
+        # ever asked for by an explicit expanded read.
+        capture.assert_called_once_with(
+            'gpu1', 'train', source='preview', history=0)
         update.assert_called_once_with('gpu1', 'train', 'pane output')
 
     def test_unknown_session_is_rejected_before_any_network_call(self):
