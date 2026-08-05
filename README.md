@@ -5,7 +5,7 @@ compute nodes. It automatically discovers your running jobs, keeps fast
 SSH connections to each node open in the background, and lets you list,
 preview, and attach to remote tmux sessions from a single TUI.
 
-## Architecture (v0.6.1)
+## Architecture (v0.7.0)
 
 AutoTmux is split into two pieces:
 
@@ -574,6 +574,35 @@ disagree about the time. The dot is decoration only: the session name stays
 exactly what `Enter` attaches to. Both thresholds are `[client]` settings —
 `idle_hint` and `idle_stale`.
 
+### Session notes
+
+Session names are chosen for typing, not for reading: `tu_debug` and
+`tu_improve` say nothing about which run matters right now. Press `e` on a row
+to say what it is for. The note appears in **STATUS**, which is blank whenever
+a row is healthy, so it costs no width — and a real warning always wins, since
+the note must never be the reason a `DEGRADED` line went unseen.
+
+Notes are keyed by **session name, not node**: a renewed batch job comes back
+on whatever node Slurm had free, and a note tied to the old node would vanish
+at exactly the moment the run it describes is still going. They live in
+`~/.config/autotmux/notes.json`.
+
+### Row order
+
+Rows are grouped by how much they want a decision, then by node and session:
+
+| | |
+| :--- | :--- |
+| offline / degraded | something is broken |
+| **just went quiet** | a run that has probably finished or wedged — the decision worth making |
+| working | |
+| quiet for hours | not news any more; kept below live work |
+| `<shell>` placeholders | not anybody's work |
+
+The tiers are deliberately coarse, so a row changes place at most twice per
+quiet spell. A table that re-sorts while the cursor is in it would be worse
+than one merely ordered badly.
+
 ### Idle-session and job-expiry reminders
 
 Two things are worth being told about without watching the dashboard.
@@ -606,10 +635,24 @@ and bare prompts are stepped over — stripped of colour, cursor and title
 sequences and capped at 120 characters. A progress bar reports its final state
 rather than its first, because the redraws are what the capture sees.
 
-This reads a screen, not a log, so it answers well for the batch jobs the
-notice exists for and poorly for a full-screen program: a session running an
-editor or another TUI quotes that program's status bar, because for a TUI the
-last line genuinely is the status bar. Click through to the pane for those.
+A full-screen program pins its furniture to the bottom of the screen, so the
+literal last line is its status bar whatever it has been doing. A status block
+sitting below the pane's last horizontal rule and built out of box glyphs
+rather than words is skipped, which is what turns
+
+```
+⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+```
+
+into
+
+```
+· Philosophising… (3m 33s · ↓ 6.3k tokens)
+```
+
+Both conditions are required: a block below a rule that reads like output —
+the rows under a table header, say — is kept, because discarding a real last
+line is worse than quoting a status bar.
 
 Announced once per quiet spell, and re-armed as soon as the session produces
 output again, so a long-lived job is not re-announced every poll while one

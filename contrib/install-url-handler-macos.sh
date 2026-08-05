@@ -39,7 +39,7 @@ if ! ATMUX_BIN="${ATMUX}" "${ATMUX}" --print-url-handler \
         > "${BUILD}/handler.applescript" 2>"${BUILD}/err"; then
     echo "Could not generate the handler script:" >&2
     cat "${BUILD}/err" >&2
-    echo "Is ${ATMUX} an AutoTmux 0.6.2 or newer install?" >&2
+    echo "Is ${ATMUX} an AutoTmux 0.7.0 or newer install?" >&2
     exit 1
 fi
 

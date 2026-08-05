@@ -2297,6 +2297,32 @@ class WarmSlavePool:
         return matched_result
 
 
+def _attention_rank(row) -> int:
+    """Where a row belongs in the table, by how much it wants a decision.
+
+    Ordering by node name gave the top of the table to whichever host sorted
+    first, which says nothing.  What earns the top is *recent change*: a
+    session that has just gone quiet is a run that has probably finished or
+    wedged, and that is the moment a decision is worth making.
+
+    The rank is deliberately coarse and slow-moving -- a row changes tier at
+    most twice per quiet spell -- because a table that re-sorts while the
+    cursor is in it is worse than one that is merely ordered badly.  A session
+    quiet for hours sinks *below* the working ones: it is not news any more,
+    and leaving it on top would push live work off the screen.
+    """
+    session = row[1]
+    status = str(row[4])
+    if session == _OFFLINE_SESSION or status.startswith('DEGRADED'):
+        return 0
+    if session == _START_SHELL_SESSION:
+        return 4                       # a placeholder, not somebody's work
+    marker, _rest = _split_idle_marker(status)
+    if marker:
+        return 3 if _looks_stale(marker) else 1
+    return 2
+
+
 def build_session_rows(state: dict) -> list:
     """Turn daemon state into a flat list of display rows.
 
@@ -2379,7 +2405,7 @@ def build_session_rows(state: dict) -> list:
             if network_warning:
                 status = f'{status} · {network_warning}'
             rows.append((node, _START_SHELL_SESSION, '-', time_left, status, cpu, load))
-    rows.sort(key=lambda r: (r[0], _session_label(r[1])))
+    rows.sort(key=lambda r: (_attention_rank(r), r[0], _session_label(r[1])))
     return rows
 
 
@@ -2563,6 +2589,59 @@ def _make_no_motion_driver(base_cls):
             # Deliberately NOT 1003h (any-motion) — see docstring.
             self.flush()
     return _NoMotionDriver
+
+
+class NoteScreen(ModalScreen[str | None]):
+    """Ask what a session is for.
+
+    Session names are chosen for typing, not for reading -- `tu_debug` and
+    `tu_improve` say nothing about which run matters right now. The note fills
+    the STATUS column, which is blank whenever a row is healthy, so it costs
+    no width and occupies space that was otherwise dead.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel_note", "Cancel"),
+    ]
+
+    CSS = """
+    NoteScreen {
+        align: center middle;
+        background: $background 60%;
+    }
+    #note_dialog {
+        width: 64;
+        max-width: 90%;
+        height: auto;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #note_title { text-style: bold; color: $accent; }
+    #note_hint { color: $text-muted; margin-bottom: 1; }
+    """
+
+    def __init__(self, session: str, current: str) -> None:
+        super().__init__()
+        self._session = str(session)
+        self._current = str(current or '')
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='note_dialog'):
+            yield Static(f'Note for {self._session}', id='note_title')
+            yield Static('Enter saves · empty clears · Esc cancels',
+                         id='note_hint')
+            yield Input(value=self._current, placeholder='what is this run for?',
+                        max_length=config.NOTE_LIMIT, id='note_input')
+
+    def on_mount(self) -> None:
+        self.query_one('#note_input', Input).focus()
+
+    def on_input_submitted(self, event) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel_note(self) -> None:
+        self.dismiss(None)
 
 
 class HelpScreen(ModalScreen[None]):
@@ -2895,6 +2974,7 @@ class AutotmuxApp(App):
         Binding("k", "toggle_keepalive", "Auto-renew job"),
         Binding("j", "toggle_jobs_view", "Jobs panel"),
         Binding("g", "manage_connections", "Login nodes"),
+        Binding("e", "edit_note", "Note", show=False),
         Binding("question_mark", "show_help", "Help"),
         Binding("q", "app.quit", "Quit"),
         Binding("r", "refresh_table", "Refresh now", show=False),
@@ -2924,6 +3004,7 @@ class AutotmuxApp(App):
             ("j", "Bottom panel: running / queued jobs", "all jobs"),
         ]),
         ("View", [
+            ("e", "Label this session with what it is for", "shows in STATUS"),
             ("g", "Pick which login nodes to route through", "whole session"),
             ("r", "Refresh now (it also refreshes itself)", "whole table"),
             ("↑ / ↓", "Move the selection", "table"),
@@ -3036,6 +3117,9 @@ class AutotmuxApp(App):
         # Per-(node, session, ts) cache of parsed Rich Text — repeating
         # the same row is essentially free.
         self._rendered_cache: dict = {}
+        # What each session is for, keyed by session name. Read once here and
+        # after an edit; a note changes only when the user changes it.
+        self._notes: dict = config.load_notes()
         self._last_rows_sig: tuple | None = None
         # Identity of the displayed rows (node, session) in order. When only
         # this is unchanged we update cells in place instead of rebuilding.
@@ -3226,6 +3310,17 @@ class AutotmuxApp(App):
             # keeps selection and preview stable.
             self._refresh_table(state)
 
+    def _status_or_note(self, session: str, status: str) -> str:
+        """STATUS, falling back to the session's note when it has nothing to say.
+
+        A warning always wins. The note is filling space that is otherwise
+        blank, so it must never be the reason a DEGRADED or ESC warning went
+        unseen.
+        """
+        if status:
+            return status
+        return self._notes.get(str(session), '')
+
     def _update_row_cells(self, i: int, r) -> bool:
         """Update only the volatile cells of row i in place. Display columns
         are IDLE0 NODE1 SESSION2 LEFT3 LOAD4 STATUS5, mapped from the row
@@ -3233,7 +3328,7 @@ class AutotmuxApp(App):
         if any cell write raised (so the caller can avoid caching a sig that
         doesn't match what's actually on screen)."""
         marker, status = _split_idle_marker(r[4])
-        status = _status_text(status)
+        status = self._status_or_note(r[1], _status_text(status))
         ok = True
         for col, val in ((0, marker), (3, _time_left_label(r[3])),
                          (4, _load_label(r[6], r[5])), (5, status)):
@@ -3375,7 +3470,7 @@ class AutotmuxApp(App):
         for r in rows:
             # row layout: (node, session, wins, time, status, cpu, load)
             marker, status = _split_idle_marker(r[4])
-            status = _status_text(status)
+            status = self._status_or_note(r[1], _status_text(status))
             self.table.add_row(
                 _idle_cell(marker),
                 *(_literal_cell(value) for value in (
@@ -4301,6 +4396,29 @@ class AutotmuxApp(App):
         elif nest and not step_ok:
             self.notify('outer tmux passthrough was unavailable',
                         severity='warning', timeout=6, markup=False)
+
+    async def action_edit_note(self) -> None:
+        sess = self.selected_session
+        if not sess or sess in (_OFFLINE_SESSION, _START_SHELL_SESSION):
+            self.notify('notes attach to a real session',
+                        severity='warning', timeout=4, markup=False)
+            return
+
+        def store(text) -> None:
+            if text is None:                      # Esc
+                return
+            if config.save_note(sess, text):
+                self._notes = config.load_notes()
+                # The note is drawn into STATUS, so the cached row signature
+                # no longer matches what should be on screen.
+                self._last_rows_sig = None
+                self._rendered_cache.clear()
+                self._refresh_table(self._last_state)
+            else:
+                self.notify('could not save the note', severity='error',
+                            timeout=5, markup=False)
+
+        self.push_screen(NoteScreen(sess, self._notes.get(sess, '')), store)
 
     async def action_open_shell(self) -> None:
         node = self.selected_node

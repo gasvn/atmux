@@ -843,6 +843,51 @@ class CompactCellTests(unittest.TestCase):
         self.assertLessEqual(len(label), 8)
 
 
+class AttentionOrderingTests(unittest.TestCase):
+    """Node-name order gave the top of the table to whichever host sorted
+    first, which says nothing about where to look."""
+
+    def _row(self, node, session, status):
+        return (node, session, '1', '1:00', status, '96', '4.0')
+
+    def test_a_freshly_quiet_session_outranks_a_working_one(self):
+        quiet = self._row('zz', 'train', f'{autotmux._IDLE_DOT} 8m Active')
+        busy = self._row('aa', 'train', 'Active')
+        self.assertLess(autotmux._attention_rank(quiet),
+                        autotmux._attention_rank(busy))
+
+    def test_a_long_dead_session_sinks_below_working_ones(self):
+        """It stopped being news hours ago; keeping it on top would push live
+        work off the screen."""
+        stale = self._row('aa', 'train', f'{autotmux._IDLE_DOT} 9h Active')
+        busy = self._row('zz', 'train', 'Active')
+        self.assertGreater(autotmux._attention_rank(stale),
+                           autotmux._attention_rank(busy))
+
+    def test_an_offline_node_comes_first(self):
+        offline = self._row('zz', autotmux._OFFLINE_SESSION, 'OFFLINE: timeout')
+        degraded = self._row('zz', 'train', 'DEGRADED: no route')
+        for row in (offline, degraded):
+            self.assertEqual(autotmux._attention_rank(row), 0)
+
+    def test_placeholder_rows_sink_to_the_bottom(self):
+        placeholder = self._row('aa', autotmux._START_SHELL_SESSION, 'No sessions')
+        real = self._row('zz', 'train', f'{autotmux._IDLE_DOT} 9h Active')
+        self.assertGreater(autotmux._attention_rank(placeholder),
+                           autotmux._attention_rank(real))
+
+    def test_order_is_stable_within_a_tier(self):
+        """Only the tier reorders; inside one, node and session still decide,
+        so the table does not shuffle between refreshes."""
+        state = {'nodes': {
+            'nodeB': {'alive': True, 'info': {}, 'sessions': [['b', '1'], ['a', '1']]},
+            'nodeA': {'alive': True, 'info': {}, 'sessions': [['z', '1']]},
+        }}
+        rows = autotmux.build_session_rows(state)
+        self.assertEqual([(r[0], r[1]) for r in rows],
+                         [('nodeA', 'z'), ('nodeB', 'a'), ('nodeB', 'b')])
+
+
 class LocalAttachTakeoverTests(unittest.TestCase):
     """tmux sizes a session's windows to its smallest attached client, so a
     second client pins the window small and leaves the rest of a bigger window

@@ -47,6 +47,17 @@ SSH_CONFIG_PATH = os.environ.get(
     'AUTOTMUX_SSH_CONFIG',
     os.path.expanduser('~/.ssh/config'),
 )
+# What each session is *for*. Keyed by session name alone, not node:session:
+# a renewed batch job comes back on whatever node Slurm had free, and a note
+# tied to the old node would evaporate at exactly the moment the run it
+# describes is still going.
+NOTES_PATH = os.environ.get(
+    'AUTOTMUX_NOTES',
+    os.path.expanduser('~/.config/autotmux/notes.json'),
+)
+NOTE_LIMIT = 60             # one table cell's worth
+NOTES_MAX = 500             # a personal file, not a database
+_NOTES_FILE_LIMIT = 256 * 1024
 _CLIENT_STATE_LIMIT = 64 * 1024
 _SSH_CONFIG_FILE_LIMIT = 1024 * 1024
 _SSH_CONFIG_TOTAL_LIMIT = 2 * 1024 * 1024
@@ -413,6 +424,88 @@ def save_client_state(mode: str, gateways: list[str],
         except OSError:
             pass
         raise
+
+
+def clean_note(text) -> str:
+    """A note as it will be stored: one line, bounded, no control characters.
+
+    It is drawn into a table cell and may be read back from a file edited by
+    hand, so newlines and escapes are removed rather than trusted.
+    """
+    if not isinstance(text, str):
+        return ''
+    # Unprintables become spaces rather than vanishing, so removing an escape
+    # cannot fuse the words on either side of it into one.
+    flattened = ''.join(
+        ch if ch.isprintable() else ' ' for ch in text.replace('\t', ' '))
+    return ' '.join(flattened.split())[:NOTE_LIMIT]
+
+
+def load_notes(path: str | None = None) -> dict:
+    """Session notes, or ``{}``. Never raises: a note is a convenience."""
+    target = NOTES_PATH if path is None else path
+    try:
+        with open(target, encoding='utf-8') as handle:
+            raw = handle.read(_NOTES_FILE_LIMIT + 1)
+        if len(raw) > _NOTES_FILE_LIMIT:
+            log.warning('notes file is too large; ignoring it')
+            return {}
+        stored = json.loads(raw)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(stored, dict):
+        return {}
+    notes = {}
+    for session, text in list(stored.items())[:NOTES_MAX]:
+        cleaned = clean_note(text)
+        if isinstance(session, str) and session and cleaned:
+            notes[session] = cleaned
+    return notes
+
+
+def save_note(session: str, text, path: str | None = None) -> bool:
+    """Attach a note to a session name, or drop it when the text is empty."""
+    target = NOTES_PATH if path is None else path
+    if not isinstance(session, str) or not session:
+        return False
+    notes = load_notes(target)
+    cleaned = clean_note(text)
+    if cleaned:
+        notes[session] = cleaned
+    else:
+        notes.pop(session, None)
+    # Oldest-first eviction is not worth a timestamp field here; refuse to
+    # grow instead, so the file cannot become unbounded by accident.
+    if len(notes) > NOTES_MAX:
+        return False
+    raw = (json.dumps(notes, ensure_ascii=False, sort_keys=True,
+                      separators=(',', ':')) + '\n').encode('utf-8')
+    directory = os.path.dirname(target)
+    try:
+        if directory:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+        temporary = os.path.join(
+            directory or '.', f'.notes.tmp.{os.getpid()}.{uuid.uuid4().hex}')
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, 'O_CLOEXEC', 0)
+                 | getattr(os, 'O_NOFOLLOW', 0))
+        fd = os.open(temporary, flags, 0o600)
+        try:
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    except OSError as error:
+        log.warning(f'could not save session note: {error}')
+        return False
+    return True
 
 
 def discover_ssh_aliases(path: str | None = None) -> list[str]:

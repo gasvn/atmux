@@ -193,6 +193,51 @@ class LastOutputLineTests(unittest.TestCase):
     def test_a_bordered_line_with_words_still_counts(self):
         self.assertEqual(notify.last_output_line('── extend ──'), '── extend ──')
 
+    # The bottom of a real Claude Code pane, which is what every one of this
+    # user's sessions runs. Before the chrome rule, all of them reported
+    # "auto mode on" -- the one thing that is true whatever the session did.
+    TUI_PANE = '\n'.join([
+        'the search space is covered; nothing else fits.',
+        '',
+        '✻ Crunched for 3m 16s · 1 monitor still running',
+        '',
+        '─────────────────────────────────────────── extend ──',
+        '❯',
+        '──────────────────────────────────────────────────────',
+        '[Opus 5 | Max] │ harness git:(main*) │ extend',
+        'Context ████████░░ 83% │ Usage ████████░░ 78%',
+        '10 hooks',
+        '✓ Bash ×17 | ✓ Monitor ×3',
+        '⏵⏵ auto mode on · 1 monitor · ← for agents',
+    ])
+
+    def test_a_status_bar_block_is_not_the_answer(self):
+        self.assertEqual(notify.last_output_line(self.TUI_PANE),
+                         '✻ Crunched for 3m 16s · 1 monitor still running')
+
+    def test_a_rule_with_a_word_centred_in_it_is_still_a_rule(self):
+        self.assertTrue(notify._looks_like_rule(
+            '─────────────────────────────────────────── extend ──'))
+        self.assertFalse(notify._looks_like_rule('Epoch 40/40 done'))
+
+    def test_output_below_a_rule_is_kept_when_it_reads_like_output(self):
+        """A table's rows sit below its header rule and are the real answer;
+        discarding them would be worse than quoting a status bar."""
+        pane = 'NAME VALUE\n──────────────────\nalpha 41\nbeta 42'
+        self.assertEqual(notify.last_output_line(pane), 'beta 42')
+
+    def test_a_single_line_below_a_rule_is_never_treated_as_chrome(self):
+        pane = 'building\n──────────────────\nbuild succeeded'
+        self.assertEqual(notify.last_output_line(pane), 'build succeeded')
+
+    def test_a_pane_with_no_rule_is_unaffected(self):
+        pane = 'Epoch 39/40\nEpoch 40/40 done'
+        self.assertEqual(notify.last_output_line(pane), 'Epoch 40/40 done')
+
+    def test_a_pane_that_is_only_chrome_yields_nothing(self):
+        pane = '──────────\n│ x │\n⏵⏵ auto mode on\n✓ Bash ×2'
+        self.assertEqual(notify.last_output_line(pane), '')
+
     def test_a_pane_with_nothing_in_it_yields_nothing(self):
         for pane in ('', '   \n\n\t\n', '\x1b[0m\x1b[0m', None, 42, b'bytes'):
             self.assertEqual(notify.last_output_line(pane), '')

@@ -315,6 +315,46 @@ _CONTROL_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 
 TAIL_LIMIT = 120
 
+# Characters a full-screen program draws its furniture from. Prose does not
+# use them; status bars, separators and progress meters are made of them.
+_CHROME_GLYPHS = frozenset('│┃║╎▏▎▍▌▋▊▉█░▒▓⏵⏸✓✗✻❯➜►▪·×•')
+_RULE_CHARS = frozenset('─━═╌┈-_=~')
+
+
+def _looks_like_rule(line: str) -> bool:
+    """A horizontal separator, whatever words a program centres inside it."""
+    squeezed = line.replace(' ', '')
+    if len(squeezed) < 8:
+        return False
+    ruled = sum(1 for ch in squeezed if ch in _RULE_CHARS)
+    return ruled / len(squeezed) >= 0.6
+
+
+def _strip_trailing_chrome(lines: list[str]) -> list[str]:
+    """Drop a status-bar block sitting below the pane's last separator.
+
+    A full-screen program keeps its furniture pinned to the bottom, so the last
+    line of the screen says what the *program* is rather than what it has been
+    doing -- for a Claude Code session, always ``auto mode on``.  The furniture
+    is identifiable by position: it hangs below the last horizontal rule and is
+    built out of box glyphs rather than words.
+
+    Both conditions are required.  A block below a rule that reads like output
+    -- the rows under a table header, say -- has no chrome glyphs and is kept,
+    because discarding a real last line is worse than quoting a status bar.
+    """
+    rules = [i for i, line in enumerate(lines) if _looks_like_rule(line)]
+    if not rules:
+        return lines
+    cut = rules[-1]
+    below = [line for line in lines[cut + 1:]
+             if line and any(ch.isalnum() for ch in line)]
+    if len(below) < 2:
+        return lines
+    furniture = sum(1 for line in below
+                    if any(ch in _CHROME_GLYPHS for ch in line))
+    return lines[:cut] if furniture / len(below) >= 0.6 else lines
+
 
 def last_output_line(content, limit: int = TAIL_LIMIT) -> str:
     """The last line of a pane that actually says something.
@@ -334,13 +374,14 @@ def last_output_line(content, limit: int = TAIL_LIMIT) -> str:
     """
     if not isinstance(content, str) or not content:
         return ''
-    for raw in reversed(content.splitlines()[-200:]):
-        line = _CONTROL_RE.sub('', _ANSI_RE.sub('', raw))
-        line = ' '.join(line.split())
-        # Require a letter or a digit somewhere. Rules, borders, spinners and
-        # bare prompts are the last thing on screen often enough to be worth
-        # stepping over, and none of them say anything.
-        if line and any(ch.isalnum() for ch in line):
+    lines = [' '.join(_CONTROL_RE.sub('', _ANSI_RE.sub('', raw)).split())
+             for raw in content.splitlines()[-200:]]
+    for line in reversed(_strip_trailing_chrome(lines)):
+        # Require a letter or a digit somewhere, and reject separators even
+        # when a program has centred a word inside one. Rules, borders,
+        # spinners and bare prompts are the last thing on screen often enough
+        # to be worth stepping over, and none of them say anything.
+        if line and any(ch.isalnum() for ch in line) and not _looks_like_rule(line):
             limit = max(8, int(limit))
             return line if len(line) <= limit else line[:limit - 1] + '…'
     return ''

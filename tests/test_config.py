@@ -204,5 +204,70 @@ class LoadClientConfigTests(unittest.TestCase):
         self.assertEqual(aliases, ['login1', 'login2', 'login3'])
 
 
+class SessionNoteTests(unittest.TestCase):
+    """Notes answer "which run is this?" for session names chosen for typing."""
+
+    def _path(self, td):
+        return os.path.join(td, 'notes.json')
+
+    def test_a_note_round_trips(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            self.assertTrue(config.save_note('tu_debug', 'hb047 sweep', path))
+            self.assertEqual(config.load_notes(path), {'tu_debug': 'hb047 sweep'})
+
+    def test_an_empty_note_clears_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            config.save_note('tu_debug', 'sweep', path)
+            config.save_note('tu_debug', '   ', path)
+            self.assertEqual(config.load_notes(path), {})
+
+    def test_notes_are_keyed_by_session_not_node(self):
+        """A renewed batch job comes back on whatever node Slurm had free; a
+        note tied to the old node would vanish while the run continues."""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            config.save_note('train', 'sweep A', path)
+            self.assertIn('train', config.load_notes(path))
+
+    def test_control_characters_and_newlines_cannot_reach_a_cell(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            config.save_note('s', 'a\nb\tc\x1b[31md\x00', path)
+            self.assertEqual(config.load_notes(path)['s'], 'a b c [31md')
+
+    def test_a_long_note_is_truncated(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            config.save_note('s', 'x' * 500, path)
+            self.assertEqual(len(config.load_notes(path)['s']),
+                             config.NOTE_LIMIT)
+
+    def test_a_hand_edited_file_cannot_break_the_dashboard(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            for content in ('not json', '[]', '{"s": 42}', '{"": "x"}',
+                            '{"s": null}'):
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write(content)
+                notes = config.load_notes(path)
+                self.assertIsInstance(notes, dict)
+                self.assertNotIn(42, notes.values())
+
+    def test_a_missing_file_is_simply_no_notes(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(config.load_notes(self._path(td)), {})
+
+    def test_an_unwritable_location_reports_failure_without_raising(self):
+        # A note is a convenience; failing to store one must never propagate
+        # into the refresh path that draws the table.
+        self.assertFalse(config.save_note('s', 'x', '/proc/nope/notes.json'))
+
+    def test_a_blank_session_name_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(config.save_note('', 'x', self._path(td)))
+
+
 if __name__ == '__main__':
     unittest.main()

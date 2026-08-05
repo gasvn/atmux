@@ -399,6 +399,10 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 }
                 app.log_view.update('preview from vanished debug session')
                 state = json.loads(json.dumps(SYNTH_STATE))
+                # The fallback selection is row 0, so drop the offline node:
+                # attention ordering would otherwise put it there and this
+                # test is about the preview, not the sort.
+                state['nodes'].pop('gpu2', None)
                 state['nodes']['gpu1']['sessions'] = [['train', '1']]
                 app._refresh_table(state)
                 self.assertEqual(
@@ -449,8 +453,13 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 new_state['nodes']['gpu1']['info']['load'] = '7.77'
                 app._refresh_table(new_state)
                 await pilot.pause()
-                # LOAD is display column 4 and carries load/cpus.
-                self.assertEqual(str(app.table.get_cell_at(Coordinate(0, 4))), '7.8')
+                # LOAD is display column 4 and carries load/cpus. Find the
+                # row rather than assuming index 0: attention ordering puts
+                # an offline node above a healthy one.
+                row = next(i for i, r in enumerate(app.all_sessions)
+                           if r[0] == 'gpu1')
+                self.assertEqual(
+                    str(app.table.get_cell_at(Coordinate(row, 4))), '7.8')
                 self.assertEqual(app._last_structural_sig, sig_before,
                                  "load-only change must not trigger a structural rebuild")
 
