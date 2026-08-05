@@ -475,6 +475,8 @@ legacy `/tmp` pid file so you don't end up with two daemons.
 | **t** | Open / attach a local tmux session | this machine |
 | **o** | Attach in a separate window, keeping this table open | selected row |
 | **e** | Label the session with what it is for | selected row |
+| **n** | Create a named tmux session (detached) | selected row's node |
+| **x** | Kill the selected session — asks first | selected row |
 | **k** | Toggle Slurm auto-renew before the walltime ends | selected row's job |
 | **j** | Switch the bottom panel: running / pending jobs | all jobs |
 | **g** | Choose which login nodes to route through | whole session |
@@ -492,6 +494,24 @@ Without that handler, or on other platforms, `o` says so and attaches in place.
 
 `s` differs on the other axis: it opens a plain login shell on the node rather
 than a tmux session, so it is gone when you exit.
+
+### Creating and killing sessions
+
+`n` creates a detached session on the selected row's node — detached, so it
+never steals the terminal you are in. Names are held to letters, digits and
+`_ @ + -`: tmux addresses windows and panes with `:` and `.`, so a session
+carrying either could never be targeted again.
+
+`x` kills the selected session. It asks first, and the destructive answer is
+not the default — `Esc` and `n` both decline, only `y` proceeds. These
+sessions exist precisely because they outlive the connection to them, so what
+is inside one is not recoverable.
+
+A tmux error is not treated as a network failure: "session not found" leaves
+the node's circuit breaker alone, where counting it as a broken link would
+take previews and attaches down with it. A failed command is never retried
+either — unlike a preview, which is a read that costs nothing to repeat, a
+retry here could create a second session or kill one you had since recreated.
 | **F12** | Restore the outer tmux after a killed client | surrounding tmux |
 | **q** | Quit | AutoTmux |
 
