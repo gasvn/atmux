@@ -269,6 +269,48 @@ def build_idle_message(entry: dict) -> str:
             f'stalled.')[:_MAX_TEXT]
 
 
+def release_claim(path: str, key: str) -> None:
+    """Give a claim back after a failed send.
+
+    The claim has to be taken before posting, or two daemons both post while
+    each waits for the other's write. But holding it after a failure would
+    silence the notice until the TTL expires -- so hand it back and let the
+    next poll, on this host or another, try again.
+    """
+    key = str(key)
+    try:
+        lock_fd = os.open(f'{path}.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with open(path, encoding='utf-8') as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            return
+        if not isinstance(record, dict) or key not in record:
+            return
+        record.pop(key, None)
+        tmp = f'{path}.{os.getpid()}.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as handle:
+                json.dump(record, handle)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except OSError:
+        return
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
 def post(url: str, text: str, timeout: float) -> tuple[bool, str]:
     """POST one reminder.  Returns ``(delivered, error)``; never raises."""
     body = json.dumps({'text': text}).encode('utf-8')

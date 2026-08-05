@@ -726,6 +726,24 @@ class JobReminderClaimTests(unittest.TestCase):
             with self.subTest(junk=junk):
                 self.assertTrue(notify.claim_job(self.path, '42'))
 
+    def test_a_released_claim_can_be_taken_again(self):
+        """The claim is taken before sending, so a failed send has to hand it
+        back or nothing retries until it expires."""
+        self.assertTrue(notify.claim_job(self.path, '42'))
+        self.assertFalse(notify.claim_job(self.path, '42'))
+        notify.release_claim(self.path, '42')
+        self.assertTrue(notify.claim_job(self.path, '42'))
+
+    def test_releasing_leaves_other_claims_alone(self):
+        notify.claim_job(self.path, '42')
+        notify.claim_job(self.path, '43')
+        notify.release_claim(self.path, '42')
+        self.assertFalse(notify.claim_job(self.path, '43'))
+
+    def test_releasing_something_unclaimed_is_harmless(self):
+        notify.release_claim(self.path, 'never-claimed')
+        notify.release_claim('/nonexistent-dir/x.json', '42')
+
     def test_the_record_stays_bounded(self):
         for i in range(200):
             notify.claim_job(self.path, str(i))

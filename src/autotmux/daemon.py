@@ -1314,9 +1314,10 @@ def _notify_expiring_jobs(node_infos: dict) -> None:
             with _notify_lock:
                 _notified_jobs.add(job_id)
             log.info(f'sent expiry reminder for job {job_id}')
-        else:
-            # Leave it unrecorded so the next poll retries.
-            log.warning(f'job {job_id} reminder not delivered: {error}')
+            return
+        # Hand the claim back too, or no daemon retries until it expires.
+        notify.release_claim(config.NOTIFY_CLAIM_PATH, job_id)
+        log.warning(f'job {job_id} reminder not delivered: {error}')
 
     for job in due:
         try:
@@ -1369,8 +1370,13 @@ def _notify_idle_sessions(node: str, info: dict) -> None:
         if ok:
             log.info(f"sent idle notice for {entry['node']}:"
                      f"{entry['session']} ({entry['idle']}s)")
-        else:
-            log.warning(f'idle notice not delivered: {error}')
+            return
+        # Undo both fences so the next poll can retry rather than losing the
+        # notice for a whole cooldown.
+        notify.release_claim(config.NOTIFY_CLAIM_PATH, key)
+        with _notify_lock:
+            _idle_announced.get(entry['node'], set()).discard(entry['session'])
+        log.warning(f'idle notice not delivered: {error}')
 
     for entry in pending:
         try:

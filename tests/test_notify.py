@@ -350,6 +350,16 @@ class IdleAnnouncementTests(unittest.TestCase):
             self._poll(900)
         self.assertEqual(self.sent, [])
 
+    def test_a_failed_post_is_retried_rather_than_lost(self):
+        """The claim has to be taken before posting, but keeping it after a
+        failure would silence the notice for a whole cooldown."""
+        with mock.patch.object(daemon.notify, 'post',
+                               return_value=(False, 'webhook down')):
+            self._poll(900)
+        self.assertEqual(self.sent, [])
+        self._poll(960)                       # webhook back up
+        self.assertEqual(len(self.sent), 1)
+
     def test_distinct_sessions_are_announced_separately(self):
         daemon._notify_idle_sessions('gpu1', {
             'job_id': '42', 'job_name': 'sweep',
