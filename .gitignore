@@ -5,3 +5,8 @@ build/
 *.pyc
 
 .venv/
+
+# coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
