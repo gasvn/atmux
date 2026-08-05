@@ -362,6 +362,22 @@ def _load_label(load, cpus) -> str:
     return load or cpus or ''
 
 
+def _session_cell(session: str, windows) -> str:
+    """SESSION as shown in the table, carrying the window count only when it
+    says something.
+
+    A dedicated WIN column spent a header and ~5 cells of width on a number
+    that is ``1`` for virtually every session; a suffix costs nothing until
+    a session actually has more than one window.
+    """
+    label = _session_label(session)
+    try:
+        count = int(str(windows).strip())
+    except (TypeError, ValueError):
+        return label
+    return f'{label} ·{count}' if count > 1 else label
+
+
 def _session_label(session: str) -> str:
     """Visible label for an internal row target token."""
     if session == _OFFLINE_SESSION:
@@ -2852,8 +2868,8 @@ class AutotmuxApp(App):
     HELP_COLUMNS = [
         ("IDLE", "Quiet time: yellow past 5m, red past 1h"),
         ("LEFT", "Time until Slurm ends the job"),
+        ("·N", "That session has N windows (hidden when 1)"),
         ("LOAD", "1-min load / cores; 35.0/1 is oversubscribed"),
-        ("WIN", "Windows inside that tmux session"),
     ]
 
     title = reactive(f"AutoTmux v{__version__}")
@@ -2900,10 +2916,12 @@ class AutotmuxApp(App):
         self.table.cursor_type = "row"
         # IDLE leads: STATUS is the first thing a narrow terminal truncates, so
         # a hint parked there is invisible exactly when the table is crowded.
-        # Seven columns, not eight: CPU folds into LOAD as "load/cpus", which
-        # is the only form either number is read in anyway.
+        # Six columns. CPU folds into LOAD as "load/cpus", the only form
+        # either number is read in; the window count rides on SESSION, since
+        # it is 1 for virtually every session and a whole column for a
+        # constant is width the table does not have to spend.
         self.table.add_columns(
-            "IDLE", "NODE", "SESSION", "WIN", "LEFT", "LOAD", "STATUS")
+            "IDLE", "NODE", "SESSION", "LEFT", "LOAD", "STATUS")
 
         self.log_view = self.query_one("#right_pane", Static)
         self.jobs_view = self.query_one("#jobs_panel", Static)
@@ -3133,14 +3151,14 @@ class AutotmuxApp(App):
 
     def _update_row_cells(self, i: int, r) -> bool:
         """Update only the volatile cells of row i in place. Display columns
-        are IDLE0 NODE1 SESSION2 WIN3 LEFT4 LOAD5 STATUS6, mapped from the
-        row tuple (node, session, wins, time, status, cpu, load). Returns False
+        are IDLE0 NODE1 SESSION2 LEFT3 LOAD4 STATUS5, mapped from the row
+        tuple (node, session, wins, time, status, cpu, load). Returns False
         if any cell write raised (so the caller can avoid caching a sig that
         doesn't match what's actually on screen)."""
         marker, status = _split_idle_marker(r[4])
         ok = True
-        for col, val in ((0, marker), (3, r[2]), (4, _time_left_label(r[3])),
-                         (5, _load_label(r[6], r[5])), (6, status)):
+        for col, val in ((0, marker), (3, _time_left_label(r[3])),
+                         (4, _load_label(r[6], r[5])), (5, status)):
             coord = Coordinate(i, col)
             cell = _idle_cell(val) if col == 0 else _literal_cell(val)
             try:
@@ -3282,7 +3300,7 @@ class AutotmuxApp(App):
             self.table.add_row(
                 _idle_cell(marker),
                 *(_literal_cell(value) for value in (
-                    _node_label(r[0]), _session_label(r[1]), r[2],
+                    _node_label(r[0]), _session_cell(r[1], r[2]),
                     _time_left_label(r[3]), _load_label(r[6], r[5]), status)),
             )
 

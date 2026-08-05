@@ -531,11 +531,11 @@ gets a coloured dot and its age in the STATUS column — yellow up to an hour,
 red beyond it:
 
 ```
-IDLE   NODE              SESSION     WIN  LEFT  LOAD    STATUS
-● 15m  holygpu8a11104    train       2    1d23h 30.5/1  Active
-● 2h   holygpu8a11401    sweep       1    4h02  6.3/1   Active
-       holygpu8a17504    build       1    6h20  4.7/1   Active
-       login:holylogin06 <shell>     -    -     14.6/1  No sessions
+IDLE   NODE              SESSION     LEFT   LOAD    STATUS
+● 15m  holygpu8a11104    train ·2    1d23h  30.5/1  Active
+● 2h   holygpu8a11401    sweep       4h02   6.3/1   Active
+       holygpu8a17504    build       6h20   4.7/1   Active
+       login:holylogin06 <shell>     -      14.6/1  No sessions
 ```
 
 `IDLE` leads because `STATUS` is the first column a narrow terminal truncates,
@@ -543,7 +543,9 @@ so a hint parked at the far right is invisible in exactly the crowded tables
 where it helps. The other cells are written for width too: a login node drops
 its cluster domain, `LEFT` keeps the magnitude of a walltime rather than the
 second it ends on, and `LOAD` carries load and core count together because
-neither number means much without the other.
+neither number means much without the other. The window count rides on
+SESSION as `·2`, shown only when a session has more than one -- a column
+of its own held the constant `1` on every row.
 
 Idle time is measured against the *node's* clock, sampled in the same command
 as the activity stamps, so it stays correct when the laptop and the cluster
