@@ -473,13 +473,25 @@ legacy `/tmp` pid file so you don't end up with two daemons.
 | **Enter** / click | Attach to the tmux session | selected row |
 | **s** | Open a plain SSH shell | selected row's node |
 | **t** | Open / attach a local tmux session | this machine |
-| **o** | Attach in a new window of the surrounding tmux | selected row |
+| **o** | Attach in a separate window, keeping this table open | selected row |
+| **e** | Label the session with what it is for | selected row |
 | **k** | Toggle Slurm auto-renew before the walltime ends | selected row's job |
 | **j** | Switch the bottom panel: running / pending jobs | all jobs |
 | **g** | Choose which login nodes to route through | whole session |
 | **r** | Refresh now (the table also refreshes on its own) | whole table |
 | **↑ / ↓** | Move the selection | table |
 | **?** | Show this list in the app | — |
+
+`Enter` and `o` open the same thing and differ only in *where* it lands:
+`Enter` takes over this terminal and returns you to the table on exit, while
+`o` leaves the table up and opens the session beside it. Inside tmux that is
+a new tmux window; on macOS outside tmux it is a new terminal window, opened
+through the same `atmux://` handler the chat links use — so it also raises the
+window a session is already showing rather than opening a second client on it.
+Without that handler, or on other platforms, `o` says so and attaches in place.
+
+`s` differs on the other axis: it opens a plain login shell on the node rather
+than a tmux session, so it is gone when you exit.
 | **F12** | Restore the outer tmux after a killed client | surrounding tmux |
 | **q** | Quit | AutoTmux |
 

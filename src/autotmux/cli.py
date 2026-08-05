@@ -1246,6 +1246,43 @@ def _local_attach_argv(session: str) -> list[str]:
     return ['tmux', 'attach-session', '-d', '-t', session]
 
 
+def _open_new_terminal_window(node: str, session: str) -> tuple[bool, str]:
+    """Open a separate terminal window already attached to this session.
+
+    `o` promised "a new window" but could only deliver one when atmux was
+    itself running inside tmux, since that is the only window manager it had.
+    Run straight from a terminal -- which is how the local client is normally
+    used -- it fell through to attaching in place, i.e. exactly what Enter
+    does, so the key appeared to do nothing.
+
+    macOS already has the missing piece: the ``atmux://`` handler installed for
+    chat links opens a window and attaches. Reusing it means `o` inherits the
+    same behaviour, including raising the window a session is already showing
+    rather than opening a second client on it.
+
+    Goes through ``open`` rather than driving the terminal directly so that
+    atmux never needs to send Apple events itself: the applet holds that
+    permission, and asking for a second grant here would put a consent dialog
+    in front of a keypress.
+    """
+    if sys.platform != 'darwin':
+        return False, 'opening a separate window needs the macOS atmux:// handler'
+    url = notify.attach_url(node, session)
+    if not url:
+        return False, 'this row cannot be expressed as an atmux:// link'
+    try:
+        result = subprocess.run(['open', url], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, ' '.join(str(error).split())[:120]
+    if result.returncode != 0:
+        detail = ' '.join((result.stderr or '').split())[:120]
+        return False, (detail
+                       or 'no handler for atmux:// — run '
+                          'contrib/install-url-handler-macos.sh')
+    return True, ''
+
+
 def _run_user_command(argv) -> tuple[int, str]:
     """Run an intentional interactive command without crashing the TUI.
 
@@ -2995,7 +3032,7 @@ class AutotmuxApp(App):
         ("Connect", [
             ("Enter", "Attach to an existing session", "survives"),
             ("click", "Same as Enter, in one action", "survives"),
-            ("o", "Attach in a new window of your tmux", "survives"),
+            ("o", "Attach in a separate window, keeping this table", "survives"),
             ("s", "Plain SSH shell on that node", "dies on exit"),
             ("t", "Local tmux on this machine", "survives"),
         ]),
@@ -4709,10 +4746,27 @@ class AutotmuxApp(App):
                 self.notify('could not create tmux window', severity='error',
                             timeout=7, markup=False)
         else:
+            # Outside tmux there is no tmux window to make, but on macOS there
+            # is a terminal window: the atmux:// handler opens one and attaches.
+            # Only then does `o` differ from Enter, which is the whole point of
+            # the key.
+            if sess != _START_SHELL_SESSION:
+                try:
+                    opened, why = await _offload_for(
+                        20.0, _open_new_terminal_window, node, sess)
+                except Exception as error:
+                    opened, why = False, ' '.join(str(error).split())[:120] or (
+                        'opening a window timed out')
+                if opened:
+                    self.notify(f'{_session_label(sess)} opened in a new window',
+                                timeout=4, markup=False)
+                    return
+                self.notify(f'no new window: {why}', severity='warning',
+                            timeout=8, markup=False)
             returncode = 0
             command_error = ''
             with self.suspend():
-                print("\n[AutoTmux] Not inside tmux – falling back to direct attach.")
+                print("\n[AutoTmux] Attaching here instead of in a new window.")
                 if node == 'localhost':
                     returncode, command_error = _run_user_command(cmd)
                 else:

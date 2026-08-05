@@ -843,6 +843,54 @@ class CompactCellTests(unittest.TestCase):
         self.assertLessEqual(len(label), 8)
 
 
+class NewTerminalWindowTests(unittest.TestCase):
+    """`o` promised a new window but could only make one inside tmux, so run
+    from a plain terminal it did exactly what Enter does."""
+
+    def test_hands_the_session_to_the_url_handler(self):
+        with mock.patch.object(autotmux.sys, 'platform', 'darwin'), \
+             mock.patch.object(autotmux.subprocess, 'run') as run:
+            run.return_value = subprocess.CompletedProcess([], 0, '', '')
+            ok, why = autotmux._open_new_terminal_window('gpu1', 'train')
+        self.assertTrue(ok, why)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], 'open')
+        self.assertEqual(argv[1], autotmux.notify.attach_url('gpu1', 'train'))
+
+    def test_reports_a_missing_handler_instead_of_failing_silently(self):
+        with mock.patch.object(autotmux.sys, 'platform', 'darwin'), \
+             mock.patch.object(autotmux.subprocess, 'run') as run:
+            run.return_value = subprocess.CompletedProcess(
+                [], 1, '', 'No application knows how to open URL')
+            ok, why = autotmux._open_new_terminal_window('gpu1', 'train')
+        self.assertFalse(ok)
+        self.assertIn('No application knows', why)
+
+    def test_a_broken_open_command_is_not_an_exception(self):
+        with mock.patch.object(autotmux.sys, 'platform', 'darwin'), \
+             mock.patch.object(autotmux.subprocess, 'run',
+                               side_effect=OSError('no open')):
+            ok, why = autotmux._open_new_terminal_window('gpu1', 'train')
+        self.assertFalse(ok)
+        self.assertIn('no open', why)
+
+    def test_rows_with_no_link_form_are_refused_before_spawning(self):
+        for session in (autotmux._START_SHELL_SESSION, autotmux._OFFLINE_SESSION):
+            with mock.patch.object(autotmux.sys, 'platform', 'darwin'), \
+                 mock.patch.object(autotmux.subprocess, 'run') as run:
+                ok, _why = autotmux._open_new_terminal_window('gpu1', session)
+            self.assertFalse(ok)
+            run.assert_not_called()
+
+    def test_other_platforms_say_so_rather_than_pretending(self):
+        with mock.patch.object(autotmux.sys, 'platform', 'linux'), \
+             mock.patch.object(autotmux.subprocess, 'run') as run:
+            ok, why = autotmux._open_new_terminal_window('gpu1', 'train')
+        self.assertFalse(ok)
+        self.assertIn('macOS', why)
+        run.assert_not_called()
+
+
 class AttentionOrderingTests(unittest.TestCase):
     """Node-name order gave the top of the table to whichever host sorted
     first, which says nothing about where to look."""
