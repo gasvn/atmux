@@ -115,6 +115,58 @@ class BoundedIpcTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'exceeds'):
             ipc._encoded({'data': 'x' * 100}, 32)
 
+    def test_reply_survives_a_peer_that_closes_first(self):
+        """A daemon that answers and hangs up must still deliver its answer.
+
+        ``shutdown(SHUT_WR)`` fails with ENOTCONN once the peer is gone, but the
+        reply is already buffered and readable, so aborting there would discard
+        a perfectly good response.  Ordinarily this depends on scheduling and
+        shows up only as a rare failure under load; here the client is held
+        until the server has definitely closed, which makes it certain.
+        """
+        original_send = ipc.send_json
+        server_closed = threading.Event()
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, 'preview.sock')
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                try:
+                    server.bind(path)
+                    server.listen(1)
+                except PermissionError as error:
+                    self.skipTest(f'Unix sockets denied by sandbox: {error}')
+                server.settimeout(5)
+
+                def serve():
+                    connection, _ = server.accept()
+                    with connection:
+                        request = ipc.recv_json(
+                            connection, ipc.MAX_REQUEST_BYTES)
+                        original_send(connection, {'ok': True, 'echo': request},
+                                      ipc.MAX_RESPONSE_BYTES)
+                    server_closed.set()
+
+                def client_send(sock, value, limit):
+                    # Only the client reaches the patched name; the server calls
+                    # the original directly.
+                    original_send(sock, value, limit)
+                    self.assertTrue(server_closed.wait(5), 'server never closed')
+
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                try:
+                    with mock.patch.object(ipc, 'send_json', client_send):
+                        response = ipc.request(
+                            path, {'action': 'status'}, timeout=5)
+                except PermissionError as error:
+                    self.skipTest(f'Unix sockets denied by sandbox: {error}')
+                finally:
+                    thread.join(timeout=5)
+            finally:
+                server.close()
+        self.assertEqual(response,
+                         {'ok': True, 'echo': {'action': 'status'}})
+
     def test_real_private_unix_socket_round_trip(self):
         """Exercise the exact client protocol where Unix sockets are allowed."""
         with tempfile.TemporaryDirectory() as td:

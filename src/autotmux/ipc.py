@@ -56,5 +56,15 @@ def request(path: str, payload: dict, timeout: float = 10.0) -> dict:
         client.settimeout(max(0.1, float(timeout)))
         client.connect(path)
         send_json(client, payload, MAX_REQUEST_BYTES)
-        client.shutdown(socket.SHUT_WR)
+        try:
+            client.shutdown(socket.SHUT_WR)
+        except OSError:
+            # Half-closing is a courtesy to the peer, not part of the protocol:
+            # it says "no more request bytes are coming". A daemon that has
+            # already answered and closed makes this fail with ENOTCONN, and
+            # failing the whole request there would throw away a reply that is
+            # sitting in the receive buffer, readable. Whether it happens comes
+            # down to scheduling, so it shows up as a rare, load-dependent
+            # error rather than an obvious one.
+            pass
         return recv_json(client, MAX_RESPONSE_BYTES)
