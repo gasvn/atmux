@@ -68,6 +68,11 @@ NOTIFY_DEFAULTS = {
     'webhook_url': '',      # Slack-shaped {"text": ...} endpoint
     'lead_time': 3600,      # seconds before expiry to send the reminder
     'timeout': 10,          # seconds to wait for the webhook
+    # A pane that stops changing is the observable end of a run: finished, or
+    # wedged. 0 disables. Re-arms once the session produces output again, so a
+    # session left quiet is announced once, not every poll.
+    'idle_notify': 300,
+    'idle_cooldown': 3600,  # shortest gap between notices for one session
     # Desktop notification on whichever machine runs the TUI.  Needs no
     # endpoint, so unlike the webhook it is on by default.
     'desktop': True,
@@ -76,6 +81,10 @@ NOTIFY_DEFAULTS = {
 _NOTIFY_NUMBER_RULES = {
     'lead_time': (float, 60.0, 86_400.0),
     'timeout':   (float, 1.0, 120.0),
+    # 0 is a real setting here: it turns idle notices off without having to
+    # disable the webhook that job-expiry reminders also use.
+    'idle_notify': (float, 0.0, 86_400.0),
+    'idle_cooldown': (float, 60.0, 604_800.0),
 }
 
 # Defaults mirror the current daemon.py constants exactly.

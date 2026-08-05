@@ -227,6 +227,48 @@ def claim_job(path: str, job_id: str, *, ttl: float = CLAIM_TTL,
             pass
 
 
+def idle_sessions(node: str, info: dict, threshold: float) -> list[dict]:
+    """Sessions on one node that have gone quiet past ``threshold``.
+
+    A pane that stops changing is the observable end of a run: the work
+    finished, or it wedged. Only compute nodes are considered -- a shell left
+    open on a login node or the laptop is idle by design and would be pure
+    noise.
+    """
+    if threshold <= 0 or not isinstance(info, dict):
+        return []
+    job_id = str(info.get('job_id') or '').strip()
+    if not job_id or job_id == '-':
+        return []
+    found = []
+    for entry in info.get('sessions') or ():
+        if not isinstance(entry, (list, tuple)) or len(entry) < 3:
+            continue
+        name = str(entry[0])
+        idle = entry[2]
+        if (not name or isinstance(idle, bool)
+                or not isinstance(idle, (int, float))
+                or not math.isfinite(idle) or idle < threshold):
+            continue
+        found.append({
+            'node': node, 'session': name, 'idle': int(idle),
+            'job_id': job_id, 'job_name': info.get('job_name') or '',
+        })
+    return found
+
+
+def build_idle_message(entry: dict) -> str:
+    """Say what stopped and for how long, and why that is worth a look."""
+    session = str(entry.get('session') or '?')
+    node = str(entry.get('node') or '?')
+    quiet = format_remaining(entry.get('idle') or 0)
+    job = str(entry.get('job_name') or '').strip()
+    job_part = f' (job {job})' if job else ''
+    return (f'AutoTmux: tmux session {session} on {node}{job_part} has shown '
+            f'no output for {quiet} — it has probably finished or '
+            f'stalled.')[:_MAX_TEXT]
+
+
 def post(url: str, text: str, timeout: float) -> tuple[bool, str]:
     """POST one reminder.  Returns ``(delivered, error)``; never raises."""
     body = json.dumps({'text': text}).encode('utf-8')

@@ -403,14 +403,15 @@ network_backoff_cap  = 60  # maximum shared node-network retry delay
 warm_orphan_interval = 30  # seconds between identity-safe warm-child sweeps
 
 [notify]
-# Reminder before a Slurm job hits its time limit. Sent by the daemon on the
-# login node, so it still arrives when the dashboard is closed. Off until a
-# webhook is set.
+# Reminders sent by the daemon on the login node, so they still arrive when
+# the dashboard is closed. Off until a webhook is set.
 enabled     = true         # master switch for every reminder route
 desktop     = true         # notification on the machine running the TUI
 webhook_url = ""           # Slack incoming webhook, or anything accepting
                            # {"text": "..."} (Discord, Teams, ntfy, relays)
-lead_time   = 3600         # seconds before expiry to send the reminder
+lead_time   = 3600         # warn this long before a job hits its time limit
+idle_notify = 300          # warn when a session stops producing output (0 = off)
+idle_cooldown = 3600       # shortest gap between notices for one session
 timeout     = 10           # seconds to wait for the webhook
 
 [keepalive]
@@ -554,6 +555,25 @@ as the activity stamps, so it stays correct when the laptop and the cluster
 disagree about the time. The dot is decoration only: the session name stays
 exactly what `Enter` attaches to. Both thresholds are `[client]` settings —
 `idle_hint` and `idle_stale`.
+
+### Idle-session and job-expiry reminders
+
+Two things are worth being told about without watching the dashboard.
+
+**A session stopped producing output.** That is the observable end of a run:
+the work finished, or it wedged. After `idle_notify` seconds of silence the
+daemon says so:
+
+```
+AutoTmux: tmux session train on holygpu8a11104 (job sweep) has shown no
+output for 15m — it has probably finished or stalled.
+```
+
+Announced once per quiet spell, and re-armed as soon as the session produces
+output again, so a long-lived job is not re-announced every poll while one
+that wakes and stalls again is. Only sessions on compute nodes count: a shell
+left open on a login node or the laptop is idle by design. `idle_notify = 0`
+turns it off without disabling the webhook that expiry reminders share.
 
 ### Job expiry reminders
 

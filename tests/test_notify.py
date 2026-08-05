@@ -1,14 +1,15 @@
-"""Tests for the job-expiry reminder webhook."""
+"""Tests for the job-expiry and idle-session reminder webhooks."""
 import os
 import sys
 import tempfile
 import unittest
 import urllib.error
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from autotmux import config, notify
+from autotmux import config, daemon, notify
 
 
 def _job(job_id='1', time_left='0:45:00', state='RUNNING', **extra):
@@ -58,6 +59,75 @@ class DueJobTests(unittest.TestCase):
 
     def test_malformed_entries_are_skipped_not_fatal(self):
         self.assertEqual(self._due(['nope', None, 42, {}, _job()]), ['1'])
+
+
+def _node(job_id='42', sessions=None, **extra):
+    return {'job_id': job_id, 'job_name': 'train',
+            'sessions': sessions or [], **extra}
+
+
+class IdleSessionTests(unittest.TestCase):
+    """A pane that stops changing is the observable end of a run: the work
+    finished, or it wedged. That is the thing worth pushing to the user."""
+
+    def test_a_quiet_session_is_reported(self):
+        found = notify.idle_sessions(
+            'gpu1', _node(sessions=[['train', '1', 900]]), 300)
+        self.assertEqual([(e['session'], e['idle']) for e in found],
+                         [('train', 900)])
+
+    def test_a_busy_session_is_not(self):
+        self.assertEqual(
+            notify.idle_sessions('gpu1', _node(sessions=[['train', '1', 30]]),
+                                 300), [])
+
+    def test_the_threshold_is_inclusive(self):
+        self.assertEqual(
+            len(notify.idle_sessions(
+                'gpu1', _node(sessions=[['t', '1', 300]]), 300)), 1)
+
+    def test_zero_disables_the_check(self):
+        self.assertEqual(
+            notify.idle_sessions('gpu1', _node(sessions=[['t', '1', 9999]]),
+                                 0), [])
+
+    def test_login_nodes_and_the_laptop_are_skipped(self):
+        """A shell left open on a login node is idle by design; announcing it
+        would be pure noise."""
+        for job_id in ('-', '', None):
+            with self.subTest(job_id=job_id):
+                self.assertEqual(
+                    notify.idle_sessions(
+                        'localhost', _node(job_id=job_id,
+                                           sessions=[['t', '1', 9999]]), 300),
+                    [])
+
+    def test_entries_without_idle_data_are_skipped(self):
+        """An older login-node daemon reports two fields, not three."""
+        self.assertEqual(
+            notify.idle_sessions('gpu1', _node(sessions=[['t', '1']]), 300),
+            [])
+
+    def test_malformed_entries_do_not_raise(self):
+        node = _node(sessions=[
+            'nope', None, [], ['t'], ['t', '1', 'x'], ['t', '1', float('nan')],
+            ['t', '1', True], ['good', '1', 900]])
+        self.assertEqual(
+            [e['session'] for e in notify.idle_sessions('gpu1', node, 300)],
+            ['good'])
+
+    def test_the_message_says_what_stopped_and_for_how_long(self):
+        entry = {'node': 'gpu1', 'session': 'train', 'idle': 900,
+                 'job_name': 'sweep'}
+        text = notify.build_idle_message(entry)
+        self.assertIn('train', text)
+        self.assertIn('gpu1', text)
+        self.assertIn('15m', text)
+        self.assertIn('sweep', text)
+        self.assertIn('finished or stalled', text)
+
+    def test_the_message_survives_missing_fields(self):
+        self.assertTrue(notify.build_idle_message({}))
 
 
 class MessageTests(unittest.TestCase):
@@ -204,6 +274,87 @@ class NotifyConfigTests(unittest.TestCase):
         cfg = self._load('[notify\nnot toml at all')
         self.assertEqual(cfg['webhook_url'], '')
         self.assertEqual(cfg['lead_time'], 3600)
+
+
+class IdleAnnouncementTests(unittest.TestCase):
+    """Announced once per quiet spell, re-armed when the session moves again."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.sent = []
+        self._saved_cfg = daemon._notify_cfg
+        self._saved_seen = daemon._idle_announced
+        daemon._idle_announced = {}
+        daemon._notify_cfg = dict(config.NOTIFY_DEFAULTS)
+        daemon._notify_cfg.update(
+            enabled=True, webhook_url='https://x.test/h', idle_notify=300)
+        self.patchers = [
+            mock.patch.object(config, 'NOTIFY_CLAIM_PATH',
+                              os.path.join(self.temp.name, 'claims.json')),
+            mock.patch.object(
+                daemon.notify, 'post',
+                side_effect=lambda u, t, to: (self.sent.append(t), (True, ''))[1]),
+            # Deliver inline so the assertions do not race a worker thread.
+            mock.patch.object(
+                daemon.threading, 'Thread',
+                side_effect=lambda target, args, **kw: SimpleNamespace(
+                    start=lambda: target(*args))),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self.patchers):
+            patcher.stop()
+        daemon._notify_cfg = self._saved_cfg
+        daemon._idle_announced = self._saved_seen
+        self.temp.cleanup()
+
+    def _poll(self, idle, session='train'):
+        daemon._notify_idle_sessions('gpu1', {
+            'job_id': '42', 'job_name': 'sweep',
+            'sessions': [[session, '1', idle]]})
+
+    def test_one_message_per_quiet_spell(self):
+        self._poll(900)
+        self._poll(960)
+        self._poll(1200)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_activity_re_arms_the_session(self):
+        self._poll(900)
+        self._poll(5)              # produced output again
+        self.assertEqual(daemon._idle_announced.get('gpu1'), set())
+
+    def test_a_second_spell_is_held_off_by_the_cooldown(self):
+        """Across four login-node daemons the shared claim is what stops the
+        same session being announced four times."""
+        self._poll(900)
+        self._poll(5)
+        self._poll(900)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_nothing_is_sent_without_a_webhook(self):
+        daemon._notify_cfg['webhook_url'] = ''
+        self._poll(900)
+        self.assertEqual(self.sent, [])
+
+    def test_zero_threshold_disables_it(self):
+        daemon._notify_cfg['idle_notify'] = 0
+        self._poll(9999)
+        self.assertEqual(self.sent, [])
+
+    def test_a_failed_post_is_not_recorded_as_delivered(self):
+        with mock.patch.object(daemon.notify, 'post',
+                               return_value=(False, 'boom')):
+            self._poll(900)
+        self.assertEqual(self.sent, [])
+
+    def test_distinct_sessions_are_announced_separately(self):
+        daemon._notify_idle_sessions('gpu1', {
+            'job_id': '42', 'job_name': 'sweep',
+            'sessions': [['a', '1', 900], ['b', '1', 900]]})
+        self.assertEqual(len(self.sent), 2)
 
 
 class LocalNotifyTests(unittest.TestCase):

@@ -140,6 +140,8 @@ _keepalive_mgr = keepalive.KeepAliveManager(config.KEEPALIVE_PATH,
 # is actually worth sending.
 _notify_cfg = dict(config.NOTIFY_DEFAULTS)
 _notified_jobs: set[str] = set()
+# node -> sessions already announced as quiet, cleared when they move again.
+_idle_announced: dict[str, set] = {}
 _notify_lock = threading.Lock()
 
 # ── tunables (overridable via ~/.config/autotmux/config.toml) ───────────────
@@ -1322,6 +1324,60 @@ def _notify_expiring_jobs(node_infos: dict) -> None:
                              name=f"notify-{job.get('job_id')}").start()
         except RuntimeError as error:
             log.warning(f'could not start reminder thread: {error}')
+
+
+def _notify_idle_sessions(node: str, info: dict) -> None:
+    """Announce a session that has stopped producing output.
+
+    That is the observable end of a run -- the work finished, or it wedged --
+    and it is the thing a user actually wants pushed to them, since noticing
+    it otherwise means watching the dashboard.
+
+    Announced once per quiet spell: the local record is cleared as soon as the
+    session produces output again, so a long-running job is not re-announced
+    every poll, while a session that wakes and stalls again is.
+    """
+    if not _notify_cfg.get('enabled') or not _notify_cfg.get('webhook_url'):
+        return
+    threshold = float(_notify_cfg.get('idle_notify') or 0)
+    if threshold <= 0:
+        return
+    try:
+        quiet = notify.idle_sessions(node, info, threshold)
+    except Exception as error:
+        log.warning(f'idle-session check failed: {error}')
+        return
+
+    quiet_names = {entry['session'] for entry in quiet}
+    with _notify_lock:
+        announced = _idle_announced.setdefault(node, set())
+        # Re-arm anything that has started moving again.
+        announced &= quiet_names
+        pending = [entry for entry in quiet
+                   if entry['session'] not in announced]
+        announced.update(entry['session'] for entry in pending)
+
+    def deliver(entry: dict) -> None:
+        # Every login node's daemon watches the same sessions.
+        key = f"idle:{entry['node']}:{entry['session']}"
+        if not notify.claim_job(config.NOTIFY_CLAIM_PATH, key,
+                                ttl=float(_notify_cfg['idle_cooldown'])):
+            return
+        text = notify.build_idle_message(entry)
+        ok, error = notify.post(
+            _notify_cfg['webhook_url'], text, float(_notify_cfg['timeout']))
+        if ok:
+            log.info(f"sent idle notice for {entry['node']}:"
+                     f"{entry['session']} ({entry['idle']}s)")
+        else:
+            log.warning(f'idle notice not delivered: {error}')
+
+    for entry in pending:
+        try:
+            threading.Thread(target=deliver, args=(entry,), daemon=True,
+                             name=f"idle-{entry['session'][:16]}").start()
+        except RuntimeError as error:
+            log.warning(f'could not start idle-notice thread: {error}')
 
 
 def _squeue_loop():
@@ -2627,6 +2683,7 @@ def _session_loop():
                     sessions, nproc, load, escape_time = (
                         _parse_session_payload(out))
                     lease.success()
+                    snapshot = None
                     with _lock:
                         info = current_info(node, job_id, generation)
                         if info is not None:
@@ -2638,6 +2695,11 @@ def _session_loop():
                             if escape_time:
                                 info['escape_time'] = escape_time
                             _set_info_error_locked(info, 'session', None)
+                            snapshot = dict(info)
+                    if snapshot is not None:
+                        # Outside the lock: delivery must never hold up the
+                        # poll loop that draws every dashboard.
+                        _notify_idle_sessions(node, snapshot)
                 except subprocess.CalledProcessError as error:
                     # The remote script ends with `exit 0`, so a non-zero status
                     # means ssh/shell failed, not merely "no tmux sessions".
