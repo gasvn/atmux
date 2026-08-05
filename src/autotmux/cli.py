@@ -2510,6 +2510,10 @@ class HelpScreen(ModalScreen[None]):
         text-style: bold;
         color: $accent;
     }
+    #help_intro {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
     #help_table {
         height: auto;
     }
@@ -2518,18 +2522,31 @@ class HelpScreen(ModalScreen[None]):
     }
     """
 
-    def __init__(self, rows) -> None:
+    def __init__(self, intro, sections, columns) -> None:
         super().__init__()
-        self._rows = list(rows)
+        self._intro = str(intro)
+        self._sections = list(sections)
+        self._columns = list(columns)
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="help_dialog"):
-            yield Label("Keys", id="help_title", markup=False)
+        with VerticalScroll(id="help_dialog"):
+            yield Label("What this does", id="help_title", markup=False)
+            yield Static(self._intro, id="help_intro", markup=False)
             table = DataTable(id="help_table", cursor_type="none")
             table.show_header = True
-            table.add_columns("KEY", "DOES", "ACTS ON")
-            for key, does, acts_on in self._rows:
-                table.add_row(*(_literal_cell(v) for v in (key, does, acts_on)))
+            table.add_columns("KEY", "DOES", "NOTE")
+            for title, rows in self._sections:
+                # A blank key cell turns the row into a heading, which keeps
+                # one aligned grid instead of a stack of separate tables.
+                table.add_row(*(_literal_cell(v)
+                                for v in ('', f'— {title} —', '')))
+                for key, does, note in rows:
+                    table.add_row(
+                        *(_literal_cell(v) for v in (key, does, note)))
+            table.add_row(*(_literal_cell(v)
+                            for v in ('', '— Columns —', '')))
+            for name, meaning in self._columns:
+                table.add_row(*(_literal_cell(v) for v in (name, meaning, '')))
             yield table
             yield Label("Esc or ? to close", id="help_footer", markup=False)
 
@@ -2792,27 +2809,51 @@ class AutotmuxApp(App):
         Binding("t", "local_shell", "Local tmux", show=False),
     ]
 
-    # (key, what it does, what it acts on) — the third column is the part the
-    # footer has no room for and the user most often needs.
-    HELP_ROWS = [
-        ("Enter", "Attach to the tmux session", "selected row"),
-        ("s", "Open a plain SSH shell", "selected row's node"),
-        ("t", "Open/attach a local tmux session", "this machine"),
-        ("o", "Attach in a new window of the surrounding tmux",
-         "selected row"),
-        ("k", "Toggle Slurm auto-renew before the walltime ends",
-         "selected row's job"),
-        ("j", "Switch the bottom panel: running / pending jobs", "all jobs"),
-        ("g", "Choose which login nodes to route through", "whole session"),
-        ("r", "Refresh now (the table also refreshes on its own)",
-         "whole table"),
-        ("↑ / ↓", "Move the selection", "table"),
-        ("click", "Select and attach in one action", "clicked row"),
-        # Bound in the outer tmux itself, not by AutoTmux, so it still works
-        # when this process is gone -- which is exactly when it is needed.
-        ("F12", "Restore the outer tmux after a killed client",
-         "surrounding tmux"),
-        ("q", "Quit", "AutoTmux"),
+    # One line of orientation: the keys only make sense once it is clear that
+    # the sessions are somewhere else and outlive the connection to them.
+    HELP_INTRO = (
+        "Your tmux sessions run on Slurm compute nodes, not here. They keep "
+        "running after you disconnect; this table finds them and connects you."
+    )
+
+    # Grouped by intent, because the confusing part is not any single key --
+    # it is that four of them "connect" and differ only in where they land and
+    # whether the thing survives disconnecting.
+    HELP_SECTIONS = [
+        ("Connect", [
+            ("Enter", "Attach to an existing session", "survives"),
+            ("click", "Same as Enter, in one action", "survives"),
+            ("o", "Attach in a new window of your tmux", "survives"),
+            ("s", "Plain SSH shell on that node", "dies on exit"),
+            ("t", "Local tmux on this machine", "survives"),
+        ]),
+        ("Allocation", [
+            ("k", "Resubmit the batch script before walltime", "batch only"),
+            ("j", "Bottom panel: running / queued jobs", "all jobs"),
+        ]),
+        ("View", [
+            ("g", "Pick which login nodes to route through", "whole session"),
+            ("r", "Refresh now (it also refreshes itself)", "whole table"),
+            ("↑ / ↓", "Move the selection", "table"),
+            ("q", "Quit", "AutoTmux"),
+        ]),
+        ("Recovery", [
+            # Bound in the outer tmux itself, not by AutoTmux, so it still
+            # works when this process is gone -- exactly when it is needed.
+            ("F12", "Restore the outer tmux after a killed client",
+             "bound by tmux"),
+        ]),
+    ]
+
+    # Flat view, for the tests and anything that just wants every key.
+    HELP_ROWS = [row for _title, rows in HELP_SECTIONS for row in rows]
+
+    # What the less obvious columns mean.
+    HELP_COLUMNS = [
+        ("IDLE", "Quiet time: yellow past 5m, red past 1h"),
+        ("LEFT", "Time until Slurm ends the job"),
+        ("LOAD", "1-min load / cores; 35.0/1 is oversubscribed"),
+        ("WIN", "Windows inside that tmux session"),
     ]
 
     title = reactive(f"AutoTmux v{__version__}")
@@ -2942,7 +2983,8 @@ class AutotmuxApp(App):
             return
         self._help_open = True
         try:
-            await self.push_screen_wait(HelpScreen(self.HELP_ROWS))
+            await self.push_screen_wait(HelpScreen(
+                self.HELP_INTRO, self.HELP_SECTIONS, self.HELP_COLUMNS))
         except Exception:
             pass
         finally:

@@ -1167,10 +1167,33 @@ class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Enter', documented)
 
     def test_help_rows_say_what_each_key_acts_on(self):
-        for key, does, acts_on in autotmux.AutotmuxApp.HELP_ROWS:
+        for key, does, note in autotmux.AutotmuxApp.HELP_ROWS:
             with self.subTest(key=key):
-                self.assertTrue(key and does and acts_on)
-                self.assertLessEqual(len(does), 60)
+                self.assertTrue(key and does and note)
+                self.assertLessEqual(len(does), 50)
+                self.assertLessEqual(len(note), 16)
+
+    def test_help_explains_the_model_before_the_keys(self):
+        """The keys only make sense once it is clear the sessions are
+        elsewhere and outlive the connection."""
+        intro = autotmux.AutotmuxApp.HELP_INTRO.lower()
+        self.assertIn('compute node', intro)
+        self.assertIn('after you disconnect', intro)
+
+    def test_the_four_connecting_keys_are_grouped_and_distinguished(self):
+        """Enter/click/o/s/t all "connect"; what differs is where they land
+        and whether the thing survives leaving."""
+        connect = dict(
+            (row[0], row[2])
+            for title, rows in autotmux.AutotmuxApp.HELP_SECTIONS
+            if title == 'Connect' for row in rows)
+        self.assertEqual(set(connect), {'Enter', 'click', 'o', 's', 't'})
+        self.assertEqual(connect['s'], 'dies on exit')
+        self.assertEqual(connect['Enter'], 'survives')
+
+    def test_the_non_obvious_columns_are_explained(self):
+        documented = {name for name, _ in autotmux.AutotmuxApp.HELP_COLUMNS}
+        self.assertEqual(documented, {'IDLE', 'LEFT', 'LOAD', 'WIN'})
 
     async def test_question_mark_opens_and_closes_help(self):
         app = autotmux.AutotmuxApp()
