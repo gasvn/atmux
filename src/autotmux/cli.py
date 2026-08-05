@@ -46,7 +46,7 @@ from autotmux import __version__
 
 from autotmux import (
     config, gateway as gateway_client, ipc, keepalive, lifecycle, notify,
-    paths, warm_registry,
+    paths, urlhandler, warm_registry,
 )
 
 STATE_FILE = paths.STATE_FILE
@@ -4216,17 +4216,19 @@ class AutotmuxApp(App):
                         returncode, command_error = _run_user_command(
                             [os.environ.get('SHELL') or '/bin/bash'])
                     else:
-                        returncode, command_error = _run_user_command(
-                            ['tmux', 'attach', '-t', sess])
+                        with urlhandler.attached(node, sess):
+                            returncode, command_error = _run_user_command(
+                                ['tmux', 'attach', '-t', sess])
                 else:
                     if direct_preferred:
                         print(f"\n[atmux] {node} is in network recovery; "
                               "opening a fresh SSH connection.", flush=True)
                     remote_args = None if sess == _START_SHELL_SESSION else [
                         'tmux', 'attach', '-t', shlex.quote(sess)]
-                    returncode, command_error, _used_direct = (
-                        _run_remote_user_command(
-                            node, remote_args, direct=direct_preferred))
+                    with urlhandler.attached(node, sess):
+                        returncode, command_error, _used_direct = (
+                            _run_remote_user_command(
+                                node, remote_args, direct=direct_preferred))
                     if returncode == 255:
                         network_outcome = 'failure'
                         network_reason = command_error or 'interactive SSH failed'
@@ -4695,15 +4697,16 @@ def _direct_attach(target: str) -> int:
                 'atmux: outer-tmux passthrough unavailable; use the outer '
                 'prefix twice for the inner tmux\n')
     try:
-        if node == 'localhost':
-            returncode, error = _run_user_command(
-                ['tmux', 'attach', '-t', session])
-        else:
-            returncode, error, _used_direct = _run_remote_user_command(
-                node, ['tmux', 'attach', '-t', shlex.quote(session)],
-                direct=_published_direct_preference(node))
-            _publish_remote_command_result(
-                node, returncode, error, 'direct-attach')
+        with urlhandler.attached(node, session):
+            if node == 'localhost':
+                returncode, error = _run_user_command(
+                    ['tmux', 'attach', '-t', session])
+            else:
+                returncode, error, _used_direct = _run_remote_user_command(
+                    node, ['tmux', 'attach', '-t', shlex.quote(session)],
+                    direct=_published_direct_preference(node))
+                _publish_remote_command_result(
+                    node, returncode, error, 'direct-attach')
     finally:
         if nest:
             restore_ok = _tmux_restore()
@@ -4736,6 +4739,21 @@ def _direct_shell(node: str) -> int:
     return returncode
 
 
+def _handler_atmux_path(env=None, argv0=None) -> str:
+    """The atmux the URL handler applet should run.
+
+    ``ATMUX_BIN`` wins so the installer can point the applet at the launcher the
+    user actually invokes -- typically ``~/.local/bin/atmux``, which survives a
+    rebuilt virtualenv, whereas this process may already have been exec'd
+    through it into the venv's own entry point.
+    """
+    env = os.environ if env is None else env
+    override = (env.get('ATMUX_BIN') or '').strip()
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.realpath((sys.argv[0] if argv0 is None else argv0) or 'atmux')
+
+
 def _build_argparser():
     import argparse
     p = argparse.ArgumentParser(
@@ -4753,6 +4771,12 @@ def _build_argparser():
         help='Attach from an atmux://attach/NODE/SESSION link. The URL is '
              'untrusted input: it is validated here and dispatched as argv, '
              'never through a shell.')
+    target.add_argument(
+        '--print-url-handler', dest='print_url_handler', nargs='?',
+        const='', choices=('',) + urlhandler.TERMINALS, metavar='TERMINAL',
+        help='Print the AppleScript for the macOS atmux:// handler and exit. '
+             'Used by contrib/install-url-handler-macos.sh; TERMINAL defaults '
+             'to iTerm when it is installed, else Terminal.')
     target.add_argument(
         '--connections', action='store_true',
         help='Open the TUI connection manager on startup.')
@@ -4894,6 +4918,13 @@ def main():
     global _RUNTIME_DISCOVERY_ENABLED
     parser = _build_argparser()
     args = parser.parse_args()
+    if args.print_url_handler is not None:
+        # Pure text generation: nothing about the runtime, the config or the
+        # gateways is needed, so answer before any of it is touched.
+        sys.stdout.write(urlhandler.applescript(
+            _handler_atmux_path(),
+            args.print_url_handler or urlhandler.default_terminal()))
+        sys.exit(0)
     deployment_error = _configure_gateway_mode(args)
     if deployment_error:
         parser.error(deployment_error)

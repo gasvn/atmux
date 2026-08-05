@@ -593,6 +593,45 @@ that wakes and stalls again is. Only sessions on compute nodes count: a shell
 left open on a login node or the laptop is idle by design. `idle_notify = 0`
 turns it off without disabling the webhook that expiry reminders share.
 
+#### Clickable reminders (macOS)
+
+With `attach_link = true`, each reminder carries an **Attach** link that opens
+the session it is about:
+
+```
+… has probably finished or stalled.  <atmux://attach/holygpu8a11104/train|Attach>
+```
+
+Install the handler that resolves the scheme once per Mac:
+
+```bash
+contrib/install-url-handler-macos.sh          # or pass an explicit atmux path
+```
+
+It builds a small applet in `~/Applications`, points it at your `atmux`, and
+registers `atmux://` with LaunchServices. The first click asks for permission
+to control iTerm2 (or Terminal.app); that consent is what lets a link open a
+window at all. Re-running the installer can ask again, because the applet is
+signed ad-hoc and macOS treats each build as a new program.
+
+Clicking a link for a session you are **already attached to** raises that
+window instead of opening a second one — two tmux clients on one session share
+a size, so a duplicate silently shrinks whichever window was larger. On iTerm2
+this works for any attach, including ones started from the dashboard: atmux
+tags its window with an `OSC 1337 SetUserVar` escape as it attaches and clears
+it on the way out. Terminal.app has no equivalent, so there reuse only finds
+windows the handler itself opened.
+
+The link is untrusted input — anyone who can post to the channel can craft one
+— so `atmux --open-url` validates the node and session against a conservative
+character set and passes them on as argv. Nothing from a URL reaches a shell
+before that check. Every click appends one line to
+`/tmp/atmux-url-handler.log`, which is the only place a failure shows up: a
+link that cannot open leaves the terminal in the foreground and nothing else.
+
+Leave `attach_link = false` (the default) if you read reminders anywhere the
+scheme is not installed; a dead link is worse than none.
+
 ### Job expiry reminders
 
 Point `[notify].webhook_url` at a Slack incoming webhook — or anything that

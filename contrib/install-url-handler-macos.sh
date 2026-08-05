@@ -30,41 +30,18 @@ BUNDLE_ID="com.autotmux.urlhandler"
 BUILD="$(mktemp -d)"
 trap 'rm -rf "${BUILD}"' EXIT
 
-# Which terminal to open. iTerm2 if present, else Terminal.app -- the attach
-# needs a real TTY, so this cannot run under `do shell script`.
-if [[ -d "/Applications/iTerm.app" ]]; then
-    OPEN_CMD='tell application "iTerm"
-            activate
-            create window with default profile command theCommand
-        end tell'
-else
-    OPEN_CMD='tell application "Terminal"
-            activate
-            do script theCommand
-        end tell'
+# The AppleScript lives in autotmux.urlhandler, not here: the URL is untrusted
+# input that crosses an AppleScript literal, a shell word and argv on its way to
+# the attach, and generating it in Python puts that quoting under test. ATMUX_BIN
+# points the applet at the launcher the user invokes rather than whatever this
+# process was exec'd into.
+if ! ATMUX_BIN="${ATMUX}" "${ATMUX}" --print-url-handler \
+        > "${BUILD}/handler.applescript" 2>"${BUILD}/err"; then
+    echo "Could not generate the handler script:" >&2
+    cat "${BUILD}/err" >&2
+    echo "Is ${ATMUX} an AutoTmux 0.6.2 or newer install?" >&2
+    exit 1
 fi
-
-# iTerm2 and Terminal.app exec the command as argv rather than handing it to a
-# shell, so a bare `quoted form of` path arrives with its quotes intact and the
-# binary is not found -- the window opens and dies immediately. Wrap it in an
-# explicit `/bin/sh -c` instead; the inner quoting is what keeps the URL, which
-# is untrusted, from being reinterpreted.
-cat > "${BUILD}/handler.applescript" <<APPLESCRIPT
-on open location this_URL
-    set inner to quoted form of "${ATMUX}" & " --open-url " & quoted form of this_URL
-    set theCommand to "/bin/sh -c " & quoted form of ("exec " & inner)
-    try
-        ${OPEN_CMD}
-    on error errMsg
-        -- The likeliest failure is macOS withholding automation consent, which
-        -- is silent from the user's side: the terminal comes forward but no
-        -- session opens. Leave a breadcrumb rather than nothing.
-        do shell script "printf '%s\n' " & quoted form of errMsg & ¬
-            " >> /tmp/atmux-url-handler.log"
-        display notification errMsg with title "AutoTmux link failed"
-    end try
-end open location
-APPLESCRIPT
 
 mkdir -p "${HOME}/Applications"
 rm -rf "${APP}"
