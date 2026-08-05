@@ -466,17 +466,23 @@ legacy `/tmp` pid file so you don't end up with two daemons.
 └─────────────────────────────────────────────┘
 ```
 
-| Key       | Action |
-| :-------- | :----- |
-| **↑ / ↓** | Navigate the session list. |
-| **Enter** | Attach to the selected tmux session via SSH (or local tmux). |
-| **s**     | Open a raw SSH shell on the selected node. |
-| **t**     | Open / attach to a local tmux session (`autotmux_local`). |
-| **o**     | Open the attach in a new tmux window of the surrounding tmux. |
-| **k**     | Toggle auto-renew for the selected Slurm job (batch jobs only). |
-| **j**     | Toggle the bottom jobs panel between `squeue -l` and `squeue --start`. |
-| **r**     | Force-refresh the table from the daemon snapshot. |
-| **q**     | Quit. |
+| Key | Does | Acts on |
+| :-- | :--- | :------ |
+| **Enter** / click | Attach to the tmux session | selected row |
+| **s** | Open a plain SSH shell | selected row's node |
+| **t** | Open / attach a local tmux session | this machine |
+| **o** | Attach in a new window of the surrounding tmux | selected row |
+| **k** | Toggle Slurm auto-renew before the walltime ends | selected row's job |
+| **j** | Switch the bottom panel: running / pending jobs | all jobs |
+| **g** | Choose which login nodes to route through | whole session |
+| **r** | Refresh now (the table also refreshes on its own) | whole table |
+| **↑ / ↓** | Move the selection | table |
+| **?** | Show this list in the app | — |
+| **F12** | Restore the outer tmux after a killed client | surrounding tmux |
+| **q** | Quit | AutoTmux |
+
+Rarely-used keys (`r`, `t`) are kept out of the footer so the visible row stays
+readable on a narrow terminal; `?` lists everything.
 
 When `atmux` itself runs inside tmux, it temporarily hands the outer client
 directly to the SSH helper with `detach-client -E`; after detach it automatically

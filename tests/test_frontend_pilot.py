@@ -1120,6 +1120,81 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
                              'Active')
 
 
+class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
+    """A key the user cannot interpret is a key they will not use."""
+
+    def setUp(self):
+        self._saved_launch = autotmux._launch_daemon
+        autotmux._launch_daemon = lambda: (True, '')
+
+    def tearDown(self):
+        autotmux._launch_daemon = self._saved_launch
+
+    def test_attach_is_advertised_on_the_table_itself(self):
+        """The focused widget's bindings win, so an App-level entry for enter
+        would never reach the footer -- it has to live on the table."""
+        binding = next(
+            b for b in autotmux.ClickToAttachDataTable.BINDINGS
+            if b.key == 'enter')
+        self.assertEqual(binding.description, 'Attach')
+        self.assertTrue(binding.show)
+
+    def test_every_footer_label_names_what_it_acts_on(self):
+        """"Shell" and "Local Shell" gave no clue which machine they land on."""
+        shown = {b.key: b.description
+                 for b in autotmux.AutotmuxApp.BINDINGS if b.show}
+        self.assertEqual(shown['s'], 'SSH to node')
+        self.assertEqual(shown['o'], 'Attach in new window')
+        self.assertEqual(shown['k'], 'Auto-renew job')
+        self.assertEqual(shown['g'], 'Login nodes')
+        for description in shown.values():
+            self.assertEqual(description, description.strip())
+            self.assertTrue(description[:1].isupper() or description[:1] == '↑')
+
+    def test_rare_keys_are_hidden_but_still_bound(self):
+        by_key = {b.key: b for b in autotmux.AutotmuxApp.BINDINGS}
+        for key in ('r', 't'):
+            with self.subTest(key=key):
+                self.assertIn(key, by_key)
+                self.assertFalse(by_key[key].show)
+
+    def test_help_documents_every_bound_key(self):
+        documented = {row[0] for row in autotmux.AutotmuxApp.HELP_ROWS}
+        bound = {b.key for b in autotmux.AutotmuxApp.BINDINGS
+                 if b.key != 'question_mark'}
+        missing = {k for k in bound if k not in documented}
+        self.assertEqual(missing, set(), f'undocumented keys: {missing}')
+        self.assertIn('Enter', documented)
+
+    def test_help_rows_say_what_each_key_acts_on(self):
+        for key, does, acts_on in autotmux.AutotmuxApp.HELP_ROWS:
+            with self.subTest(key=key):
+                self.assertTrue(key and does and acts_on)
+                self.assertLessEqual(len(does), 60)
+
+    async def test_question_mark_opens_and_closes_help(self):
+        app = autotmux.AutotmuxApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("question_mark")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, autotmux.HelpScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, autotmux.HelpScreen)
+
+    async def test_help_cannot_be_stacked_onto_itself(self):
+        app = autotmux.AutotmuxApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for _ in range(3):
+                await pilot.press("question_mark")
+                await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, autotmux.HelpScreen)
+
+
 class WarnedJobPersistenceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

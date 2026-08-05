@@ -2440,6 +2440,12 @@ class ClickToAttachDataTable(DataTable):
     clicks (row/column index -1) are left untouched for upstream to handle.
     """
 
+    # Upstream binds enter as a hidden "Select". The focused widget's bindings
+    # win, so an App-level entry for the same key never reaches the footer --
+    # attaching, the whole point of the table, went undocumented. Re-declare it
+    # with a name that says what it does.
+    BINDINGS = [Binding("enter", "select_cursor", "Attach", show=True)]
+
     async def _on_click(self, event: events.Click) -> None:
         meta = event.style.meta
         if "row" not in meta or "column" not in meta:
@@ -2473,6 +2479,62 @@ def _make_no_motion_driver(base_cls):
             # Deliberately NOT 1003h (any-motion) — see docstring.
             self.flush()
     return _NoMotionDriver
+
+
+class HelpScreen(ModalScreen[None]):
+    """Full key list, including the ones the footer has no room for."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss_help", "Close"),
+        Binding("q", "dismiss_help", "Close"),
+        Binding("question_mark", "dismiss_help", "Close"),
+    ]
+
+    CSS = """
+    HelpScreen {
+        align: center middle;
+        background: $background 60%;
+    }
+    #help_dialog {
+        /* Wide enough that ACTS ON -- the column the footer cannot show at
+           all, and the one users actually need -- is not itself truncated. */
+        width: 88;
+        max-width: 94%;
+        height: auto;
+        max-height: 90%;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #help_title {
+        text-style: bold;
+        color: $accent;
+    }
+    #help_table {
+        height: auto;
+    }
+    #help_footer {
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, rows) -> None:
+        super().__init__()
+        self._rows = list(rows)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help_dialog"):
+            yield Label("Keys", id="help_title", markup=False)
+            table = DataTable(id="help_table", cursor_type="none")
+            table.show_header = True
+            table.add_columns("KEY", "DOES", "ACTS ON")
+            for key, does, acts_on in self._rows:
+                table.add_row(*(_literal_cell(v) for v in (key, does, acts_on)))
+            yield table
+            yield Label("Esc or ? to close", id="help_footer", markup=False)
+
+    def action_dismiss_help(self) -> None:
+        self.dismiss(None)
 
 
 class ConnectionManager(ModalScreen[dict | None]):
@@ -2711,18 +2773,46 @@ class AutotmuxApp(App):
     }
     """
 
+    # Labels name the object, not the verb alone: "Shell" and "Local Shell"
+    # gave no clue which machine either one lands on. Enter leads because it
+    # is the whole point of the table, and it was missing from the footer
+    # entirely -- DataTable consumes the key and emits RowSelected, so the
+    # binding below never fires, but it documents the key and `?` explains it.
+    # Rarely-used keys are hidden from the footer and listed in help instead,
+    # so the visible row stays readable on a narrow terminal.
     BINDINGS = [
+        Binding("s", "open_shell", "SSH to node"),
+        Binding("o", "new_window", "Attach in new window"),
+        Binding("k", "toggle_keepalive", "Auto-renew job"),
+        Binding("j", "toggle_jobs_view", "Jobs panel"),
+        Binding("g", "manage_connections", "Login nodes"),
+        Binding("question_mark", "show_help", "Help"),
         Binding("q", "app.quit", "Quit"),
-        Binding("r", "refresh_table", "Refresh"),
-        Binding("g", "manage_connections", "Connections"),
-        # Enter is handled by on_data_table_row_selected (DataTable consumes
-        # the key itself and emits RowSelected, so an App-level Binding
-        # for "enter" would never fire).
-        Binding("s", "open_shell", "Shell"),
-        Binding("t", "local_shell", "Local Shell"),
-        Binding("o", "new_window", "New Window"),
-        Binding("k", "toggle_keepalive", "Keep-alive"),
-        Binding("j", "toggle_jobs_view", "Jobs view"),
+        Binding("r", "refresh_table", "Refresh now", show=False),
+        Binding("t", "local_shell", "Local tmux", show=False),
+    ]
+
+    # (key, what it does, what it acts on) — the third column is the part the
+    # footer has no room for and the user most often needs.
+    HELP_ROWS = [
+        ("Enter", "Attach to the tmux session", "selected row"),
+        ("s", "Open a plain SSH shell", "selected row's node"),
+        ("t", "Open/attach a local tmux session", "this machine"),
+        ("o", "Attach in a new window of the surrounding tmux",
+         "selected row"),
+        ("k", "Toggle Slurm auto-renew before the walltime ends",
+         "selected row's job"),
+        ("j", "Switch the bottom panel: running / pending jobs", "all jobs"),
+        ("g", "Choose which login nodes to route through", "whole session"),
+        ("r", "Refresh now (the table also refreshes on its own)",
+         "whole table"),
+        ("↑ / ↓", "Move the selection", "table"),
+        ("click", "Select and attach in one action", "clicked row"),
+        # Bound in the outer tmux itself, not by AutoTmux, so it still works
+        # when this process is gone -- which is exactly when it is needed.
+        ("F12", "Restore the outer tmux after a killed client",
+         "surrounding tmux"),
+        ("q", "Quit", "AutoTmux"),
     ]
 
     title = reactive(f"AutoTmux v{__version__}")
@@ -2732,6 +2822,7 @@ class AutotmuxApp(App):
         super().__init__()
         self._connection_setup_pending = bool(offer_connection_setup)
         self._connection_manager_open = False
+        self._help_open = False
         self._restart_attempts = []   # time.monotonic() of recent daemon restarts
         self._crash_looping = False
         self._recovery_inflight = False
@@ -2844,6 +2935,18 @@ class AutotmuxApp(App):
                         group='initial-snapshots')
         if self._connection_setup_pending:
             self.call_after_refresh(self.action_manage_connections)
+
+    async def action_show_help(self) -> None:
+        """Show every key, including those the footer cannot fit."""
+        if self._help_open:
+            return
+        self._help_open = True
+        try:
+            await self.push_screen_wait(HelpScreen(self.HELP_ROWS))
+        except Exception:
+            pass
+        finally:
+            self._help_open = False
 
     async def action_manage_connections(self) -> None:
         """Open the local SSH-alias picker without blocking the render loop."""
