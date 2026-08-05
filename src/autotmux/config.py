@@ -136,6 +136,11 @@ CLIENT_DEFAULTS = {
     # How long a tmux session must be quiet before the list flags it.
     'idle_hint': 300,
     'idle_stale': 3600,
+    # Mouse reporting hands clicks to the app, which is what makes
+    # click-to-attach work -- and what stops the terminal doing its own text
+    # selection. "auto" keeps it on locally and off over SSH; "off" trades
+    # click-to-attach for being able to select and copy with the mouse.
+    'mouse': 'auto',
 }
 
 _CLIENT_NUMBER_RULES = {
@@ -538,6 +543,15 @@ def load_client() -> dict:
             log.warning('ignoring invalid client agent_command')
         else:
             cfg['agent_command'] = command
+
+    if 'mouse' in section:
+        value = section['mouse']
+        if isinstance(value, str) and value.strip().lower() in {
+                'auto', 'on', 'off'}:
+            cfg['mouse'] = value.strip().lower()
+        else:
+            log.warning("ignoring invalid client mouse "
+                        "(expected 'auto', 'on' or 'off')")
 
     if 'control_path' in section:
         control_path = _client_control_path(section['control_path'])

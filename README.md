@@ -131,6 +131,7 @@ server_alive_max = 3
 
 idle_hint = 300     # seconds of tmux quiet before a session is flagged
 idle_stale = 3600   # seconds before the flag escalates to the red tier
+mouse = "auto"      # "off" restores the terminal's own text selection
 ```
 
 ### Reusing externally managed SSH masters
@@ -484,6 +485,23 @@ legacy `/tmp` pid file so you don't end up with two daemons.
 
 Rarely-used keys (`r`, `t`) are kept out of the footer so the visible row stays
 readable on a narrow terminal; `?` lists everything.
+
+### Selecting text with the mouse
+
+Mouse reporting is what lets a click attach to a session — and it is also what
+stops the terminal doing its own selection, because the clicks go to AutoTmux
+instead. Reporting is on locally and off over SSH by default.
+
+To select and copy normally, either hold the terminal's bypass modifier while
+dragging (Option in iTerm2 and Terminal.app, Shift in kitty/Alacritty/GNOME
+Terminal), or give up click-to-attach and use `Enter`:
+
+```toml
+[client]
+mouse = "off"       # "auto" (default) | "on" | "off"
+```
+
+`atmux --no-mouse` and `atmux --mouse` still override it for a single run.
 
 When `atmux` itself runs inside tmux, it temporarily hands the outer client
 directly to the SSH helper with `detach-client -E`; after detach it automatically

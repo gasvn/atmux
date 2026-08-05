@@ -4794,11 +4794,26 @@ def _is_remote_session() -> bool:
 
 
 def _want_mouse(args) -> bool:
+    """Whether to report mouse events to the app.
+
+    Reporting is what makes click-to-attach work, and also what stops the
+    terminal doing its own text selection -- so this has to be settable
+    without retyping a flag every launch. Order: explicit flag, saved
+    preference, then the default of on locally and off over SSH (where the
+    report traffic competes with keystrokes).
+    """
     if args.no_mouse:
         return False
     if args.mouse:
         return True
-    return not _is_remote_session()   # on locally, off over SSH
+    ok, settings = _load_client_config_bounded()
+    if ok and isinstance(settings, dict):
+        preference = str(settings.get('mouse') or 'auto').lower()
+        if preference == 'off':
+            return False
+        if preference == 'on':
+            return True
+    return not _is_remote_session()
 
 
 def _configure_gateway_mode(args) -> str:

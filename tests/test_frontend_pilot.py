@@ -1137,6 +1137,42 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
                              '')
 
 
+class MousePreferenceTests(unittest.TestCase):
+    """Mouse reporting is what makes click-to-attach work and what stops the
+    terminal selecting text, so the choice has to survive without a flag."""
+
+    def _want(self, body='[client]\n', *, no_mouse=False, mouse=False,
+              remote=False):
+        args = SimpleNamespace(no_mouse=no_mouse, mouse=mouse)
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, 'config.toml')
+            with open(path, 'w') as handle:
+                handle.write(body)
+            with mock.patch.object(autotmux.config, 'CONFIG_PATH', path), \
+                 mock.patch.object(autotmux, '_is_remote_session',
+                                   return_value=remote):
+                return autotmux._want_mouse(args)
+
+    def test_default_is_on_locally_and_off_over_ssh(self):
+        self.assertTrue(self._want())
+        self.assertFalse(self._want(remote=True))
+
+    def test_the_preference_is_honoured(self):
+        self.assertFalse(self._want('[client]\nmouse = "off"\n'))
+        self.assertTrue(self._want('[client]\nmouse = "on"\n', remote=True))
+
+    def test_a_flag_still_wins_for_one_run(self):
+        self.assertTrue(self._want('[client]\nmouse = "off"\n', mouse=True))
+        self.assertFalse(self._want('[client]\nmouse = "on"\n', no_mouse=True))
+
+    def test_an_invalid_preference_falls_back_to_auto(self):
+        self.assertTrue(self._want('[client]\nmouse = "banana"\n'))
+        self.assertTrue(self._want('[client]\nmouse = 1\n'))
+
+    def test_an_unreadable_config_does_not_break_startup(self):
+        self.assertTrue(self._want('[client\nbroken'))
+
+
 class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
     """A key the user cannot interpret is a key they will not use."""
 

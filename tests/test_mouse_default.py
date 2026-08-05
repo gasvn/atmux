@@ -5,8 +5,10 @@ for click-to-attach. --mouse / --no-mouse force either way."""
 import os
 import sys
 import io
+import tempfile
 import unittest
 from contextlib import redirect_stderr
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,8 +24,17 @@ class WantMouseTests(unittest.TestCase):
         self._saved = {k: os.environ.get(k)
                        for k in ('SSH_CONNECTION', 'SSH_TTY', 'SSH_CLIENT',
                                  'MOSH_CONNECTION', 'MOSH_IP')}
+        # These assert the *defaults*, so they must not read whatever the
+        # developer happens to have set in their own config.
+        self._temp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(
+            cli.config, 'CONFIG_PATH',
+            os.path.join(self._temp.name, 'absent.toml'))
+        self._patch.start()
 
     def tearDown(self):
+        self._patch.stop()
+        self._temp.cleanup()
         for k, v in self._saved.items():
             if v is None:
                 os.environ.pop(k, None)
