@@ -619,7 +619,11 @@ class WillNestLogicTests(unittest.TestCase):
             self.assertEqual(autotmux._direct_attach('localhost:main'), 0)
         step.assert_called_once_with()
         restore.assert_called_once_with()
-        run.assert_called_once_with(['tmux', 'attach', '-t', 'main'])
+        # -d: tmux sizes a session to its smallest attached client, so a
+        # leftover client pins the window small and blanks the rest of a
+        # bigger one. The remote paths already attached this way.
+        run.assert_called_once_with(
+            ['tmux', 'attach-session', '-d', '-t', 'main'])
 
     def test_outer_client_handoff_removes_outer_tmux_from_data_path(self):
         os.environ['TMUX'] = '/tmp/outer.sock,123,0'

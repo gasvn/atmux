@@ -1232,6 +1232,20 @@ def _handoff_outer_tmux_client(helper_args: list[str]) -> bool:
         'detach-client', '-t', client_tty, '-E', command)
 
 
+def _local_attach_argv(session: str) -> list[str]:
+    """Attach to a tmux session on this machine, taking the session over.
+
+    ``-d`` detaches whatever else is holding it.  tmux sizes a session's
+    windows to its *smallest* attached client, so a second client -- a window
+    on another display, or one left behind by a connection that dropped without
+    tmux noticing -- pins the window to that smaller size and leaves the rest
+    of the bigger window blank.  Every remote path already attaches this way
+    (see the agent, and the rewrite in _run_remote_user_command); local ones
+    did not, which is exactly where two displays of different sizes meet.
+    """
+    return ['tmux', 'attach-session', '-d', '-t', session]
+
+
 def _run_user_command(argv) -> tuple[int, str]:
     """Run an intentional interactive command without crashing the TUI.
 
@@ -4255,7 +4269,7 @@ class AutotmuxApp(App):
                     else:
                         with urlhandler.attached(node, sess):
                             returncode, command_error = _run_user_command(
-                                ['tmux', 'attach', '-t', sess])
+                                _local_attach_argv(sess))
                 else:
                     if direct_preferred:
                         print(f"\n[atmux] {node} is in network recovery; "
@@ -4547,11 +4561,12 @@ class AutotmuxApp(App):
         if node == 'localhost':
             cmd = ([os.environ.get('SHELL') or '/bin/bash']
                    if sess == _START_SHELL_SESSION
-                   else ['tmux', 'attach', '-t', sess])
+                   else _local_attach_argv(sess))
         else:
             base = ['ssh'] + _get_ssh_args(node) + ['-o', 'StrictHostKeyChecking=accept-new', '-t', node]
             cmd = (base if sess == _START_SHELL_SESSION
-                   else base + ['tmux', 'attach', '-t', shlex.quote(sess)])
+                   else base + ['tmux', 'attach-session', '-d',
+                                '-t', shlex.quote(sess)])
 
         if os.environ.get('TMUX'):
             wname = (f"{node}-{sess}" if sess != _START_SHELL_SESSION
@@ -4737,7 +4752,7 @@ def _direct_attach(target: str) -> int:
         with urlhandler.attached(node, session):
             if node == 'localhost':
                 returncode, error = _run_user_command(
-                    ['tmux', 'attach', '-t', session])
+                    _local_attach_argv(session))
             else:
                 returncode, error, _used_direct = _run_remote_user_command(
                     node, ['tmux', 'attach', '-t', shlex.quote(session)],

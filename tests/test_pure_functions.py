@@ -4,6 +4,7 @@ Covers what we can test without a running daemon or terminal: file I/O
 helpers, state-shape building, and the small bookkeeping functions.
 Run with `python -m unittest tests/test_pure_functions.py`.
 """
+import inspect
 import io
 import json
 import os
@@ -840,6 +841,31 @@ class CompactCellTests(unittest.TestCase):
         label = autotmux._session_label(autotmux._START_SHELL_SESSION)
         self.assertEqual(label, '<shell>')
         self.assertLessEqual(len(label), 8)
+
+
+class LocalAttachTakeoverTests(unittest.TestCase):
+    """tmux sizes a session's windows to its smallest attached client, so a
+    second client pins the window small and leaves the rest of a bigger window
+    blank. Every remote path already takes the session over; local ones did
+    not, which is exactly where two displays of different sizes meet."""
+
+    def test_local_attach_detaches_other_clients(self):
+        self.assertEqual(autotmux._local_attach_argv('train'),
+                         ['tmux', 'attach-session', '-d', '-t', 'train'])
+
+    def test_the_session_name_is_passed_as_argv(self):
+        """No shell is involved locally, so it needs no quoting -- and must not
+        get any, or the quotes become part of the name."""
+        argv = autotmux._local_attach_argv('my session')
+        self.assertEqual(argv[-1], 'my session')
+
+    def test_the_remote_wire_format_is_left_alone(self):
+        """`_run_remote_user_command` and the gateway both parse a literal
+        4-element ['tmux','attach','-t',NAME]; adding -d at the call sites
+        would make the gateway reject its own request."""
+        source = inspect.getsource(autotmux._run_remote_user_command)
+        self.assertIn("command[:3] == ['tmux', 'attach', '-t']", source)
+        self.assertIn("'tmux', 'attach-session', '-d', '-t'", source)
 
 
 class GatewayHealthNoteTests(unittest.TestCase):
