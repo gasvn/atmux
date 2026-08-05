@@ -1417,15 +1417,17 @@ class GatewayPool:
                 "kind": "unavailable", "reason": last_error,
                 "retry_after": float(self.settings["backoff_base"])}
 
-    def preview(self, node: str, session: str) -> dict:
+    def preview(self, node: str, session: str, history: int = 0) -> dict:
         if (not isinstance(session, str) or not session
                 or len(session.encode("utf-8", "surrogatepass")) > 4096):
             return {"ok": False, "kind": "invalid",
                     "reason": "invalid tmux session"}
         if node == "localhost":
             try:
+                scroll = (["-S", f"-{int(history)}"] if history > 0 else [])
                 result = subprocess.run(
-                    ["tmux", "capture-pane", "-p", "-e", "-t", session],
+                    ["tmux", "capture-pane", "-p", "-e", *scroll,
+                     "-t", session],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, timeout=min(
                         8.0, float(self.settings["state_timeout"])))
@@ -1447,11 +1449,15 @@ class GatewayPool:
                 node, session, response["content"],
                 response["captured_epoch"])
             return response
+        payload = {"action": "preview", "session": session}
+        if history > 0:
+            payload["history"] = min(config.PREVIEW_HISTORY_MAX, int(history))
         response = self._rpc_failover(
-            {"action": "preview", "session": session}, node=node,
-            retry_unavailable=True)
+            payload, node=node, retry_unavailable=True)
         content = response.get("content")
-        if response.get("ok") and isinstance(content, str):
+        # An expanded read is a one-off answer to "what happened"; caching it
+        # as the row's preview would leave the table showing scrollback.
+        if response.get("ok") and isinstance(content, str) and not history:
             self._store_preview(
                 node, session, content, response.get("captured_epoch"))
         return response

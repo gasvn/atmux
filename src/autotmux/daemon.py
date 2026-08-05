@@ -140,6 +140,11 @@ _keepalive_mgr = keepalive.KeepAliveManager(config.KEEPALIVE_PATH,
 # is actually worth sending.
 _notify_cfg = dict(config.NOTIFY_DEFAULTS)
 _notified_jobs: set[str] = set()
+# Jobs already seen running, so a start is announced once. Seeded on the first
+# complete poll rather than compared, or a restart announces everything that
+# happened to be running at the time.
+_started_jobs: set[str] = set()
+_started_seeded = False
 # node -> sessions already announced as quiet, cleared when they move again.
 _idle_announced: dict[str, set] = {}
 _notify_lock = threading.Lock()
@@ -1327,6 +1332,65 @@ def _notify_expiring_jobs(node_infos: dict) -> None:
             log.warning(f'could not start reminder thread: {error}')
 
 
+def _notify_started_jobs(node_infos: dict) -> None:
+    """Say when something you queued has started running.
+
+    Only ever called with a complete squeue view, and the first such view a
+    daemon sees is *seeded* rather than announced: on a restart every job that
+    was already running would otherwise look new. The cost is that a job which
+    starts while every daemon is down goes unannounced, which is the right way
+    round -- a missed notice beats four spurious ones.
+    """
+    if (not _notify_cfg.get('enabled') or not _notify_cfg.get('webhook_url')
+            or not _notify_cfg.get('job_start')):
+        return
+    jobs = {}
+    for node, info in (node_infos or {}).items():
+        if not isinstance(info, dict):
+            continue
+        job_id = str(info.get('job_id') or '').strip()
+        if job_id and job_id not in jobs:
+            jobs[job_id] = {**info, 'node': node}
+    global _started_seeded
+    with _notify_lock:
+        seeding = not _started_seeded
+        if seeding:
+            _started_jobs.clear()
+            _started_jobs.update(jobs)
+            _started_seeded = True
+        else:
+            # Drop jobs that have left the queue so the set cannot grow
+            # forever, then claim the new ones before releasing the lock.
+            _started_jobs.intersection_update(jobs)
+            fresh = notify.started_jobs(jobs.values(), set(_started_jobs))
+            _started_jobs.update(str(job.get('job_id')) for job in fresh)
+    if seeding:
+        return
+
+    def deliver(job: dict) -> None:
+        job_id = str(job.get('job_id') or '')
+        key = f'start:{job_id}'
+        if not notify.claim_job(config.NOTIFY_CLAIM_PATH, key):
+            return
+        ok, error = notify.post(
+            _notify_cfg['webhook_url'], notify.build_start_message(job),
+            float(_notify_cfg['timeout']))
+        if ok:
+            log.info(f'sent start notice for job {job_id}')
+            return
+        notify.release_claim(config.NOTIFY_CLAIM_PATH, key)
+        with _notify_lock:
+            _started_jobs.discard(job_id)
+        log.warning(f'job {job_id} start notice not delivered: {error}')
+
+    for job in fresh:
+        try:
+            threading.Thread(target=deliver, args=(job,), daemon=True,
+                             name=f"start-{job.get('job_id')}").start()
+        except RuntimeError as error:
+            log.warning(f'could not start notice thread: {error}')
+
+
 def _idle_tail(entry: dict) -> str:
     """The line the session stopped on, or '' if it cannot be had cheaply.
 
@@ -1415,6 +1479,7 @@ def _squeue_loop():
             node_infos, discovery_complete = _discover_nodes()
             if discovery_complete:
                 _notify_expiring_jobs(node_infos)
+                _notify_started_jobs(node_infos)
             # Preserve fields populated by the session loop only for the same
             # job, and never treat incomplete controller data as node loss.
             gone, known_nodes = _merge_discovery(
@@ -1548,24 +1613,34 @@ def _health_loop():
 
 
 def _capture_pane(node: str, session: str,
-                  source: str = 'snapshot') -> str | None:
-    """Capture one pane under the shared per-node network budget."""
+                  source: str = 'snapshot', history: int = 0) -> str | None:
+    """Capture one pane under the shared per-node network budget.
+
+    ``history`` asks for that many lines of scrollback above the visible
+    screen. The dashboard's own preview never uses it -- one screen is what
+    fits beside the table, and paying for scrollback on every poll would be
+    waste -- but reading why something died usually means looking further back
+    than the last screenful.
+    """
     lease = _network_coordinator.acquire(node, source)
     if lease is None:
         return None
+    scroll = ['-S', f'-{int(history)}'] if history > 0 else []
     try:
         if node == 'localhost':
-            cmd = ['tmux', 'capture-pane', '-p', '-e', '-t', session]
+            cmd = ['tmux', 'capture-pane', '-p', '-e', *scroll, '-t', session]
         else:
             if not _master_alive(node):
                 lease.failure('ControlMaster unavailable')
                 return None
             # ssh ships remaining args as a single string to the remote shell;
             # quote the session in case it contains spaces / metacharacters.
+            scroll_args = ' '.join(scroll)
             cmd = ['ssh', '-o', f'ControlPath={_ctl_path(node)}',
                    '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
                    '-o', f'ConnectTimeout={CONNECT_TIMEOUT}',
-                   node, f'tmux capture-pane -p -e -t {shlex.quote(session)}']
+                   node, f'tmux capture-pane -p -e {scroll_args} '
+                         f'-t {shlex.quote(session)}']
         result = _hard_run(
             cmd, timeout=8, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
@@ -1834,7 +1909,12 @@ def _handle_preview_request(request: dict) -> dict:
         return {'ok': False, 'kind': 'not-found',
                 'reason': 'tmux session no longer exists'}
 
-    content = _capture_pane(node, session, source='preview')
+    try:
+        history = int(request.get('history') or 0)
+    except (TypeError, ValueError):
+        history = 0
+    history = max(0, min(config.PREVIEW_HISTORY_MAX, history))
+    content = _capture_pane(node, session, source='preview', history=history)
     state = _network_coordinator.snapshot(node)
     if content is None:
         kind = 'busy' if state.get('busy') else (

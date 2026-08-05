@@ -233,6 +233,93 @@ class AgentForwardingTests(unittest.TestCase):
         forward.assert_not_called()
 
 
+class ScrollbackPreviewTests(unittest.TestCase):
+    """The dashboard preview is one screen; reading why something died means
+    looking further back, and attaching to look resizes the session."""
+
+    def test_the_poll_preview_asks_for_no_scrollback(self):
+        with mock.patch.object(daemon._network_coordinator, 'acquire',
+                               return_value=mock.MagicMock()), \
+             mock.patch.object(daemon, '_master_alive', return_value=True), \
+             mock.patch.object(daemon, '_hard_run', return_value=_ok()) as run:
+            daemon._capture_pane('gpu1', 'train', source='preview')
+        self.assertNotIn('-S', run.call_args.args[0][-1])
+
+    def test_an_expanded_read_asks_for_history(self):
+        with mock.patch.object(daemon._network_coordinator, 'acquire',
+                               return_value=mock.MagicMock()), \
+             mock.patch.object(daemon, '_master_alive', return_value=True), \
+             mock.patch.object(daemon, '_hard_run', return_value=_ok()) as run:
+            daemon._capture_pane('gpu1', 'train', source='preview',
+                                 history=2000)
+        self.assertIn('-S -2000', run.call_args.args[0][-1])
+
+    def test_localhost_history_is_passed_as_argv(self):
+        with mock.patch.object(daemon._network_coordinator, 'acquire',
+                               return_value=mock.MagicMock()), \
+             mock.patch.object(daemon, '_hard_run', return_value=_ok()) as run:
+            daemon._capture_pane('localhost', 'train', history=500)
+        self.assertEqual(run.call_args.args[0][:6],
+                         ['tmux', 'capture-pane', '-p', '-e', '-S', '-500'])
+
+    def test_a_request_cannot_ask_for_unbounded_history(self):
+        node_infos = {'sessions': [['train', '1', 1]], 'job_id': '1'}
+        daemon._known_nodes_info['gpu1'] = node_infos
+        try:
+            with mock.patch.object(daemon, '_capture_pane',
+                                   return_value='x') as capture, \
+                 mock.patch.object(daemon, '_update_snapshot_entry'):
+                daemon._handle_preview_request({
+                    'action': 'preview', 'node': 'gpu1', 'session': 'train',
+                    'history': 10 ** 9})
+            self.assertEqual(capture.call_args.kwargs['history'],
+                             config.PREVIEW_HISTORY_MAX)
+        finally:
+            daemon._known_nodes_info.pop('gpu1', None)
+
+    def test_a_junk_history_is_treated_as_none(self):
+        daemon._known_nodes_info['gpu1'] = {
+            'sessions': [['train', '1', 1]], 'job_id': '1'}
+        try:
+            for value in ('lots', None, -5, [1]):
+                with mock.patch.object(daemon, '_capture_pane',
+                                       return_value='x') as capture, \
+                     mock.patch.object(daemon, '_update_snapshot_entry'):
+                    daemon._handle_preview_request({
+                        'action': 'preview', 'node': 'gpu1',
+                        'session': 'train', 'history': value})
+                self.assertEqual(capture.call_args.kwargs['history'], 0, value)
+        finally:
+            daemon._known_nodes_info.pop('gpu1', None)
+
+    def test_an_expanded_read_is_not_cached_as_the_row_preview(self):
+        """Otherwise the table would start showing scrollback."""
+        pool = gateway.GatewayPool.__new__(gateway.GatewayPool)
+        pool.settings = {'state_timeout': 10.0}
+        with mock.patch.object(gateway.GatewayPool, '_rpc_failover',
+                               return_value={'ok': True, 'content': 'x'}), \
+             mock.patch.object(gateway.GatewayPool, '_store_preview') as store:
+            pool.preview('gpu1', 'train', history=2000)
+        store.assert_not_called()
+
+    def test_an_ordinary_preview_is_still_cached(self):
+        pool = gateway.GatewayPool.__new__(gateway.GatewayPool)
+        pool.settings = {'state_timeout': 10.0}
+        with mock.patch.object(gateway.GatewayPool, '_rpc_failover',
+                               return_value={'ok': True, 'content': 'x'}), \
+             mock.patch.object(gateway.GatewayPool, '_store_preview') as store:
+            pool.preview('gpu1', 'train')
+        store.assert_called_once()
+
+    def test_the_agent_bounds_history_before_forwarding(self):
+        with mock.patch.object(agent, '_forward_daemon_request',
+                               return_value={'ok': True}) as forward:
+            agent.handle_rpc({'action': 'preview', 'node': 'gpu1',
+                              'session': 'train', 'history': 10 ** 9})
+        self.assertEqual(forward.call_args.args[0]['history'],
+                         config.PREVIEW_HISTORY_MAX)
+
+
 class ConfirmScreenTests(unittest.TestCase):
     def test_the_destructive_answer_is_never_the_default(self):
         keys = {b.key: b.action for b in cli.ConfirmScreen.BINDINGS}

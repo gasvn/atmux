@@ -142,6 +142,42 @@ class IdleSessionTests(unittest.TestCase):
             self.assertNotIn('Last line', notify.build_idle_message(entry))
 
 
+class JobStartTests(unittest.TestCase):
+    """A job holds no node until it starts, so appearing in the allocated set
+    is the transition worth announcing."""
+
+    def test_a_newly_running_job_is_reported(self):
+        jobs = [{'job_id': '7', 'job_name': 'train', 'state': 'RUNNING',
+                 'node': 'gpu1'}]
+        fresh = notify.started_jobs(jobs, set())
+        self.assertEqual([j['job_id'] for j in fresh], ['7'])
+
+    def test_a_job_already_seen_is_not_reported_again(self):
+        jobs = [{'job_id': '7', 'state': 'RUNNING'}]
+        self.assertEqual(notify.started_jobs(jobs, {'7'}), [])
+
+    def test_a_job_that_is_not_running_is_ignored(self):
+        for state in ('PENDING', 'COMPLETING', 'SUSPENDED'):
+            jobs = [{'job_id': '7', 'state': state}]
+            self.assertEqual(notify.started_jobs(jobs, set()), [], state)
+
+    def test_malformed_entries_do_not_raise(self):
+        jobs = ['nope', None, {}, {'job_id': ''}, {'job_id': '7'}]
+        self.assertEqual([j['job_id'] for j in notify.started_jobs(jobs, set())],
+                         ['7'])
+
+    def test_the_message_names_the_job_and_where_it_landed(self):
+        text = notify.build_start_message(
+            {'job_id': '7', 'job_name': 'train', 'node': 'gpu1'})
+        self.assertIn('train', text)
+        self.assertIn('7', text)
+        self.assertIn('gpu1', text)
+        self.assertIn('now running', text)
+
+    def test_the_message_survives_missing_fields(self):
+        self.assertTrue(notify.build_start_message({}))
+
+
 class LastOutputLineTests(unittest.TestCase):
     """Whether a run finished or died is in the line it stopped on, and that
     line is raw terminal bytes on its way into a chat message."""
@@ -546,6 +582,51 @@ class IdleAnnouncementTests(unittest.TestCase):
                         self._poll(900)
                 self.assertEqual(len(self.sent), 1)
                 self.assertNotIn('Last line', self.sent[0])
+
+    def test_the_first_complete_poll_is_seeded_not_announced(self):
+        """A restart would otherwise announce every job already running."""
+        daemon._started_jobs.clear()
+        daemon._started_seeded = False
+        running = {'gpu1': {'job_id': '7', 'job_name': 'train',
+                            'state': 'RUNNING'}}
+        daemon._notify_started_jobs(running)
+        self.assertEqual(self.sent, [])
+        self.assertIn('7', daemon._started_jobs)
+
+    def test_a_job_that_starts_later_is_announced(self):
+        daemon._started_jobs.clear()
+        daemon._started_seeded = False
+        daemon._notify_started_jobs({'gpu1': {'job_id': '7', 'state': 'RUNNING'}})
+        daemon._notify_started_jobs({
+            'gpu1': {'job_id': '7', 'state': 'RUNNING'},
+            'gpu2': {'job_id': '8', 'job_name': 'sweep', 'state': 'RUNNING'}})
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('sweep', self.sent[0])
+        self.assertIn('now running', self.sent[0])
+
+    def test_a_job_is_announced_once(self):
+        daemon._started_jobs.clear()
+        daemon._started_seeded = False
+        daemon._notify_started_jobs({})
+        for _ in range(3):
+            daemon._notify_started_jobs(
+                {'gpu1': {'job_id': '9', 'state': 'RUNNING'}})
+        self.assertEqual(len(self.sent), 1)
+
+    def test_job_start_can_be_turned_off(self):
+        daemon._notify_cfg['job_start'] = False
+        daemon._started_jobs.clear()
+        daemon._started_seeded = False
+        daemon._notify_started_jobs({})
+        daemon._notify_started_jobs({'gpu1': {'job_id': '7', 'state': 'RUNNING'}})
+        self.assertEqual(self.sent, [])
+
+    def test_a_job_leaving_the_queue_does_not_grow_the_set(self):
+        daemon._started_jobs.clear()
+        daemon._started_seeded = False
+        daemon._notify_started_jobs({'gpu1': {'job_id': '7', 'state': 'RUNNING'}})
+        daemon._notify_started_jobs({})
+        self.assertEqual(daemon._started_jobs, set())
 
     def test_nothing_is_sent_without_a_webhook(self):
         daemon._notify_cfg['webhook_url'] = ''

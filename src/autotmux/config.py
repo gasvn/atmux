@@ -62,6 +62,11 @@ NOTES_PATH = os.environ.get(
 NEW_SESSION_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_@+-]{0,63}$')
 SESSION_VERBS = ('kill', 'new')
 
+# Scrollback the expanded preview may ask for. Bounded because it crosses SSH
+# and a chatty pane's history is unbounded; a few thousand lines is far more
+# than anyone reads and still a small payload.
+PREVIEW_HISTORY_MAX = 5000
+
 NOTE_LIMIT = 60             # one table cell's worth
 NOTES_MAX = 500             # a personal file, not a database
 _NOTES_FILE_LIMIT = 256 * 1024
@@ -103,6 +108,9 @@ NOTIFY_DEFAULTS = {
     # does mean one line of terminal output leaves the cluster, so it is a
     # separate switch from the notice itself.
     'idle_tail': True,
+    # Say when something you queued starts running. Separate from the others
+    # because it fires on good news, not on something needing attention.
+    'job_start': True,
 }
 
 _NOTIFY_NUMBER_RULES = {
@@ -775,7 +783,8 @@ def load_notify() -> dict:
         log.warning('ignoring invalid [notify] config (expected a table)')
         return _notify_normalized(cfg)
 
-    for flag in ('enabled', 'desktop', 'attach_link', 'idle_tail'):
+    for flag in ('enabled', 'desktop', 'attach_link', 'idle_tail',
+                 'job_start'):
         if flag in section:
             if isinstance(section[flag], bool):
                 cfg[flag] = section[flag]

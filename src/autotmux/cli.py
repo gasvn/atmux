@@ -2685,6 +2685,54 @@ class NoteScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class PaneScreen(ModalScreen[None]):
+    """A session's output with its scrollback, without attaching to it.
+
+    The dashboard preview is one screen, which is what fits beside the table
+    and all a poll should ever pay for. But working out why something died
+    means reading further back than the last screenful, and attaching to look
+    resizes the session to this terminal and disturbs whatever is still
+    running in it.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_pane", "Close"),
+        Binding("q", "dismiss_pane", "Close"),
+        Binding("v", "dismiss_pane", "Close"),
+    ]
+
+    CSS = """
+    PaneScreen { align: center middle; background: $background 70%; }
+    #pane_dialog {
+        width: 96%; height: 92%;
+        border: round $primary; background: $surface; padding: 0 1;
+    }
+    #pane_title { text-style: bold; color: $accent; height: 1; }
+    #pane_body { height: 1fr; overflow-y: scroll; }
+    """
+
+    def __init__(self, title: str, content) -> None:
+        super().__init__()
+        self._title = str(title)
+        self._content = content
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='pane_dialog'):
+            yield Static(f'{self._title}  ·  Esc / q / v closes', id='pane_title')
+            with VerticalScroll(id='pane_body'):
+                yield Static(self._content, id='pane_text')
+
+    def on_mount(self) -> None:
+        body = self.query_one('#pane_body', VerticalScroll)
+        body.focus()
+        # Land at the end: the interesting part of a dead run is its last
+        # words, not how it started.
+        body.scroll_end(animate=False)
+
+    def action_dismiss_pane(self) -> None:
+        self.dismiss(None)
+
+
 class ConfirmScreen(ModalScreen[bool]):
     """A yes/no that defaults to no.
 
@@ -3060,6 +3108,7 @@ class AutotmuxApp(App):
         Binding("e", "edit_note", "Note", show=False),
         Binding("n", "new_session", "New session", show=False),
         Binding("x", "kill_session", "Kill session", show=False),
+        Binding("v", "view_pane", "View output", show=False),
         Binding("question_mark", "show_help", "Help"),
         Binding("q", "app.quit", "Quit"),
         Binding("r", "refresh_table", "Refresh now", show=False),
@@ -3087,6 +3136,7 @@ class AutotmuxApp(App):
         ("Sessions", [
             ("n", "Create a named session on that node", "detached"),
             ("x", "Kill the selected session (asks first)", "cannot undo"),
+            ("v", "Read its output, scrollback and all", "read-only"),
         ]),
         ("Allocation", [
             ("k", "Resubmit the batch script before walltime", "batch only"),
@@ -4485,6 +4535,42 @@ class AutotmuxApp(App):
         elif nest and not step_ok:
             self.notify('outer tmux passthrough was unavailable',
                         severity='warning', timeout=6, markup=False)
+
+    async def action_view_pane(self) -> None:
+        node, sess = self.selected_node, self.selected_session
+        if not node or not sess or sess in (_OFFLINE_SESSION,
+                                            _START_SHELL_SESSION):
+            self.notify('select a real session to read',
+                        severity='warning', timeout=4, markup=False)
+            return
+        self.notify(f'reading {_session_label(sess)} …', timeout=3,
+                    markup=False)
+        try:
+            response = await self._fetch_pane(
+                node, sess, config.PREVIEW_HISTORY_MAX)
+        except Exception as error:
+            response = {'ok': False,
+                        'reason': ' '.join(str(error).split())[:160]}
+        if not isinstance(response, dict) or not response.get('ok'):
+            reason = ' '.join(str(
+                (response or {}).get('reason') or 'unavailable').split())[:160]
+            self.notify(f'could not read {_session_label(sess)}: {reason}',
+                        severity='error', timeout=9, markup=False)
+            return
+        content = response.get('content') or ''
+        self.push_screen(PaneScreen(
+            f'{node}:{_session_label(sess)}',
+            rich.text.Text.from_ansi(str(content))))
+
+    async def _fetch_pane(self, node: str, session: str, history: int):
+        if _GATEWAY_POOL is not None:
+            return await _offload_for(
+                float(_GATEWAY_POOL.settings['state_timeout']) + 4.0,
+                _GATEWAY_POOL.preview, node, session, history)
+        return await _offload_for(
+            _PREVIEW_CAPTURE_TIMEOUT + 6.0, ipc.request, PREVIEW_SOCKET,
+            {'action': 'preview', 'node': node, 'session': session,
+             'history': int(history)}, _PREVIEW_CAPTURE_TIMEOUT + 4.0)
 
     async def _session_command(self, node: str, session: str,
                                verb: str) -> tuple[bool, str]:

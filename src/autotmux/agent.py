@@ -217,6 +217,12 @@ def handle_rpc(request: dict) -> dict:
                     request.get("session"), maximum=4096, required=True)
             except ValueError as error:
                 return {"ok": False, "kind": "invalid", "reason": str(error)}
+            try:
+                history = int(request.get("history") or 0)
+            except (TypeError, ValueError):
+                history = 0
+            forwarded["history"] = max(
+                0, min(config.PREVIEW_HISTORY_MAX, history))
         elif action == "report":
             forwarded.update({
                 "outcome": request.get("outcome"),

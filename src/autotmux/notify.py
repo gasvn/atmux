@@ -60,6 +60,38 @@ def build_message(job: dict, remaining: float) -> str:
             f'{format_remaining(remaining)}.')[:_MAX_TEXT]
 
 
+def build_start_message(job: dict) -> str:
+    """A job you were waiting on is now running somewhere."""
+    job_id = str(job.get('job_id') or '?')
+    name = str(job.get('job_name') or '?')
+    node = str(job.get('node') or '')
+    where = f' on {node}' if node else ''
+    return (f'AutoTmux: Slurm job {name} ({job_id}) is now '
+            f'running{where}.')[:_MAX_TEXT]
+
+
+def started_jobs(jobs, seen) -> list[dict]:
+    """Jobs that are running now and were not running the last time we looked.
+
+    A job holds no node until it starts, so "appeared in the allocated set" is
+    the transition worth announcing.  ``seen`` is what the caller already knew
+    about; on a daemon's first complete poll it is seeded rather than compared,
+    or a restart would announce every job that was already running.
+    """
+    fresh = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        job_id = str(job.get('job_id') or '').strip()
+        if not job_id or job_id in seen:
+            continue
+        state = str(job.get('state') or '').strip().upper()
+        if state and state != 'RUNNING':
+            continue
+        fresh.append(job)
+    return fresh
+
+
 def due_jobs(jobs, lead_time: float, already_sent) -> list[dict]:
     """Jobs inside the reminder window that have not been announced yet.
 
