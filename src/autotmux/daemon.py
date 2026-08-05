@@ -1364,7 +1364,8 @@ def _notify_idle_sessions(node: str, info: dict) -> None:
         if not notify.claim_job(config.NOTIFY_CLAIM_PATH, key,
                                 ttl=float(_notify_cfg['idle_cooldown'])):
             return
-        text = notify.build_idle_message(entry)
+        text = notify.build_idle_message(
+            entry, link=bool(_notify_cfg.get('attach_link')))
         ok, error = notify.post(
             _notify_cfg['webhook_url'], text, float(_notify_cfg['timeout']))
         if ok:

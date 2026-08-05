@@ -73,6 +73,9 @@ NOTIFY_DEFAULTS = {
     # session left quiet is announced once, not every poll.
     'idle_notify': 300,
     'idle_cooldown': 3600,  # shortest gap between notices for one session
+    # Append a clickable atmux:// link. Opt-in: the scheme only resolves where
+    # the URL handler is installed, and a dead link is worse than none.
+    'attach_link': False,
     # Desktop notification on whichever machine runs the TUI.  Needs no
     # endpoint, so unlike the webhook it is on by default.
     'desktop': True,
@@ -666,7 +669,7 @@ def load_notify() -> dict:
         log.warning('ignoring invalid [notify] config (expected a table)')
         return _notify_normalized(cfg)
 
-    for flag in ('enabled', 'desktop'):
+    for flag in ('enabled', 'desktop', 'attach_link'):
         if flag in section:
             if isinstance(section[flag], bool):
                 cfg[flag] = section[flag]

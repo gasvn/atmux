@@ -4749,6 +4749,11 @@ def _build_argparser():
     target.add_argument('--shell', dest='shell_node', metavar='NODE',
                         help='Skip the TUI and open a shell directly on NODE.')
     target.add_argument(
+        '--open-url', dest='open_url', metavar='URL',
+        help='Attach from an atmux://attach/NODE/SESSION link. The URL is '
+             'untrusted input: it is validated here and dispatched as argv, '
+             'never through a shell.')
+    target.add_argument(
         '--connections', action='store_true',
         help='Open the TUI connection manager on startup.')
     target.add_argument(
@@ -4929,6 +4934,14 @@ def main():
             if warning:
                 print(f'  ⚠ {warning}')
         sys.exit(0 if all(result.get('ok') for result in results) else 1)
+    if args.open_url:
+        parsed = notify.parse_attach_url(args.open_url)
+        if parsed is None:
+            sys.stderr.write(
+                'atmux: refusing to open an unrecognised or unsafe URL\n')
+            sys.exit(2)
+        node, session = parsed
+        sys.exit(_direct_attach(f'{node}:{session}'))
     if args.attach:
         sys.exit(_direct_attach(args.attach))
     if args.shell_node:

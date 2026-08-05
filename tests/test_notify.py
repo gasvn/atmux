@@ -130,6 +130,63 @@ class IdleSessionTests(unittest.TestCase):
         self.assertTrue(notify.build_idle_message({}))
 
 
+class AttachUrlTests(unittest.TestCase):
+    """The link arrives from a chat message, so anyone who can post to the
+    channel can craft one. It is validated here and dispatched as argv."""
+
+    def test_round_trip(self):
+        url = notify.attach_url('holygpu8a11104', 'newclaw')
+        self.assertEqual(url, 'atmux://attach/holygpu8a11104/newclaw')
+        self.assertEqual(notify.parse_attach_url(url),
+                         ('holygpu8a11104', 'newclaw'))
+
+    def test_a_space_in_a_session_name_survives(self):
+        url = notify.attach_url('gpu1', 'my session')
+        self.assertEqual(notify.parse_attach_url(url), ('gpu1', 'my session'))
+
+    def test_names_that_cannot_be_expressed_safely_yield_no_link(self):
+        for node, session in (('gpu1', 'a/b'), ('gpu1', ';rm -rf /'),
+                              ('gpu1', '$(id)'), ('-oProxy=x', 's'),
+                              ('gpu1', '`id`'), ('gpu1', 'a\nb'),
+                              ('gpu1', ''), ('', 's')):
+            with self.subTest(node=node, session=session):
+                self.assertEqual(notify.attach_url(node, session), '')
+
+    def test_hostile_urls_are_refused(self):
+        for url in (
+                'atmux://attach/gpu1/%3Brm%20-rf%20%2F',
+                'atmux://attach/gpu1/%24%28id%29',
+                'atmux://attach/../../etc/passwd',
+                'atmux://attach/-oProxyCommand%3Dx/s',
+                'atmux://attach/gpu1/a/b',
+                'atmux://attach/gpu1',
+                'atmux://attach/',
+                'atmux://other/gpu1/s',
+                'http://evil.test/attach/gpu1/s',
+                'file:///etc/passwd',
+                '', None, 42,
+                'atmux://attach/gpu1/%0Aid'):
+            with self.subTest(url=url):
+                self.assertIsNone(notify.parse_attach_url(url))
+
+    def test_a_query_string_is_ignored_not_smuggled(self):
+        self.assertEqual(
+            notify.parse_attach_url('atmux://attach/gpu1/sess?x=1'),
+            ('gpu1', 'sess'))
+
+    def test_the_link_is_opt_in(self):
+        entry = {'node': 'gpu1', 'session': 'train', 'idle': 900}
+        self.assertNotIn('atmux://', notify.build_idle_message(entry))
+        self.assertIn('<atmux://attach/gpu1/train|Attach>',
+                      notify.build_idle_message(entry, link=True))
+
+    def test_an_unlinkable_session_degrades_to_plain_text(self):
+        entry = {'node': 'gpu1', 'session': 'a/b', 'idle': 900}
+        text = notify.build_idle_message(entry, link=True)
+        self.assertNotIn('atmux://', text)
+        self.assertIn('a/b', text)
+
+
 class MessageTests(unittest.TestCase):
     def test_message_names_the_job_node_and_time(self):
         text = notify.build_message(_job(), 2700)

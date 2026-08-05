@@ -18,14 +18,18 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from . import keepalive
+
+_NODE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 
 log = logging.getLogger('autotmux_daemon')
 
@@ -257,16 +261,68 @@ def idle_sessions(node: str, info: dict, threshold: float) -> list[dict]:
     return found
 
 
-def build_idle_message(entry: dict) -> str:
-    """Say what stopped and for how long, and why that is worth a look."""
+URL_SCHEME = 'atmux'
+_URL_PREFIX = f'{URL_SCHEME}://attach/'
+# Deliberately narrower than a tmux session name can be. This value arrives
+# from a chat message, so anything outside a conservative set is refused rather
+# than escaped -- there is no legitimate session whose name needs more.
+_URL_SESSION_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 ._@:+-]{0,127}$')
+
+
+def attach_url(node: str, session: str) -> str:
+    """A link that opens this session, or "" if it cannot be expressed safely."""
+    node, session = str(node), str(session)
+    if not _NODE_RE.fullmatch(node) or not _URL_SESSION_RE.fullmatch(session):
+        return ''
+    return (_URL_PREFIX + urllib.parse.quote(node, safe='')
+            + '/' + urllib.parse.quote(session, safe=''))
+
+
+def parse_attach_url(url: str) -> tuple[str, str] | None:
+    """Validate an ``atmux://attach/<node>/<session>`` link.
+
+    Whatever produced the link is untrusted -- anyone who can post to the
+    channel can craft one -- so this refuses anything that is not exactly a
+    plain node and session, and the caller passes them on as argv, never
+    through a shell.
+    """
+    if not isinstance(url, str) or not url.startswith(_URL_PREFIX):
+        return None
+    rest = url[len(_URL_PREFIX):]
+    if '?' in rest or '#' in rest:
+        rest = re.split(r'[?#]', rest, 1)[0]
+    parts = rest.split('/')
+    if len(parts) != 2:
+        return None
+    try:
+        node = urllib.parse.unquote(parts[0])
+        session = urllib.parse.unquote(parts[1])
+    except (ValueError, UnicodeError):
+        return None
+    if not _NODE_RE.fullmatch(node) or not _URL_SESSION_RE.fullmatch(session):
+        return None
+    return node, session
+
+
+def build_idle_message(entry: dict, *, link: bool = False) -> str:
+    """Say what stopped and for how long, and why that is worth a look.
+
+    ``link`` appends a Slack-formatted ``atmux://`` link. It is opt-in because
+    the scheme only resolves on a machine where the handler is installed, and
+    a dead link is worse than none.
+    """
     session = str(entry.get('session') or '?')
     node = str(entry.get('node') or '?')
     quiet = format_remaining(entry.get('idle') or 0)
     job = str(entry.get('job_name') or '').strip()
     job_part = f' (job {job})' if job else ''
-    return (f'AutoTmux: tmux session {session} on {node}{job_part} has shown '
-            f'no output for {quiet} — it has probably finished or '
-            f'stalled.')[:_MAX_TEXT]
+    text = (f'AutoTmux: tmux session {session} on {node}{job_part} has shown '
+            f'no output for {quiet} — it has probably finished or stalled.')
+    if link:
+        url = attach_url(node, session)
+        if url:
+            text += f'  <{url}|Attach>'
+    return text[:_MAX_TEXT]
 
 
 def release_claim(path: str, key: str) -> None:
