@@ -270,6 +270,87 @@ class SessionNoteTests(unittest.TestCase):
             self.assertFalse(config.save_note('', 'x', self._path(td)))
 
 
+class ClusterDefinitionTests(unittest.TestCase):
+    """`gateways` is one cluster's interchangeable entry points; `clusters`
+    adds independent places. Collapsing them into one list is the bug this
+    shape exists to prevent."""
+
+    def test_no_clusters_means_just_the_primary(self):
+        self.assertEqual(
+            config.client_clusters({'gateways': ['k6', 'k7']}),
+            [(config.PRIMARY_CLUSTER, ('k6', 'k7'))])
+
+    def test_extra_clusters_follow_the_primary_in_order(self):
+        groups = config.client_clusters({
+            'gateways': ['k6'],
+            'clusters': {'lab': ['ws'], 'other': ['ol1', 'ol2']},
+        })
+        self.assertEqual(groups, [
+            (config.PRIMARY_CLUSTER, ('k6',)),
+            ('lab', ('ws',)),
+            ('other', ('ol1', 'ol2')),
+        ])
+
+    def test_a_standalone_machine_is_just_a_cluster_of_one(self):
+        groups = config.client_clusters(
+            {'gateways': ['k6'], 'clusters': {'vps': ['my-vps']}})
+        self.assertEqual(groups[1], ('vps', ('my-vps',)))
+
+    def test_no_gateways_at_all_means_no_groups(self):
+        self.assertEqual(config.client_clusters({'gateways': []}), [])
+        self.assertEqual(config.client_clusters({}), [])
+        self.assertEqual(config.client_clusters(None), [])
+
+    def test_one_bad_cluster_never_costs_the_good_ones(self):
+        cleaned = config.clean_clusters({
+            'lab': ['ws'],
+            'bad name': ['x'],          # invalid cluster name
+            'empty': [],                # nothing usable
+            'wrong': 'not-a-list',
+            'hosts': ['-oProxyCommand=evil', 'good'],
+        })
+        self.assertEqual(cleaned['lab'], ['ws'])
+        self.assertEqual(cleaned['hosts'], ['good'])
+        self.assertNotIn('bad name', cleaned)
+        self.assertNotIn('empty', cleaned)
+        self.assertNotIn('wrong', cleaned)
+
+    def test_a_cluster_cannot_take_the_primary_name(self):
+        """It would shadow `gateways` and silently drop that whole cluster."""
+        cleaned = config.clean_clusters(
+            {config.PRIMARY_CLUSTER: ['x'], 'lab': ['ws']},
+            exclude=(config.PRIMARY_CLUSTER,))
+        self.assertEqual(list(cleaned), ['lab'])
+
+    def test_cluster_definitions_are_bounded(self):
+        many = {f'c{i}': [f'h{i}'] for i in range(200)}
+        self.assertLessEqual(len(config.clean_clusters(many)),
+                             config.CLUSTERS_MAX)
+        wide = {'c': [f'h{i}' for i in range(200)]}
+        self.assertLessEqual(len(config.clean_clusters(wide)['c']),
+                             config.CLUSTER_GATEWAYS_MAX)
+
+    def test_junk_is_ignored_rather_than_raising(self):
+        for value in (None, [], 'text', 42):
+            with self.subTest(value=value):
+                self.assertEqual(config.clean_clusters(value), {})
+
+    def test_the_connection_dialog_cannot_delete_configured_clusters(self):
+        """It only edits the primary group. Rewriting the file without the
+        others would silently destroy them."""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, 'connections.json')
+            with mock.patch.object(config, 'CLIENT_STATE_PATH', path):
+                config.save_client_state(
+                    'gateway', ['k6'], ['atmux-agent'],
+                    clusters={'lab': ['ws']})
+                config.save_client_state('gateway', ['k6', 'k7'],
+                                         ['atmux-agent'])
+                state = config._read_client_state()
+        self.assertEqual(state['gateways'], ['k6', 'k7'])
+        self.assertEqual(state['clusters'], {'lab': ['ws']})
+
+
 class LayoutPreferenceTests(unittest.TestCase):
     """Which panes are on screen, remembered between runs."""
 

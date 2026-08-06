@@ -222,7 +222,11 @@ def _claim_age(path: str, wall: float) -> float | None:
             stamp = os.stat(path).st_mtime
         except OSError:
             return None
-    return wall - stamp
+    # A stamp from the future -- one login node's clock running ahead of
+    # another's -- means "just taken", not "aged out". Never let it read as a
+    # negative age, which would compare as younger than any TTL and pin the
+    # claim until the clocks agreed again.
+    return max(0.0, wall - stamp)
 
 
 def _take_claim(path: str, wall: float) -> bool:
@@ -234,7 +238,9 @@ def _take_claim(path: str, wall: float) -> bool:
     except FileExistsError:
         return False
     try:
-        os.write(fd, f'{wall:.3f}\n'.encode('ascii'))
+        # Full precision, not a rounded string: %.3f rounds *up*, so a claim
+        # taken at t could be stamped t+0.0005 and read back as negative age.
+        os.write(fd, f'{wall!r}\n'.encode('ascii'))
     except OSError:
         # The claim is ours either way -- the file exists, and its mtime
         # still dates it well enough to expire.

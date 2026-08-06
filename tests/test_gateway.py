@@ -710,6 +710,17 @@ class JobReminderClaimTests(unittest.TestCase):
         self.assertTrue(notify.claim_job(self.path, '42'))
         self.assertTrue(notify.claim_job(self.path, '42', ttl=0))
 
+    def test_a_claim_stamped_in_the_future_still_expires(self):
+        """Login nodes do not share a clock. A stamp ahead of ours must read
+        as "just taken", never as a negative age -- that compares younger than
+        every TTL and would pin the claim until the clocks agreed."""
+        self.assertTrue(notify.claim_job(self.path, '42', now=1_000_060.0))
+        target = os.path.join(self.path, notify._claim_name('42'))
+        self.assertEqual(notify._claim_age(target, 1_000_000.0), 0.0)
+        self.assertFalse(notify.claim_job(self.path, '42', now=1_000_000.0))
+        self.assertTrue(
+            notify.claim_job(self.path, '42', ttl=0, now=1_000_000.0))
+
     def test_the_record_is_created_with_its_directory(self):
         nested = os.path.join(self.temp.name, 'cfg', 'claims')
         self.assertTrue(notify.claim_job(nested, '42'))
@@ -1183,7 +1194,7 @@ class CliDeploymentModeTests(unittest.TestCase):
         with mock.patch.object(config, "load_client",
                                return_value=client_settings()) as load, \
              mock.patch.object(cli, "_is_remote_session", return_value=True), \
-             mock.patch.object(cli.gateway_client, "GatewayPool") as pool:
+             mock.patch.object(cli.gateway_client, "ClusterPool") as pool:
             error = cli._configure_gateway_mode(self.args())
         self.assertEqual(error, "")
         self.assertIsNone(cli._GATEWAY_POOL)
@@ -1195,7 +1206,7 @@ class CliDeploymentModeTests(unittest.TestCase):
         with mock.patch.object(config, "load_client",
                                return_value=client_settings()), \
              mock.patch.object(cli, "_is_remote_session", return_value=False), \
-             mock.patch.object(cli.gateway_client, "GatewayPool",
+             mock.patch.object(cli.gateway_client, "ClusterPool",
                                return_value=sentinel):
             error = cli._configure_gateway_mode(self.args())
         self.assertEqual(error, "")
@@ -1214,14 +1225,16 @@ class CliDeploymentModeTests(unittest.TestCase):
         settings = client_settings(gateways=())
         settings["mode"] = "login"
         with mock.patch.object(config, "load_client", return_value=settings), \
-             mock.patch.object(cli.gateway_client, "GatewayPool",
+             mock.patch.object(cli.gateway_client, "ClusterPool",
                                return_value=sentinel) as pool:
             error = cli._configure_gateway_mode(
                 self.args(gateway=["login9", "login10"]))
         self.assertEqual(error, "")
         self.assertIs(cli._GATEWAY_POOL, sentinel)
-        self.assertEqual(
-            pool.call_args.args[0]["gateways"], ["login9", "login10"])
+        # One cluster, both hosts in it: a --gateway override names alternate
+        # ways in to the same place, never two different places.
+        self.assertEqual(pool.call_args.args[0],
+                         [("main", ("login9", "login10"))])
 
     def test_local_first_run_offers_tui_setup_without_a_config(self):
         settings = dict(config.CLIENT_DEFAULTS)
@@ -1298,3 +1311,258 @@ class GatewayFrontendPilotTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClusterPoolTests(unittest.TestCase):
+    """Several unrelated places in one table.
+
+    A cluster is a set of interchangeable ways in to *one* place: the pool
+    races them and keeps the first valid reply. Putting a second, unrelated
+    machine in that race lets it win and define the whole node table, and
+    everything behind the other login nodes silently disappears. Clusters are
+    fetched separately and merged instead.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.patchers = [
+            mock.patch.object(
+                gateway.paths, "GATEWAY_STATE_CACHE",
+                os.path.join(self.temp.name, "state.json")),
+            mock.patch.object(
+                gateway.paths, "GATEWAY_SNAPSHOT_CACHE",
+                os.path.join(self.temp.name, "snapshots.json")),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self.patchers):
+            patcher.stop()
+        self.temp.cleanup()
+
+    def build(self, clusters=(("main", ("login1",)), ("lab", ("labws",)))):
+        return gateway.ClusterPool(
+            clusters, client_settings(gateways=("login1",)),
+            local_state_loader=local_node)
+
+    @staticmethod
+    def _state(nodes, updated="2026-08-01 12:00:00"):
+        return {"updated": updated, "nodes": nodes,
+                "keepalive": {}, "keepalive_health": {}}
+
+    def _stub(self, pool, replies):
+        """Give each cluster's pool a canned fetch_state result."""
+        for name, sub in pool._pools:
+            reply = replies[name]
+            sub.fetch_state = (lambda r=reply: (True, r))
+
+    def test_every_cluster_contributes_its_own_machines(self):
+        pool = self.build()
+        self._stub(pool, {
+            "main": self._state({
+                "localhost": local_node(),
+                "login--l1": {"alive": True, "sessions": [["a", "1"]],
+                              "info": {}, "last_error": ""},
+                "gpu1": {"alive": True, "sessions": [["train", "1"]],
+                         "info": {}, "last_error": ""}}),
+            "lab": self._state({
+                "localhost": local_node(),
+                "login--labws": {"alive": True, "sessions": [["ws", "1"]],
+                                 "info": {}, "last_error": ""}}),
+        })
+        _ok, state = pool.fetch_state()
+        self.assertEqual(
+            set(state["nodes"]),
+            {"localhost", "login--l1", "gpu1", "login--labws"})
+        self.assertEqual(state["nodes"]["gpu1"]["cluster"], "main")
+        self.assertEqual(state["nodes"]["login--labws"]["cluster"], "lab")
+
+    def test_this_laptop_appears_once_not_once_per_cluster(self):
+        """Every cluster's reply carries the same local row."""
+        pool = self.build()
+        self._stub(pool, {
+            "main": self._state({"localhost": local_node()}),
+            "lab": self._state({"localhost": local_node()}),
+        })
+        _ok, state = pool.fetch_state()
+        self.assertEqual(
+            [name for name in state["nodes"] if name == "localhost"],
+            ["localhost"])
+        self.assertEqual(state["nodes"]["localhost"]["sessions"],
+                         [["laptop", "1"]])
+
+    def test_a_colliding_node_name_is_disambiguated_not_overwritten(self):
+        """Two clusters can both have a node called gpu1, and losing one of
+        them silently is exactly the failure clusters exist to prevent."""
+        pool = self.build()
+        row = {"alive": True, "sessions": [["x", "1"]], "info": {},
+               "last_error": ""}
+        self._stub(pool, {
+            "main": self._state({"gpu1": dict(row, marker="main")}),
+            "lab": self._state({"gpu1": dict(row, marker="lab")}),
+        })
+        _ok, state = pool.fetch_state()
+        self.assertEqual(state["nodes"]["gpu1"]["marker"], "main")
+        self.assertEqual(state["nodes"]["gpu1--lab"]["marker"], "lab")
+        # The first cluster keeps the plain name: adding a second cluster must
+        # not rename rows the user already knows.
+        self.assertEqual(pool.cluster_of("gpu1"), "main")
+        self.assertEqual(pool.cluster_of("gpu1--lab"), "lab")
+
+    def test_operations_reach_the_cluster_that_owns_the_node(self):
+        pool = self.build()
+        row = {"alive": True, "sessions": [["x", "1"]], "info": {},
+               "last_error": ""}
+        self._stub(pool, {
+            "main": self._state({"gpu1": dict(row)}),
+            "lab": self._state({"gpu1": dict(row)}),
+        })
+        pool.fetch_state()
+        seen = []
+        for name, sub in pool._pools:
+            sub.preview = (lambda node, session, history=0, n=name:
+                           seen.append((n, node, session)) or {"ok": True})
+            sub.session_command = (lambda node, session, verb, n=name:
+                                   seen.append((n, node, verb)) or {"ok": True})
+        pool.preview("gpu1--lab", "train")
+        pool.session_command("gpu1", "train", "kill")
+        # The node reaches its own cluster under the name *that* cluster knows
+        # it by -- the disambiguating suffix is a display name, not a host.
+        self.assertEqual(seen, [("lab", "gpu1", "train"),
+                                ("main", "gpu1", "kill")])
+
+    def test_an_unreachable_cluster_is_visible_rather_than_absent(self):
+        """Silently missing rows read as "I never configured that"."""
+        pool = self.build()
+        for name, sub in pool._pools:
+            if name == "main":
+                sub.fetch_state = lambda: (True, self._state(
+                    {"localhost": local_node(), "gpu1": {
+                        "alive": True, "sessions": [], "info": {},
+                        "last_error": ""}}))
+            else:
+                sub.fetch_state = lambda: (True, {
+                    "nodes": {}, "gateway": {"last_error": "no route to host"}})
+        _ok, state = pool.fetch_state()
+        self.assertIn("lab", state["nodes"])
+        self.assertFalse(state["nodes"]["lab"]["alive"])
+        self.assertIn("no route", state["nodes"]["lab"]["last_error"])
+        summary = {entry["name"]: entry
+                   for entry in state["gateway"]["clusters"]}
+        self.assertEqual(summary["lab"]["nodes"], 0)
+        self.assertIn("no route", summary["lab"]["last_error"])
+
+    def test_one_broken_cluster_never_takes_down_the_others(self):
+        pool = self.build()
+        for name, sub in pool._pools:
+            if name == "main":
+                sub.fetch_state = lambda: (True, self._state(
+                    {"gpu1": {"alive": True, "sessions": [["t", "1"]],
+                              "info": {}, "last_error": ""}}))
+            else:
+                def boom():
+                    raise RuntimeError("agent exploded")
+                sub.fetch_state = boom
+        _ok, state = pool.fetch_state()
+        self.assertIn("gpu1", state["nodes"])
+
+    def test_clusters_do_not_share_a_disk_cache(self):
+        """_load_caches rejects a foreign pool_id, so a shared file would
+        leave every pool but the last writer starting cold."""
+        pool = self.build()
+        caches = [sub._state_cache for _name, sub in pool._pools]
+        self.assertEqual(len(set(caches)), len(caches))
+        snapshots = [sub._snapshot_cache for _name, sub in pool._pools]
+        self.assertEqual(len(set(snapshots)), len(snapshots))
+
+    def test_the_gateway_roster_is_the_union_in_order(self):
+        pool = self.build((("main", ("login1", "login2")), ("lab", ("labws",))))
+        self.assertEqual(pool.gateways, ("login1", "login2", "labws"))
+        self.assertEqual(pool.clusters, ("main", "lab"))
+
+    def test_keepalive_survives_a_cluster_with_no_registry(self):
+        """A workstation has no Slurm; that must not hide the cluster's
+        keep-alive markers."""
+        pool = self.build()
+        for name, sub in pool._pools:
+            if name == "main":
+                sub.keepalive_entries = lambda fresh=False: [{"job_name": "t"}]
+            else:
+                def boom(fresh=False):
+                    raise gateway.GatewayError("no keep-alive registry")
+                sub.keepalive_entries = boom
+        self.assertEqual(pool.keepalive_entries(), [{"job_name": "t"}])
+
+    def test_every_cluster_failing_still_reports_an_error(self):
+        pool = self.build()
+        for _name, sub in pool._pools:
+            def boom(fresh=False):
+                raise gateway.GatewayError("unreachable")
+            sub.keepalive_entries = boom
+        with self.assertRaises(gateway.GatewayError):
+            pool.keepalive_entries()
+
+    def test_snapshots_are_keyed_by_the_name_the_table_shows(self):
+        pool = self.build()
+        row = {"alive": True, "sessions": [["train", "1"]], "info": {},
+               "last_error": ""}
+        self._stub(pool, {
+            "main": self._state({"gpu1": dict(row)}),
+            "lab": self._state({"gpu1": dict(row)}),
+        })
+        pool.fetch_state()
+        for name, sub in pool._pools:
+            sub.read_snapshots = (
+                lambda n=name: (True, {"gpu1:train": {"lines": n}}))
+        _ok, snaps = pool.read_snapshots()
+        self.assertEqual(snaps["gpu1:train"]["lines"], "main")
+        self.assertEqual(snaps["gpu1--lab:train"]["lines"], "lab")
+
+    def test_a_pool_needs_at_least_one_cluster(self):
+        with self.assertRaises(ValueError):
+            gateway.ClusterPool([], client_settings())
+        with self.assertRaises(ValueError):
+            gateway.ClusterPool([("main", ())], client_settings())
+
+
+class ClusterArgumentTests(unittest.TestCase):
+    """--cluster is deliberately not --gateway repeated: repeating --gateway
+    adds another way in to the same place and those get raced."""
+
+    def test_a_standalone_machine_is_one_host(self):
+        self.assertEqual(cli.parse_cluster_args(['lab=my-workstation']),
+                         ({'lab': ['my-workstation']}, ''))
+
+    def test_a_second_slurm_cluster_lists_its_login_nodes(self):
+        clusters, error = cli.parse_cluster_args(
+            ['other=ol1,ol2', 'lab=ws'])
+        self.assertEqual(error, '')
+        self.assertEqual(clusters, {'other': ['ol1', 'ol2'], 'lab': ['ws']})
+
+    def test_nothing_at_all_is_not_an_error(self):
+        self.assertEqual(cli.parse_cluster_args(None), ({}, ''))
+        self.assertEqual(cli.parse_cluster_args([]), ({}, ''))
+
+    def test_a_malformed_value_is_refused_with_a_usable_message(self):
+        for value, expected in (
+                ('lab', 'NAME=HOST'),
+                ('lab=', 'NAME=HOST'),
+                ('bad name=x', 'invalid cluster name'),
+                ('lab=-oProxyCommand=evil', 'invalid SSH alias'),
+        ):
+            with self.subTest(value=value):
+                clusters, error = cli.parse_cluster_args([value])
+                self.assertEqual(clusters, {})
+                self.assertIn(expected, error)
+
+    def test_the_primary_cluster_name_is_reserved(self):
+        """Reusing it would shadow --gateway/[client].gateways and drop that
+        whole cluster from the table."""
+        _clusters, error = cli.parse_cluster_args(
+            [f'{config.PRIMARY_CLUSTER}=x'])
+        self.assertIn(config.PRIMARY_CLUSTER, error)
+
+    def test_the_same_name_twice_is_refused_not_silently_merged(self):
+        _clusters, error = cli.parse_cluster_args(['lab=a', 'lab=b'])
+        self.assertIn('twice', error)

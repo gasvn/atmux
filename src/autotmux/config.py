@@ -194,7 +194,26 @@ CLIENT_DEFAULTS = {
     # selection. "auto" keeps it on locally and off over SSH; "off" trades
     # click-to-attach for being able to select and copy with the mouse.
     'mouse': 'auto',
+    # Clusters *beyond* the one in `gateways`, as name -> login nodes.
+    #
+    # A "cluster" is a group of interchangeable entry points to one place.
+    # AutoTmux races the members of a group and keeps the first valid reply,
+    # so everything in one group must be a view of the same machines --
+    # otherwise whichever answers fastest defines the whole table and the
+    # rest of it disappears. Separate places go in separate groups, and the
+    # groups' node tables are merged.
+    #
+    # A standalone machine with no Slurm is just a group of one.
+    'clusters': {},
 }
+
+# `gateways` stays the primary group so an older client, which knows nothing
+# about groups, still sees exactly one coherent cluster rather than a race
+# between unrelated machines.
+PRIMARY_CLUSTER = 'main'
+CLUSTER_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$')
+CLUSTERS_MAX = 16
+CLUSTER_GATEWAYS_MAX = 16
 
 _CLIENT_NUMBER_RULES = {
     'connect_timeout':   (int,   1,   120),
@@ -398,7 +417,9 @@ def _read_client_state() -> dict | None:
     command = _client_agent_command(value.get('agent_command', ['atmux-agent']))
     if command is None:
         return None
-    return {'mode': mode, 'gateways': clean, 'agent_command': command}
+    return {'mode': mode, 'gateways': clean, 'agent_command': command,
+            'clusters': clean_clusters(value.get('clusters'),
+                                       exclude=(PRIMARY_CLUSTER,))}
 
 
 def client_state_exists() -> bool:
@@ -407,8 +428,13 @@ def client_state_exists() -> bool:
 
 
 def save_client_state(mode: str, gateways: list[str],
-                      agent_command) -> None:
-    """Atomically persist a connection selection made by the local TUI."""
+                      agent_command, clusters=None) -> None:
+    """Atomically persist a connection selection made by the local TUI.
+
+    ``clusters=None`` keeps whatever groups are already on disk. The dialog
+    only edits the primary group, and rewriting the file without them would
+    silently delete every other cluster the user has configured.
+    """
     if mode not in {'gateway', 'login'}:
         raise ValueError('invalid connection mode')
     clean = []
@@ -422,11 +448,15 @@ def save_client_state(mode: str, gateways: list[str],
     command = _client_agent_command(agent_command)
     if command is None:
         raise ValueError('invalid remote agent command')
+    if clusters is None:
+        existing = _read_client_state()
+        clusters = existing.get('clusters') if existing else {}
     value = {
         'version': 1,
         'mode': mode,
         'gateways': clean,
         'agent_command': command,
+        'clusters': clean_clusters(clusters, exclude=(PRIMARY_CLUSTER,)),
     }
     raw = (json.dumps(value, ensure_ascii=False, separators=(',', ':'))
            + '\n').encode('utf-8')
@@ -657,12 +687,81 @@ def discover_ssh_aliases(path: str | None = None) -> list[str]:
     return aliases
 
 
+def clean_clusters(value, exclude=()) -> dict:
+    """Validated ``name -> [login node, ...]`` groups. Never raises.
+
+    A bad entry is dropped on its own: one typo in a second cluster must not
+    cost the user the cluster that works.  Names already used elsewhere (the
+    primary group) are refused rather than silently merged.
+    """
+    if not isinstance(value, dict):
+        if value is not None:
+            log.warning('ignoring invalid client clusters (expected a table)')
+        return {}
+    taken = {str(name) for name in exclude}
+    clusters = {}
+    for name, hosts in list(value.items())[:CLUSTERS_MAX]:
+        if not isinstance(name, str) or CLUSTER_NAME_RE.fullmatch(name) is None:
+            log.warning(f'ignoring invalid cluster name: {name!r}')
+            continue
+        if name in taken:
+            log.warning(f'ignoring duplicate cluster name: {name!r}')
+            continue
+        if not isinstance(hosts, (list, tuple)):
+            log.warning(f'ignoring cluster {name!r} (expected an array)')
+            continue
+        clean = []
+        for host in list(hosts)[:CLUSTER_GATEWAYS_MAX]:
+            if valid_gateway(host) and host not in clean:
+                clean.append(host)
+            else:
+                log.warning(
+                    f'ignoring invalid/duplicate login node in cluster '
+                    f'{name!r}: {host!r}')
+        if not clean:
+            log.warning(f'ignoring cluster {name!r} (no usable login node)')
+            continue
+        taken.add(name)
+        clusters[name] = clean
+    return clusters
+
+
+def client_clusters(cfg: dict) -> list:
+    """``[(name, (login node, ...)), ...]``, primary first.
+
+    One entry per independent place. The caller races within an entry and
+    merges across entries; collapsing these into one flat list is exactly the
+    bug this shape exists to prevent.
+    """
+    if not isinstance(cfg, dict):
+        return []
+    groups = []
+    primary = [g for g in (cfg.get('gateways') or []) if valid_gateway(g)]
+    if primary:
+        groups.append((PRIMARY_CLUSTER, tuple(primary)))
+    extra = cfg.get('clusters')
+    if isinstance(extra, dict):
+        for name, hosts in extra.items():
+            hosts = tuple(h for h in hosts if valid_gateway(h))
+            if hosts:
+                groups.append((name, hosts))
+    return groups
+
+
 def _apply_client_state(cfg: dict) -> dict:
     state = _read_client_state()
     if state is not None:
         cfg['mode'] = state['mode']
         cfg['gateways'] = list(state['gateways'])
         cfg['agent_command'] = list(state['agent_command'])
+        # Absent from the file means "the TUI never wrote any", not "none":
+        # the connection dialog only edits the primary group, so clusters
+        # configured in config.toml have to survive it.
+        if state.get('clusters'):
+            cfg['clusters'] = {name: list(hosts)
+                               for name, hosts in state['clusters'].items()}
+    cfg['clusters'] = clean_clusters(cfg.get('clusters'),
+                                     exclude=(PRIMARY_CLUSTER,))
     return cfg
 
 
@@ -713,6 +812,10 @@ def load_client() -> dict:
                 log.warning(f'ignoring invalid/duplicate gateway: {gateway!r}')
     elif 'gateways' in section:
         log.warning('ignoring invalid client gateways (expected an array)')
+
+    if 'clusters' in section:
+        cfg['clusters'] = clean_clusters(section['clusters'],
+                                         exclude=(PRIMARY_CLUSTER,))
 
     for key, rule in _CLIENT_NUMBER_RULES.items():
         if key in section:

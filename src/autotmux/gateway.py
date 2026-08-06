@@ -213,7 +213,9 @@ class GatewayPool:
     def __init__(self, settings: dict, *, clock: Callable[[], float] = time.monotonic,
                  wall_clock: Callable[[], float] = time.time,
                  popen=subprocess.Popen,
-                 local_state_loader: Callable[[], dict] | None = None) -> None:
+                 local_state_loader: Callable[[], dict] | None = None,
+                 state_cache: str | None = None,
+                 snapshot_cache: str | None = None) -> None:
         self.settings = dict(settings)
         self._gateways = tuple(settings.get("gateways") or ())
         if not self._gateways or any(not config.valid_gateway(g) for g in self._gateways):
@@ -263,6 +265,11 @@ class GatewayPool:
         self._cache_sequence = 0
         self._last_state: dict = {}
         self._snapshots: dict = {}
+        # Each cluster caches separately. Sharing one file would make every
+        # pool but the last writer start cold, since _load_caches rejects a
+        # cache whose pool_id is not its own.
+        self._state_cache = state_cache or paths.GATEWAY_STATE_CACHE
+        self._snapshot_cache = snapshot_cache or paths.GATEWAY_SNAPSHOT_CACHE
         self._keepalive_entries: list[dict] = []
         self._keepalive_known = False
         self._load_caches()
@@ -283,7 +290,7 @@ class GatewayPool:
     def _load_caches(self) -> None:
         state_cache_valid = False
         try:
-            state = _read_owned_json(paths.GATEWAY_STATE_CACHE, _CACHE_LIMIT)
+            state = _read_owned_json(self._state_cache, _CACHE_LIMIT)
             gateway_info = state.get("gateway")
             if (isinstance(state.get("nodes"), dict)
                     and isinstance(gateway_info, dict)
@@ -307,7 +314,7 @@ class GatewayPool:
             return
         try:
             snapshots = _read_owned_json(
-                paths.GATEWAY_SNAPSHOT_CACHE, _SNAPSHOT_CACHE_LIMIT)
+                self._snapshot_cache, _SNAPSHOT_CACHE_LIMIT)
             self._snapshots = {
                 key: value for key, value in snapshots.items()
                 if isinstance(key, str) and isinstance(value, dict)
@@ -1182,7 +1189,7 @@ class GatewayPool:
                     and sequence < self._cache_sequence):
                 return
             try:
-                _atomic_write_json(paths.GATEWAY_STATE_CACHE, state, _CACHE_LIMIT)
+                _atomic_write_json(self._state_cache, state, _CACHE_LIMIT)
             except Exception:
                 return
             if isinstance(sequence, int) and not isinstance(sequence, bool):
@@ -1376,7 +1383,7 @@ class GatewayPool:
         with self._cache_lock:
             try:
                 _atomic_write_json(
-                    paths.GATEWAY_SNAPSHOT_CACHE, snapshot,
+                    self._snapshot_cache, snapshot,
                     _SNAPSHOT_CACHE_LIMIT)
             except Exception:
                 pass
@@ -1814,3 +1821,330 @@ class GatewayPool:
 
     def status(self) -> dict:
         return self._health_payload()
+
+
+# ── several clusters, one table ────────────────────────────────────────────
+
+# A cluster's rows keep their own names until two clusters collide, at which
+# point the cluster name disambiguates. Nothing is renamed pre-emptively: the
+# common case is one cluster, and a prefix on every row would be pure noise.
+_CLUSTER_SUFFIX_SEP = "--"
+
+
+def _cluster_slug(name: str) -> str:
+    """A filename-safe tag for a cluster's private cache files."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", str(name)).strip("-")[:32]
+    return cleaned or hashlib.sha256(
+        str(name).encode("utf-8", "surrogatepass")).hexdigest()[:8]
+
+
+def merge_node_names(groups) -> list:
+    """Assign display names to ``[(cluster, [node, ...]), ...]``.
+
+    Returns ``[(cluster, source_name, display_name), ...]`` in input order.
+    The first cluster to claim a name keeps it unchanged, so adding a second
+    cluster never renames rows the user already knows.
+    """
+    taken: set[str] = set()
+    assigned = []
+    for cluster, names in groups:
+        for name in names:
+            # An empty source name is a stand-in for a whole cluster that
+            # answered with nothing; it is shown under the cluster's own name.
+            base = name or cluster
+            digest = hashlib.sha256(
+                f"{cluster}\0{name}".encode("utf-8", "surrogatepass")
+            ).hexdigest()[:8]
+            for display in (base,
+                            f"{base}{_CLUSTER_SUFFIX_SEP}{cluster}",
+                            f"{base[:200]}{_CLUSTER_SUFFIX_SEP}{digest}",
+                            f"node{_CLUSTER_SUFFIX_SEP}{digest}"):
+                if display not in taken and _NODE_RE.fullmatch(display):
+                    break
+            taken.add(display)
+            assigned.append((cluster, name, display))
+    return assigned
+
+
+class ClusterPool:
+    """One :class:`GatewayPool` per cluster, merged into a single table.
+
+    A cluster is a set of interchangeable ways in to *one* place; the pool
+    races them and keeps the first valid reply. Two unrelated machines must
+    therefore never share a pool -- whichever answered first would define the
+    whole node table and the other's machines would vanish. This class is the
+    layer above: it fetches each cluster independently and merges the results,
+    so a laptop, a Slurm cluster and a lone workstation coexist in one list.
+
+    It implements the same surface the TUI uses on a single pool, so nothing
+    downstream has to know how many clusters there are.
+    """
+
+    def __init__(self, clusters, settings: dict, **pool_kwargs) -> None:
+        groups = [(str(name), tuple(hosts)) for name, hosts in clusters if hosts]
+        if not groups:
+            raise ValueError("ClusterPool needs at least one cluster")
+        self._pools: list[tuple[str, GatewayPool]] = []
+        for index, (name, hosts) in enumerate(groups):
+            pool_settings = dict(settings)
+            pool_settings["gateways"] = list(hosts)
+            extra = dict(pool_kwargs)
+            if index:
+                # Only the first cluster contributes the laptop's own tmux
+                # row, and each cluster caches to its own file -- a shared
+                # cache would leave every pool but the last writer starting
+                # cold, since _load_caches rejects a foreign pool_id.
+                extra.setdefault(
+                    "state_cache",
+                    f"{paths.GATEWAY_STATE_CACHE}.{_cluster_slug(name)}")
+                extra.setdefault(
+                    "snapshot_cache",
+                    f"{paths.GATEWAY_SNAPSHOT_CACHE}.{_cluster_slug(name)}")
+            self._pools.append((name, GatewayPool(pool_settings, **extra)))
+        self._primary_name, self._primary = self._pools[0]
+        self.settings = self._primary.settings
+        self._lock = threading.RLock()
+        self._owner: dict[str, GatewayPool] = {}
+        self._display: dict[str, tuple[str, str]] = {}
+
+    # ── identity ─────────────────────────────────────────────────────────
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    @property
+    def clusters(self) -> tuple[str, ...]:
+        return tuple(name for name, _pool in self._pools)
+
+    @property
+    def gateways(self) -> tuple[str, ...]:
+        seen: list[str] = []
+        for _name, pool in self._pools:
+            for gateway in pool.gateways:
+                if gateway not in seen:
+                    seen.append(gateway)
+        return tuple(seen)
+
+    @property
+    def active_gateway(self) -> str | None:
+        # The primary's, when it has one: the subtitle names "the" gateway,
+        # and the cluster the user mostly works in is the honest answer.
+        for _name, pool in self._pools:
+            active = pool.active_gateway
+            if active:
+                return active
+        return None
+
+    def _pool_for(self, node: str) -> GatewayPool:
+        """The cluster that owns a display name, defaulting to the primary."""
+        with self._lock:
+            return self._owner.get(str(node), self._primary)
+
+    def _source_node(self, node: str) -> str:
+        """The name that cluster knows the node by, before disambiguation."""
+        with self._lock:
+            entry = self._display.get(str(node))
+        return entry[1] if entry else str(node)
+
+    def cluster_of(self, node: str) -> str:
+        with self._lock:
+            entry = self._display.get(str(node))
+        return entry[0] if entry else self._primary_name
+
+    # ── state ────────────────────────────────────────────────────────────
+    def fetch_state(self) -> tuple[bool, dict]:
+        """Fetch every cluster in parallel and merge them into one table."""
+        results: dict[str, tuple[bool, dict]] = {}
+        threads = []
+
+        def worker(name: str, pool: GatewayPool) -> None:
+            try:
+                results[name] = pool.fetch_state()
+            except Exception as error:                      # never propagate
+                results[name] = (False, {"gateway": {
+                    "last_error": _safe_error(error)}, "nodes": {}})
+
+        for name, pool in self._pools:
+            thread = threading.Thread(
+                target=worker, args=(name, pool), daemon=True,
+                name=f"cluster-state-{name}")
+            thread.start()
+            threads.append(thread)
+        budget = float(self.settings["state_timeout"]) + 2.0
+        deadline = time.monotonic() + budget
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+
+        return True, self._merge(results)
+
+    def _merge(self, results: dict) -> dict:
+        merged: dict | None = None
+        contributions: list[tuple[str, dict]] = []
+        items: list = []
+        summaries: list = []
+        local_row = None
+
+        for name, _pool in self._pools:
+            _ok, state = results.get(name, (False, {}))
+            if not isinstance(state, dict):
+                state = {}
+            info = state.get("gateway")
+            info = info if isinstance(info, dict) else {}
+            source = state.get("nodes")
+            source = source if isinstance(source, dict) else {}
+            if name == self._primary_name:
+                merged = copy.deepcopy(state)
+            # "localhost" is this laptop -- identical in every cluster's
+            # reply, so it is contributed once rather than N times.
+            contributed = {key: value for key, value in source.items()
+                           if key != "localhost" and isinstance(value, dict)}
+            if local_row is None and isinstance(source.get("localhost"), dict):
+                local_row = copy.deepcopy(source["localhost"])
+
+            last_error = _safe_error(info.get("last_error") or "")
+            # A cluster that answers with nothing would simply be absent from
+            # the table, and "absent" reads as "I never configured it".
+            if not contributed and last_error:
+                contributed = {"": {
+                    "alive": False, "socket": "", "info": {}, "sessions": [],
+                    "last_error": last_error,
+                }}
+            contributions.append((name, contributed))
+
+            payload_items = info.get("items")
+            if isinstance(payload_items, list):
+                items.extend({**entry, "cluster": name}
+                             for entry in payload_items
+                             if isinstance(entry, dict))
+            summaries.append({
+                "name": name,
+                "active": info.get("active") or "",
+                "cached": bool(info.get("cached")),
+                "nodes": sum(1 for key in contributed if key),
+                "last_error": last_error,
+            })
+
+        pools = {name: pool for name, pool in self._pools}
+        nodes: dict = {}
+        owner: dict[str, GatewayPool] = {}
+        display_map: dict[str, tuple[str, str]] = {}
+        for cluster, source_name, display in merge_node_names(
+                [(name, list(entries)) for name, entries in contributions]):
+            entries = next(e for n, e in contributions if n == cluster)
+            item = copy.deepcopy(entries[source_name])
+            item["cluster"] = cluster
+            nodes[display] = item
+            owner[display] = pools[cluster]
+            display_map[display] = (cluster, source_name or "localhost")
+
+        if merged is None:
+            merged = {}
+        if local_row is not None:
+            nodes["localhost"] = local_row
+        merged["nodes"] = nodes
+        gateway_info = merged.get("gateway")
+        gateway_info = dict(gateway_info) if isinstance(gateway_info, dict) else {}
+        gateway_info["items"] = items
+        gateway_info["clusters"] = summaries
+        merged["gateway"] = gateway_info
+        with self._lock:
+            self._owner = owner
+            self._display = display_map
+        return merged
+
+    def read_snapshots(self) -> tuple[bool, dict]:
+        merged: dict = {}
+        with self._lock:
+            display_map = dict(self._display)
+        by_source: dict[GatewayPool, dict] = {}
+        for _name, pool in self._pools:
+            _ok, snaps = pool.read_snapshots()
+            by_source[pool] = snaps if isinstance(snaps, dict) else {}
+        for display, (_cluster, source_name) in display_map.items():
+            pool = self._owner.get(display)
+            for key, value in by_source.get(pool, {}).items():
+                node, _, session = str(key).partition(":")
+                if node == source_name and session:
+                    merged[f"{display}:{session}"] = value
+        # The laptop's own rows are not renamed, so pass them through as-is.
+        for key, value in by_source.get(self._primary, {}).items():
+            if str(key).startswith("localhost:"):
+                merged.setdefault(str(key), value)
+        return True, merged
+
+    # ── per-node operations ──────────────────────────────────────────────
+    def preview(self, node: str, session: str, history: int = 0) -> dict:
+        return self._pool_for(node).preview(
+            self._source_node(node), session, history)
+
+    def session_command(self, node: str, session: str, verb: str) -> dict:
+        return self._pool_for(node).session_command(
+            self._source_node(node), session, verb)
+
+    def run_interactive(self, node: str, remote_args, *,
+                        direct: bool = False):
+        return self._pool_for(node).run_interactive(
+            self._source_node(node), remote_args, direct=direct)
+
+    def prewarm_interactive(self, node: str) -> bool:
+        return self._pool_for(node).prewarm_interactive(
+            self._source_node(node))
+
+    def report_async(self, node: str, outcome: str, reason: str,
+                     source: str) -> None:
+        self._pool_for(node).report_async(
+            self._source_node(node), outcome, reason, source)
+
+    # ── Slurm operations ─────────────────────────────────────────────────
+    def scontrol_job(self, job_id: str, node: str | None = None):
+        return self._pool_for(node).scontrol_job(str(job_id))
+
+    def set_keepalive(self, job_name: str, enabled: bool, command: str = "",
+                      workdir: str = "", *, job_id=None, entry_id=None,
+                      node: str | None = None) -> bool:
+        return self._pool_for(node).set_keepalive(
+            job_name, enabled, command, workdir,
+            job_id=job_id, entry_id=entry_id)
+
+    def keepalive_entries(self, require_fresh: bool = False) -> list[dict]:
+        entries: list[dict] = []
+        failures = []
+        for name, pool in self._pools:
+            try:
+                entries.extend(pool.keepalive_entries(require_fresh))
+            except Exception as error:
+                failures.append(f"{name}: {_safe_error(error, 80)}")
+        # One cluster without a reachable registry must not hide the markers
+        # for the cluster that answered.
+        if failures and not entries:
+            raise GatewayError("; ".join(failures[:3]))
+        return entries
+
+    def keepalive_warning(self, gateway: str) -> str:
+        for _name, pool in self._pools:
+            if gateway in pool.gateways:
+                return pool.keepalive_warning(gateway)
+        return ""
+
+    # ── diagnostics ──────────────────────────────────────────────────────
+    def _tagged(self, method: str) -> list[dict]:
+        results: list[dict] = []
+        for name, pool in self._pools:
+            try:
+                for entry in getattr(pool, method)():
+                    results.append({**entry, "cluster": name})
+            except Exception as error:
+                results.append({"gateway": ", ".join(pool.gateways),
+                                "cluster": name, "ok": False,
+                                "error": _safe_error(error)})
+        return results
+
+    def check_all(self) -> list[dict]:
+        return self._tagged("check_all")
+
+    def authenticate(self) -> list[dict]:
+        return self._tagged("authenticate")
+
+    def status(self) -> dict:
+        return {"clusters": [
+            {"name": name, **pool.status()} for name, pool in self._pools]}

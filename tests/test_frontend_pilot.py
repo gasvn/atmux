@@ -757,7 +757,7 @@ class KeepAliveToggleTests(unittest.IsolatedAsyncioTestCase):
 
             app = autotmux.AutotmuxApp()
             # Avoid real scontrol — pretend it's a batch job.
-            app._scontrol_job = lambda jid: {
+            app._scontrol_job = lambda jid, node=None: {
                 'batch': True, 'command': '/home/x/train_job',
                 'workdir': '/home/x', 'job_name': 'train_job'}
             async with app.run_test() as pilot:
@@ -849,7 +849,7 @@ class KeepAliveToggleTests(unittest.IsolatedAsyncioTestCase):
             ka_path = os.path.join(td, 'keepalive.json')
             autotmux.config.KEEPALIVE_PATH = ka_path
             app = autotmux.AutotmuxApp()
-            app._scontrol_job = lambda _job_id: {
+            app._scontrol_job = lambda _job_id, _node=None: {
                 'batch': True, 'command': '/x/empty-job',
                 'workdir': '/x', 'job_name': 'empty-job',
             }
@@ -934,7 +934,7 @@ class KeepAliveToggleTests(unittest.IsolatedAsyncioTestCase):
             ka_path = os.path.join(td, 'keepalive.json')
             autotmux.config.KEEPALIVE_PATH = ka_path
             app = autotmux.AutotmuxApp()
-            app._scontrol_job = lambda _job_id: {
+            app._scontrol_job = lambda _job_id, _node=None: {
                 'batch': True,
                 'command': '/home/x/train_job',
                 'workdir': '/home/x',

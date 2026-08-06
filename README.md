@@ -468,6 +468,64 @@ legacy `/tmp` pid file so you don't end up with two daemons.
 └─────────────────────────────────────────────┘
 ```
 
+### More than one place
+
+`[client].gateways` is **one cluster's interchangeable entry points**, not "my
+servers". AutoTmux races them and keeps the first valid reply, because k6 and
+k7 are two doors into the same machines. Put an unrelated host in that list and
+it will sometimes win the race — and since it knows nothing about your compute
+nodes, they all vanish from the table until the next fetch lands elsewhere.
+
+Somewhere else goes in its own cluster. Each cluster is raced internally and
+the results are merged into one table:
+
+```
+                 raced within                merged across
+ ┌──────────────────────────────┐  ┌────────────────────────────────┐
+ main:  k6  k7  k8  b8  kempner │  │  holygpu8a17504   4gpu         │
+ lab:   my-workstation          │→ │  holygpu8a19301   sweepA       │
+ other: ol1  ol2                │  │  login:my-workstation  notes   │
+ └──────────────────────────────┘  │  ol-gpu02         eval         │
+                                   └────────────────────────────────┘
+```
+
+A standalone machine with no Slurm is simply a cluster of one: it contributes
+its own tmux sessions as a single row. Attach, preview, `x`, notes and the
+idle column all work on it exactly as they do on a compute node.
+
+Try it for one run:
+
+```sh
+atmux --cluster lab=my-workstation --cluster other=ol1,ol2
+```
+
+Keep it:
+
+```toml
+[client]
+gateways = ["k6", "k7", "k8", "b8", "kempner"]   # the primary cluster
+
+[client.clusters]
+lab   = ["my-workstation"]
+other = ["ol1", "ol2"]
+```
+
+`gateways` stays the primary cluster rather than becoming one entry among
+many, so a client that predates clusters still sees one coherent cluster
+instead of a race between unrelated machines.
+
+Each cluster needs `atmux-agent` reachable on its login nodes, the same as the
+primary. Node names normally stay as they are; if two clusters both have a
+`gpu1`, the second one shows as `gpu1--lab` — the first cluster to claim a name
+keeps it, so adding a cluster never renames rows you already know. A cluster
+with no reachable entry point gets one visible row carrying the error rather
+than quietly disappearing, and the subtitle says `⚠ cluster unreachable: lab`.
+
+The `g` dialog edits the primary cluster only; the others are configured in
+the files above and are preserved when the dialog writes.
+
+### Layout
+
 `z` cycles which of those panes are on screen, and remembers the choice for
 next time. The default spends 44% of the width on the preview and up to 14
 lines on the queue, which is the wrong shape on a small terminal or whenever

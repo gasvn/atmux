@@ -344,6 +344,23 @@ def _time_left_label(value) -> str:
     return f'{minutes}m'
 
 
+def _cluster_health_note(clusters) -> str:
+    """Which whole clusters are not answering, which is usually none.
+
+    A single unreachable login node is routine and the pool routes around it;
+    a cluster with *no* reachable entry point means every machine behind it
+    has silently left the table, and silence is the wrong way to say that.
+    """
+    if not isinstance(clusters, list) or len(clusters) < 2:
+        return ''
+    down = [str(entry.get('name') or '?') for entry in clusters
+            if isinstance(entry, dict) and entry.get('last_error')
+            and not entry.get('nodes')]
+    if not down:
+        return ''
+    return f" · ⚠ cluster unreachable: {', '.join(sorted(down))}"
+
+
 def _gateway_health_note(items) -> str:
     """What to say about the gateways we are *not* using, which is usually
     nothing.
@@ -1406,10 +1423,14 @@ def _publish_remote_command_result(node: str, returncode: int, error: str,
 def _set_keepalive_enabled(path: str, job_name: str, enabled: bool,
                            command: str = '', workdir: str = '', **kwargs) -> bool:
     """Write keep-alive intent on the host which owns Slurm state."""
+    # Which cluster's registry: a JobID only means anything to the Slurm that
+    # issued it, so the row's node decides, not whichever gateway is active.
+    node = kwargs.pop('node', None)
     if _GATEWAY_POOL is not None:
         return _GATEWAY_POOL.set_keepalive(
             job_name, enabled, command, workdir,
-            job_id=kwargs.get('job_id'), entry_id=kwargs.get('entry_id'))
+            job_id=kwargs.get('job_id'), entry_id=kwargs.get('entry_id'),
+            node=node)
     return keepalive.set_entry_enabled(
         path, job_name, enabled, command, workdir, **kwargs)
 
@@ -4132,6 +4153,7 @@ class AutotmuxApp(App):
                             if isinstance(latency, (int, float)) else '')
             extra += f" · gateway {via}{latency_text}"
             extra += _gateway_health_note(gateway_items)
+            extra += _cluster_health_note(gateway_info.get('clusters'))
             agent_version = gateway_info.get('agent_version')
             if (isinstance(agent_version, str) and agent_version
                     and agent_version != __version__):
@@ -4944,7 +4966,7 @@ class AutotmuxApp(App):
                     _operation_timeout(8), _set_keepalive_enabled,
                     config.KEEPALIVE_PATH,
                     str(existing.get('job_name') or job_name), False,
-                    **kwargs)
+                    node=node, **kwargs)
             except Exception as error:
                 self.notify(f'could not update keep-alive registry: {error}',
                             severity='error', timeout=6, markup=False)
@@ -4986,7 +5008,7 @@ class AutotmuxApp(App):
         entry_id = entry_id or uuid.uuid4().hex
         try:
             info = await _offload_for(
-                _operation_timeout(10), self._scontrol_job, job_id)
+                _operation_timeout(10), self._scontrol_job, job_id, node)
             if info is None:
                 self.notify(f'could not read job {job_id} (scontrol)',
                             severity='warning', timeout=4, markup=False)
@@ -5006,7 +5028,8 @@ class AutotmuxApp(App):
                 _operation_timeout(8), _set_keepalive_enabled,
                 config.KEEPALIVE_PATH,
                 authoritative_name, True, info['command'],
-                info.get('workdir') or '', job_id=job_id, entry_id=entry_id)
+                info.get('workdir') or '', job_id=job_id, entry_id=entry_id,
+                node=node)
             new_entry = {
                 'entry_id': entry_id,
                 'job_id': keepalive.job_family_id(job_id),
@@ -5037,7 +5060,7 @@ class AutotmuxApp(App):
             self._ka_inflight.discard(inflight_key)
 
     @staticmethod
-    def _scontrol_job(job_id: str):
+    def _scontrol_job(job_id: str, node: str | None = None):
         """Run `scontrol show job <id>` and parse it. None on failure."""
         # Only real SLURM job ids: '123', array '123_4', array-range '123_[5-9]'.
         # Guards against a crafted state value like '-Q' being taken by scontrol
@@ -5045,7 +5068,7 @@ class AutotmuxApp(App):
         if not re.match(r'^\d+(_\d+|_\[[0-9,\-]+\])?$', str(job_id)):
             return None
         if _GATEWAY_POOL is not None:
-            return _GATEWAY_POOL.scontrol_job(str(job_id))
+            return _GATEWAY_POOL.scontrol_job(str(job_id), node=node)
         try:
             result = _hard_subprocess_run(
                 ['scontrol', 'show', 'job', str(job_id)],
@@ -5395,7 +5418,38 @@ def _build_argparser():
         '--gateway', action='append', default=[], metavar='SSH_HOST',
         help='Use this SSH login gateway for local mode (repeatable; overrides '
              '[client].gateways).')
+    # Deliberately separate from --gateway: repeating --gateway adds another
+    # way in to the *same* place, and AutoTmux races those. A machine that is
+    # somewhere else has to say so, or it would win the race and replace the
+    # table with its own single row.
+    p.add_argument(
+        '--cluster', action='append', default=[], metavar='NAME=HOST[,HOST]',
+        help='Add an independent cluster or standalone machine, shown in the '
+             'same table (repeatable). A lone workstation is just NAME=HOST.')
     return p
+
+
+def parse_cluster_args(values) -> tuple[dict, str]:
+    """``['lab=ws', 'other=o1,o2']`` -> ``({'lab': ['ws'], ...}, error)``."""
+    clusters: dict = {}
+    for value in values or []:
+        name, separator, hosts = str(value).partition('=')
+        name = name.strip()
+        if not separator or not hosts.strip():
+            return {}, f'--cluster needs NAME=HOST, got {value!r}'
+        if config.CLUSTER_NAME_RE.fullmatch(name) is None:
+            return {}, f'invalid cluster name: {name!r}'
+        if name == config.PRIMARY_CLUSTER:
+            return {}, (f'{config.PRIMARY_CLUSTER!r} is the name of the '
+                        'cluster in --gateway/[client].gateways')
+        members = [host.strip() for host in hosts.split(',') if host.strip()]
+        bad = [host for host in members if not config.valid_gateway(host)]
+        if bad:
+            return {}, f'invalid SSH alias in --cluster {name}: {bad[0]!r}'
+        if name in clusters:
+            return {}, f'--cluster {name} given twice'
+        clusters[name] = members
+    return clusters, ''
 
 
 def _is_remote_session() -> bool:
@@ -5443,6 +5497,7 @@ def _configure_gateway_mode(args) -> str:
         return ''
     explicit_gateway = bool(
         cli_gateways or getattr(args, 'gateway_mode', False)
+        or getattr(args, 'cluster', None)
         or getattr(args, 'gateway_login', False)
         or getattr(args, 'gateway_check', False))
     if _is_remote_session() and not explicit_gateway:
@@ -5468,8 +5523,21 @@ def _configure_gateway_mode(args) -> str:
             return f'invalid gateway SSH destination: {invalid[0]!r}'
         settings['gateways'] = list(dict.fromkeys(cli_gateways))
 
+    cli_clusters, cluster_error = parse_cluster_args(
+        getattr(args, 'cluster', None))
+    if cluster_error:
+        return cluster_error
+    if cli_clusters:
+        # Additive: --cluster names extra places, it does not restate the
+        # ones already configured.
+        merged = dict(settings.get('clusters') or {})
+        merged.update(cli_clusters)
+        settings['clusters'] = config.clean_clusters(
+            merged, exclude=(config.PRIMARY_CLUSTER,))
+
     forced = bool(
         getattr(args, 'gateway_mode', False) or cli_gateways
+        or cli_clusters
         or getattr(args, 'gateway_login', False)
         or getattr(args, 'gateway_check', False))
     mode = settings.get('mode', 'auto')
@@ -5481,7 +5549,10 @@ def _configure_gateway_mode(args) -> str:
     if not settings.get('gateways'):
         return 'gateway mode needs at least one [client].gateways entry'
     try:
-        _GATEWAY_POOL = gateway_client.GatewayPool(settings)
+        # Always the multi-cluster pool, even for one cluster: a single code
+        # path downstream is worth more than the indirection costs.
+        _GATEWAY_POOL = gateway_client.ClusterPool(
+            config.client_clusters(settings), settings)
     except Exception as error:
         return f'could not initialize gateway mode: {error}'
     return ''
