@@ -510,12 +510,37 @@ lab   = ["my-workstation"]
 other = ["ol1", "ol2"]
 ```
 
+A cluster that needs its own settings takes the table form instead:
+
+```toml
+[client.clusters.zgx]
+gateways = ["zgx"]
+# Where atmux-agent lives is a property of the machine. `ssh host <cmd>` runs
+# non-interactively and gets a bare PATH -- on Ubuntu that excludes
+# ~/.local/bin, so a venv install needs its absolute path here.
+agent_command = ["/home/me/.local/venv/atmux/bin/atmux-agent"]
+# "" means "manage your own SSH master". Set it when the global control_path
+# points at an MFA helper's socket that this machine will never have.
+control_path = ""
+```
+
 `gateways` stays the primary cluster rather than becoming one entry among
 many, so a client that predates clusters still sees one coherent cluster
 instead of a race between unrelated machines.
 
-Each cluster needs `atmux-agent` reachable on its login nodes, the same as the
-primary. Node names normally stay as they are; if two clusters both have a
+Each cluster needs `atmux-agent` reachable on its login nodes. AutoTmux is not
+on PyPI — install it from the repo, and on a machine without root a venv keeps
+it self-contained:
+
+```sh
+ssh my-workstation 'python3 -m venv ~/.local/venv/atmux &&
+  ~/.local/venv/atmux/bin/pip install git+https://github.com/gasvn/atmux'
+```
+
+Then point that cluster's `agent_command` at
+`~/.local/venv/atmux/bin/atmux-agent` as above. Nothing else is needed: the
+daemon starts itself on first contact, and on a host with no `squeue` it says
+so once and reports that machine's tmux sessions alone. Node names normally stay as they are; if two clusters both have a
 `gpu1`, the second one shows as `gpu1--lab` — the first cluster to claim a name
 keeps it, so adding a cluster never renames rows you already know. A cluster
 with no reachable entry point gets one visible row carrying the error rather

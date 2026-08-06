@@ -278,7 +278,7 @@ class ClusterDefinitionTests(unittest.TestCase):
     def test_no_clusters_means_just_the_primary(self):
         self.assertEqual(
             config.client_clusters({'gateways': ['k6', 'k7']}),
-            [(config.PRIMARY_CLUSTER, ('k6', 'k7'))])
+            [(config.PRIMARY_CLUSTER, ('k6', 'k7'), {})])
 
     def test_extra_clusters_follow_the_primary_in_order(self):
         groups = config.client_clusters({
@@ -286,15 +286,52 @@ class ClusterDefinitionTests(unittest.TestCase):
             'clusters': {'lab': ['ws'], 'other': ['ol1', 'ol2']},
         })
         self.assertEqual(groups, [
-            (config.PRIMARY_CLUSTER, ('k6',)),
-            ('lab', ('ws',)),
-            ('other', ('ol1', 'ol2')),
+            (config.PRIMARY_CLUSTER, ('k6',), {}),
+            ('lab', ('ws',), {}),
+            ('other', ('ol1', 'ol2'), {}),
         ])
+
+    def test_a_cluster_can_say_where_its_agent_lives(self):
+        """Machines do not agree on this. FASRC resolves atmux-agent from a
+        conda env on the non-interactive PATH; a plain Ubuntu box has neither
+        that env nor ~/.local/bin on that PATH, so it needs an absolute one."""
+        groups = config.client_clusters({
+            'gateways': ['k6'],
+            'clusters': {'zgx': {
+                'gateways': ['zgx'],
+                'agent_command': ['/home/me/.local/venv/atmux/bin/atmux-agent'],
+            }},
+        })
+        self.assertEqual(groups[1], (
+            'zgx', ('zgx',),
+            {'agent_command': ['/home/me/.local/venv/atmux/bin/atmux-agent']}))
+
+    def test_the_bare_array_form_still_works(self):
+        """Most clusters do not need an override and should not have to say
+        so; the table form is only for the ones that do."""
+        groups = config.client_clusters(
+            {'gateways': ['k6'], 'clusters': {'lab': ['ws']}})
+        self.assertEqual(groups[1], ('lab', ('ws',), {}))
+
+    def test_a_bad_agent_command_drops_the_override_not_the_cluster(self):
+        cleaned = config.clean_clusters(
+            {'zgx': {'gateways': ['zgx'], 'agent_command': ['-oProxy=evil']}})
+        self.assertEqual(cleaned['zgx']['gateways'], ['zgx'])
+        self.assertIsNone(cleaned['zgx']['agent_command'])
+
+    def test_a_cluster_can_opt_out_of_a_shared_control_path(self):
+        """An MFA helper keeps authenticated masters for one cluster and
+        knows nothing about a plain key-auth box."""
+        groups = config.client_clusters({
+            'gateways': ['k6'],
+            'clusters': {'zgx': {'gateways': ['zgx'], 'control_path': ''}},
+        })
+        self.assertEqual(groups[1][2], {'control_path': ''})
 
     def test_a_standalone_machine_is_just_a_cluster_of_one(self):
         groups = config.client_clusters(
             {'gateways': ['k6'], 'clusters': {'vps': ['my-vps']}})
-        self.assertEqual(groups[1], ('vps', ('my-vps',)))
+        self.assertEqual(groups[1], ('vps', ('my-vps',), {}))
 
     def test_no_gateways_at_all_means_no_groups(self):
         self.assertEqual(config.client_clusters({'gateways': []}), [])
@@ -309,8 +346,8 @@ class ClusterDefinitionTests(unittest.TestCase):
             'wrong': 'not-a-list',
             'hosts': ['-oProxyCommand=evil', 'good'],
         })
-        self.assertEqual(cleaned['lab'], ['ws'])
-        self.assertEqual(cleaned['hosts'], ['good'])
+        self.assertEqual(cleaned['lab']['gateways'], ['ws'])
+        self.assertEqual(cleaned['hosts']['gateways'], ['good'])
         self.assertNotIn('bad name', cleaned)
         self.assertNotIn('empty', cleaned)
         self.assertNotIn('wrong', cleaned)
@@ -327,7 +364,7 @@ class ClusterDefinitionTests(unittest.TestCase):
         self.assertLessEqual(len(config.clean_clusters(many)),
                              config.CLUSTERS_MAX)
         wide = {'c': [f'h{i}' for i in range(200)]}
-        self.assertLessEqual(len(config.clean_clusters(wide)['c']),
+        self.assertLessEqual(len(config.clean_clusters(wide)['c']['gateways']),
                              config.CLUSTER_GATEWAYS_MAX)
 
     def test_junk_is_ignored_rather_than_raising(self):
@@ -348,7 +385,9 @@ class ClusterDefinitionTests(unittest.TestCase):
                                          ['atmux-agent'])
                 state = config._read_client_state()
         self.assertEqual(state['gateways'], ['k6', 'k7'])
-        self.assertEqual(state['clusters'], {'lab': ['ws']})
+        self.assertEqual(state['clusters'], {'lab': {
+            'gateways': ['ws'], 'agent_command': None,
+            'control_path': None}})
 
 
 class LayoutPreferenceTests(unittest.TestCase):

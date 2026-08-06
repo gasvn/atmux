@@ -1881,12 +1881,21 @@ class ClusterPool:
     """
 
     def __init__(self, clusters, settings: dict, **pool_kwargs) -> None:
-        groups = [(str(name), tuple(hosts)) for name, hosts in clusters if hosts]
+        # Entries are (name, hosts) or (name, hosts, overrides). The overrides
+        # exist because machines do not agree on where atmux-agent lives: a
+        # conda env on one cluster says nothing about a venv on another.
+        groups = []
+        for entry in clusters:
+            name, hosts, overrides = (
+                entry if len(entry) == 3 else (*entry, {}))
+            if hosts:
+                groups.append((str(name), tuple(hosts), dict(overrides or {})))
         if not groups:
             raise ValueError("ClusterPool needs at least one cluster")
         self._pools: list[tuple[str, GatewayPool]] = []
-        for index, (name, hosts) in enumerate(groups):
+        for index, (name, hosts, overrides) in enumerate(groups):
             pool_settings = dict(settings)
+            pool_settings.update(overrides)
             pool_settings["gateways"] = list(hosts)
             extra = dict(pool_kwargs)
             if index:

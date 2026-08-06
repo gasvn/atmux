@@ -688,11 +688,16 @@ def discover_ssh_aliases(path: str | None = None) -> list[str]:
 
 
 def clean_clusters(value, exclude=()) -> dict:
-    """Validated ``name -> [login node, ...]`` groups. Never raises.
+    """Validated ``name -> {'gateways': [...], 'agent_command': [...]|None}``.
 
-    A bad entry is dropped on its own: one typo in a second cluster must not
-    cost the user the cluster that works.  Names already used elsewhere (the
-    primary group) are refused rather than silently merged.
+    Never raises. A bad entry is dropped on its own: one typo in a second
+    cluster must not cost the user the cluster that works. Names already used
+    elsewhere (the primary group) are refused rather than silently merged.
+
+    A cluster may be written as a bare array of login nodes, or as a table
+    when it needs its own ``agent_command`` -- machines do not agree on where
+    ``atmux-agent`` lives, and a conda env on one cluster says nothing about
+    a venv on another.
     """
     if not isinstance(value, dict):
         if value is not None:
@@ -700,13 +705,32 @@ def clean_clusters(value, exclude=()) -> dict:
         return {}
     taken = {str(name) for name in exclude}
     clusters = {}
-    for name, hosts in list(value.items())[:CLUSTERS_MAX]:
+    for name, entry in list(value.items())[:CLUSTERS_MAX]:
         if not isinstance(name, str) or CLUSTER_NAME_RE.fullmatch(name) is None:
             log.warning(f'ignoring invalid cluster name: {name!r}')
             continue
         if name in taken:
             log.warning(f'ignoring duplicate cluster name: {name!r}')
             continue
+        command = None
+        control = None
+        if isinstance(entry, dict):
+            hosts = entry.get('gateways')
+            if 'agent_command' in entry:
+                command = _client_agent_command(entry['agent_command'])
+                if command is None:
+                    log.warning(
+                        f'ignoring invalid agent_command in cluster {name!r}')
+            if 'control_path' in entry:
+                # Also per-machine: an MFA helper keeps authenticated masters
+                # for one cluster and knows nothing about a plain key-auth
+                # box, where "" (manage our own) is what you want.
+                control = _client_control_path(entry['control_path'])
+                if control is None:
+                    log.warning(
+                        f'ignoring invalid control_path in cluster {name!r}')
+        else:
+            hosts = entry
         if not isinstance(hosts, (list, tuple)):
             log.warning(f'ignoring cluster {name!r} (expected an array)')
             continue
@@ -722,12 +746,13 @@ def clean_clusters(value, exclude=()) -> dict:
             log.warning(f'ignoring cluster {name!r} (no usable login node)')
             continue
         taken.add(name)
-        clusters[name] = clean
+        clusters[name] = {'gateways': clean, 'agent_command': command,
+                          'control_path': control}
     return clusters
 
 
 def client_clusters(cfg: dict) -> list:
-    """``[(name, (login node, ...)), ...]``, primary first.
+    """``[(name, (login node, ...), overrides), ...]``, primary first.
 
     One entry per independent place. The caller races within an entry and
     merges across entries; collapsing these into one flat list is exactly the
@@ -738,13 +763,18 @@ def client_clusters(cfg: dict) -> list:
     groups = []
     primary = [g for g in (cfg.get('gateways') or []) if valid_gateway(g)]
     if primary:
-        groups.append((PRIMARY_CLUSTER, tuple(primary)))
+        groups.append((PRIMARY_CLUSTER, tuple(primary), {}))
     extra = cfg.get('clusters')
     if isinstance(extra, dict):
-        for name, hosts in extra.items():
-            hosts = tuple(h for h in hosts if valid_gateway(h))
+        for name, entry in clean_clusters(extra, exclude=()).items():
+            hosts = tuple(entry['gateways'])
+            overrides = {}
+            if entry.get('agent_command'):
+                overrides['agent_command'] = list(entry['agent_command'])
+            if entry.get('control_path') is not None:
+                overrides['control_path'] = entry['control_path']
             if hosts:
-                groups.append((name, hosts))
+                groups.append((name, hosts, overrides))
     return groups
 
 

@@ -398,6 +398,38 @@ class DiscoveryFailureSafetyTests(unittest.TestCase):
         self.assertFalse(complete)
         self.assertIn('localhost', nodes)
 
+    def test_a_host_without_slurm_still_reports_its_own_tmux(self):
+        """A workstation or VPS listed as its own cluster has no squeue, and
+        that is the whole point of supporting it."""
+        with patch.object(d.subprocess, 'check_output',
+                          side_effect=FileNotFoundError('squeue')):
+            nodes, complete = d._discover_nodes()
+        self.assertIn('localhost', nodes)
+        self.assertEqual(nodes['localhost']['state'], 'LOCAL')
+        # Incomplete, so nothing ages a node toward destructive cleanup and
+        # no job notices fire on a machine that has no jobs.
+        self.assertFalse(complete)
+
+    def test_a_missing_squeue_is_said_once_not_every_poll(self):
+        """One poll per squeue_interval would write thousands of identical
+        warnings a day and rotate real errors out of a 1 MB log."""
+        saved = d._squeue_absent
+        d._squeue_absent = False
+        try:
+            with self.assertLogs(d.log, level='INFO') as first:
+                with patch.object(d.subprocess, 'check_output',
+                                  side_effect=FileNotFoundError('squeue')):
+                    d._discover_nodes()
+            self.assertTrue(any('no squeue' in line for line in first.output))
+
+            with patch.object(d.subprocess, 'check_output',
+                              side_effect=FileNotFoundError('squeue')):
+                with self.assertNoLogs(d.log, level='INFO'):
+                    for _ in range(5):
+                        d._discover_nodes()
+        finally:
+            d._squeue_absent = saved
+
     def test_pending_empty_node_field_does_not_corrupt_whole_poll(self):
         # %N is empty for a pending job, so the record begins with the unit
         # separator. str.strip() removes \x1f and used to shift every field.

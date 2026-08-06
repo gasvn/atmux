@@ -834,6 +834,16 @@ def _discover_nodes() -> tuple[dict, bool]:
             else:
                 complete = False
                 log.warning(f'invalid hostname from squeue {node_part!r}; skipping')
+    except FileNotFoundError:
+        # No Slurm here at all -- a workstation or VPS listed as its own
+        # cluster. That is a permanent, expected fact, not an incident: at one
+        # poll every squeue_interval it would otherwise write thousands of
+        # identical warnings a day and rotate real errors out of the log.
+        global _squeue_absent
+        if not _squeue_absent:
+            _squeue_absent = True
+            log.info('no squeue on this host; reporting local tmux only')
+        complete = False
     except Exception as e:
         log.warning(f'squeue error: {e}')
         complete = False
@@ -846,6 +856,9 @@ def _get_nodes() -> dict:
 
 
 # ── daemon main loop ──────────────────────────────────────────────────────────
+
+# Said once, not once per poll: a host without Slurm never grows one.
+_squeue_absent = False
 
 _known_nodes_info: dict = {}
 _master_backoff: dict = {}    # node -> {'next_try': epoch, 'fails': N}

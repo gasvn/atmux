@@ -1234,7 +1234,7 @@ class CliDeploymentModeTests(unittest.TestCase):
         # One cluster, both hosts in it: a --gateway override names alternate
         # ways in to the same place, never two different places.
         self.assertEqual(pool.call_args.args[0],
-                         [("main", ("login9", "login10"))])
+                         [("main", ("login9", "login10"), {})])
 
     def test_local_first_run_offers_tui_setup_without_a_config(self):
         settings = dict(config.CLIENT_DEFAULTS)
@@ -1566,3 +1566,59 @@ class ClusterArgumentTests(unittest.TestCase):
     def test_the_same_name_twice_is_refused_not_silently_merged(self):
         _clusters, error = cli.parse_cluster_args(['lab=a', 'lab=b'])
         self.assertIn('twice', error)
+
+
+class ClusterAgentCommandTests(unittest.TestCase):
+    """Where atmux-agent lives is a property of the machine, not of the user.
+
+    FASRC resolves it from a conda env already on the non-interactive PATH; a
+    plain Ubuntu box has neither that env nor ~/.local/bin on that PATH, so
+    one shared agent_command cannot serve both.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.patchers = [
+            mock.patch.object(
+                gateway.paths, "GATEWAY_STATE_CACHE",
+                os.path.join(self.temp.name, "state.json")),
+            mock.patch.object(
+                gateway.paths, "GATEWAY_SNAPSHOT_CACHE",
+                os.path.join(self.temp.name, "snapshots.json")),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self.patchers):
+            patcher.stop()
+        self.temp.cleanup()
+
+    def test_each_cluster_uses_its_own_agent_command(self):
+        pool = gateway.ClusterPool(
+            [("main", ("login1",), {}),
+             ("zgx", ("zgx",), {"agent_command": ["/opt/venv/bin/atmux-agent"]})],
+            client_settings(gateways=("login1",)))
+        by_name = dict(pool._pools)
+        self.assertEqual(by_name["main"].settings["agent_command"],
+                         ["atmux-agent"])
+        self.assertEqual(by_name["zgx"].settings["agent_command"],
+                         ["/opt/venv/bin/atmux-agent"])
+
+    def test_the_override_reaches_the_command_that_is_actually_run(self):
+        pool = gateway.ClusterPool(
+            [("main", ("login1",), {}),
+             ("zgx", ("zgx",), {"agent_command": ["/opt/venv/bin/atmux-agent"]})],
+            client_settings(gateways=("login1",)))
+        by_name = dict(pool._pools)
+        self.assertIn("/opt/venv/bin/atmux-agent",
+                      by_name["zgx"]._agent_command("rpc"))
+        self.assertNotIn("/opt/venv/bin/atmux-agent",
+                         by_name["main"]._agent_command("rpc"))
+
+    def test_a_two_tuple_cluster_still_works(self):
+        """Most clusters need no override and must not have to say so."""
+        pool = gateway.ClusterPool(
+            [("main", ("login1",)), ("lab", ("ws",))],
+            client_settings(gateways=("login1",)))
+        self.assertEqual(pool.clusters, ("main", "lab"))
