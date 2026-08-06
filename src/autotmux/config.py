@@ -55,6 +55,20 @@ NOTES_PATH = os.environ.get(
     'AUTOTMUX_NOTES',
     os.path.expanduser('~/.config/autotmux/notes.json'),
 )
+# Which panes are on screen. Kept out of the main config file on purpose: it
+# is changed by a keypress, many times a session, and a hand-maintained TOML
+# is the wrong thing for a program to rewrite behind the user's back.
+LAYOUT_PATH = os.environ.get(
+    'AUTOTMUX_LAYOUT',
+    os.path.expanduser('~/.config/autotmux/layout.json'),
+)
+# Ordered: `z` walks this list. Each step hides something, so the cycle reads
+# as "give the table more room", and the last one trades the table away for
+# the queue. Ending back at `split` means four presses always restore the
+# view someone started from, without having to remember a second key.
+LAYOUT_MODES = ('split', 'wide', 'table', 'jobs')
+LAYOUT_DEFAULT = 'split'
+_LAYOUT_FILE_LIMIT = 4 * 1024
 # Session lifecycle, shared by the daemon that runs the command and the agent
 # that forwards it. A name tmux will accept as a target without ambiguity: it
 # uses ':' and '.' to address windows and panes, so a session carrying either
@@ -495,12 +509,22 @@ def save_note(session: str, text, path: str | None = None) -> bool:
         return False
     raw = (json.dumps(notes, ensure_ascii=False, sort_keys=True,
                       separators=(',', ':')) + '\n').encode('utf-8')
+    return _write_file_atomic(target, raw, 'notes', 'session note')
+
+
+def _write_file_atomic(target: str, raw: bytes, prefix: str,
+                       what: str) -> bool:
+    """Replace ``target`` with ``raw``, or leave it exactly as it was.
+
+    Never raises: every caller here is storing a convenience, and losing one
+    must not take down the thing the user actually came for.
+    """
     directory = os.path.dirname(target)
     try:
         if directory:
             os.makedirs(directory, mode=0o700, exist_ok=True)
         temporary = os.path.join(
-            directory or '.', f'.notes.tmp.{os.getpid()}.{uuid.uuid4().hex}')
+            directory or '.', f'.{prefix}.tmp.{os.getpid()}.{uuid.uuid4().hex}')
         flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
                  | getattr(os, 'O_CLOEXEC', 0)
                  | getattr(os, 'O_NOFOLLOW', 0))
@@ -518,9 +542,49 @@ def save_note(session: str, text, path: str | None = None) -> bool:
                 pass
             raise
     except OSError as error:
-        log.warning(f'could not save session note: {error}')
+        log.warning(f'could not save {what}: {error}')
         return False
     return True
+
+
+def next_layout(mode) -> str:
+    """The layout that follows ``mode`` in the cycle.
+
+    An unknown mode -- a hand-edited file, or a name from a newer release --
+    resolves to the default rather than to the end of the cycle, so one bad
+    value cannot make the key appear dead on the first press.
+    """
+    try:
+        index = LAYOUT_MODES.index(mode)
+    except ValueError:
+        return LAYOUT_DEFAULT
+    return LAYOUT_MODES[(index + 1) % len(LAYOUT_MODES)]
+
+
+def load_layout(path: str | None = None) -> str:
+    """The remembered layout mode, or the default. Never raises."""
+    target = LAYOUT_PATH if path is None else path
+    try:
+        with open(target, encoding='utf-8') as handle:
+            raw = handle.read(_LAYOUT_FILE_LIMIT + 1)
+        if len(raw) > _LAYOUT_FILE_LIMIT:
+            log.warning('layout file is too large; ignoring it')
+            return LAYOUT_DEFAULT
+        stored = json.loads(raw)
+    except (OSError, ValueError):
+        return LAYOUT_DEFAULT
+    mode = stored.get('mode') if isinstance(stored, dict) else None
+    return mode if mode in LAYOUT_MODES else LAYOUT_DEFAULT
+
+
+def save_layout(mode, path: str | None = None) -> bool:
+    """Remember the layout mode for the next run."""
+    if mode not in LAYOUT_MODES:
+        return False
+    target = LAYOUT_PATH if path is None else path
+    raw = (json.dumps({'mode': mode}, separators=(',', ':'))
+           + '\n').encode('utf-8')
+    return _write_file_atomic(target, raw, 'layout', 'layout preference')
 
 
 def discover_ssh_aliases(path: str | None = None) -> list[str]:

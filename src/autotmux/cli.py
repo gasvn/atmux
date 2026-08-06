@@ -3061,6 +3061,35 @@ class ConnectionManager(ModalScreen[dict | None]):
         self.action_save()
 
 
+# What each layout mode shows. `table` is whether the session table is on
+# screen at all, `preview` the live pane beside it, `jobs` the queue below;
+# `expand_jobs` gives the queue the whole body once nothing else needs it.
+#
+# The point of the cycle is room. A 24-line terminal spends 14 of them on the
+# jobs panel and 44% of its width on the preview, which is the right default
+# and the wrong thing when the answer is in the table.
+_LAYOUT_SPECS = {
+    'split': {'table': True, 'preview': True, 'jobs': True,
+              'expand_jobs': False,
+              'label': 'sessions + preview + jobs'},
+    'wide': {'table': True, 'preview': False, 'jobs': True,
+             'expand_jobs': False,
+             'label': 'full-width sessions + jobs'},
+    'table': {'table': True, 'preview': False, 'jobs': False,
+              'expand_jobs': False,
+              'label': 'sessions only'},
+    'jobs': {'table': False, 'preview': False, 'jobs': True,
+             'expand_jobs': True,
+             'label': 'jobs only'},
+}
+
+
+def layout_spec(mode) -> dict:
+    """The pane visibility for a layout mode, defaulting on anything odd."""
+    spec = _LAYOUT_SPECS.get(mode)
+    return spec if spec is not None else _LAYOUT_SPECS[config.LAYOUT_DEFAULT]
+
+
 class AutotmuxApp(App):
     # Without this the header reads "AutotmuxApp", i.e. the class name.
     TITLE = 'atmux'
@@ -3094,6 +3123,13 @@ class AutotmuxApp(App):
         height: 100%;
         border-right: solid $primary;
     }
+    /* Layout modes (`z`). The divider goes with the pane it divides from:
+       a rule down the right edge of a full-width table is a frame, not a
+       separator, and reads as clipped content. */
+    #left_pane.-full {
+        width: 100%;
+        border-right: none;
+    }
     #right_pane_scroll {
         width: 44%;
         background: $surface;
@@ -3103,13 +3139,24 @@ class AutotmuxApp(App):
         width: 100%;
         height: auto;
     }
-    #jobs_panel {
+    #jobs_scroll {
         height: 35%;
         min-height: 6;
         max-height: 14;
         border-top: solid $primary;
         padding: 0 1;
-        overflow-y: auto;
+    }
+    /* Expanded: the 14-line cap exists so the queue cannot crowd out the
+       table. With the table gone there is nothing to protect, and the cap
+       would leave most of the terminal blank. */
+    #jobs_scroll.-full {
+        height: 1fr;
+        max-height: 100%;
+        border-top: none;
+    }
+    #jobs_panel {
+        width: 100%;
+        height: auto;
     }
     """
 
@@ -3124,7 +3171,11 @@ class AutotmuxApp(App):
         Binding("s", "open_shell", "SSH to node"),
         Binding("o", "new_window", "New window"),
         Binding("k", "toggle_keepalive", "Auto-renew job"),
-        Binding("j", "toggle_jobs_view", "Jobs panel"),
+        # Hidden, not demoted: the jobs panel prints "[j: switch view]" in its
+        # own title, so the key is advertised exactly where it applies. That
+        # buys the footer the room for `z`, which has nowhere else to appear.
+        Binding("j", "toggle_jobs_view", "Jobs panel", show=False),
+        Binding("z", "cycle_layout", "Layout"),
         Binding("g", "manage_connections", "Login nodes"),
         Binding("e", "edit_note", "Note", show=False),
         Binding("n", "new_session", "New session", show=False),
@@ -3164,6 +3215,7 @@ class AutotmuxApp(App):
             ("j", "Bottom panel: running / queued jobs", "all jobs"),
         ]),
         ("View", [
+            ("z", "Cycle layout: split → wide → table → jobs", "remembered"),
             ("e", "Label this session with what it is for", "shows in STATUS"),
             ("g", "Pick which login nodes to route through", "whole session"),
             ("r", "Refresh now (it also refreshes itself)", "whole table"),
@@ -3208,6 +3260,13 @@ class AutotmuxApp(App):
         except Exception:
             self._notify_cfg = dict(config.NOTIFY_DEFAULTS)
         self._warned_jobs = _load_warned_jobs()
+        # Which panes are on screen. Read before the first frame so a
+        # remembered layout is what gets painted, rather than the default
+        # flashing up and being rearranged a moment later.
+        try:
+            self.layout_mode = config.load_layout()
+        except Exception:
+            self.layout_mode = config.LAYOUT_DEFAULT
         _apply_idle_thresholds()
         # A timed-out NFS registry read keeps running on its daemon thread.
         # Single-flight it so manual/timer refreshes cannot strand all eight
@@ -3226,7 +3285,10 @@ class AutotmuxApp(App):
                 yield Static("", id="right_pane", markup=False)
         # squeue output contains user-controlled job names and array syntax;
         # render it literally rather than treating ``[...]`` as Rich markup.
-        yield Static("(loading squeue...)", id="jobs_panel", markup=False)
+        # The scroller is a container so that the expanded layout can hand the
+        # queue the arrow keys; a bare Static scrolls by mouse only.
+        with VerticalScroll(id="jobs_scroll"):
+            yield Static("(loading squeue...)", id="jobs_panel", markup=False)
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -3252,6 +3314,7 @@ class AutotmuxApp(App):
         # of the preview still works without focus.
         self.query_one("#right_pane_scroll").can_focus = False
         self.table.focus()
+        self._apply_layout()
 
         self.all_sessions: list = []
         self.selected_node = ""
@@ -4174,6 +4237,55 @@ class AutotmuxApp(App):
         # stay instant even if the runtime filesystem is temporarily stuck.
         self._refresh_jobs(self._last_state)
 
+    # ── layout modes (z) ─────────────────────────────────────────────────────
+
+    def _preview_visible(self) -> bool:
+        """Whether the live pane is on screen under the current layout."""
+        return bool(layout_spec(getattr(self, 'layout_mode', None))['preview'])
+
+    def _apply_layout(self) -> None:
+        """Show the panes this mode calls for. Idempotent."""
+        spec = layout_spec(self.layout_mode)
+        upper = self.query_one('#upper')
+        table = self.query_one('#left_pane')
+        preview = self.query_one('#right_pane_scroll')
+        jobs = self.query_one('#jobs_scroll')
+        was_previewing = bool(preview.display)
+
+        # #upper is 1fr high: leaving it displayed with both children hidden
+        # would reserve the whole body to draw nothing in.
+        upper.display = spec['table'] or spec['preview']
+        table.display = spec['table']
+        preview.display = spec['preview']
+        table.set_class(not spec['preview'], '-full')
+        jobs.display = spec['jobs']
+        jobs.set_class(spec['expand_jobs'], '-full')
+
+        # Focus follows what is visible, or the arrow keys steer a widget
+        # nobody can see. The queue becomes focusable only while it *is* the
+        # screen; otherwise a stray Tab would scroll it instead of moving the
+        # session cursor -- the same trap #right_pane_scroll was taken out of.
+        jobs.can_focus = bool(spec['expand_jobs'])
+        if spec['table'] and getattr(self, 'table', None) is not None:
+            self.table.focus()
+        elif spec['expand_jobs']:
+            jobs.focus()
+
+        # Coming back from a mode that suppressed live fetches, the pane still
+        # holds whatever it last drew, with nothing to say how old that is.
+        # The cached snapshot is stale too, but it says so.
+        if spec['preview'] and not was_previewing:
+            self._show_cached_snapshot(self.selected_node, self.selected_session)
+
+    async def action_cycle_layout(self) -> None:
+        self.layout_mode = config.next_layout(self.layout_mode)
+        self._apply_layout()
+        # Remembering it is the point: the mode is chosen to fit a terminal,
+        # and that terminal is usually the same one tomorrow.
+        config.save_layout(self.layout_mode)
+        self.notify(f'Layout: {layout_spec(self.layout_mode)["label"]}',
+                    timeout=2, markup=False)
+
     # ── persistent snapshot cache ────────────────────────────────────────────
 
     def _reload_snapshots(self) -> None:
@@ -4355,6 +4467,14 @@ class AutotmuxApp(App):
                 for k in [k for k, t in backoff_until.items() if t <= _now]:
                     backoff_until.pop(k, None)
                     timeout_counts.pop(k, None)
+                # A layout that hides the pane should also stop paying for it:
+                # no capture, no SSH round trip per tick. Clearing active_key
+                # makes the first tick after it reappears fetch immediately
+                # instead of resuming a backed-off cadence.
+                if not self._preview_visible():
+                    active_key = ""
+                    unchanged_streak = 0
+                    continue
                 node = self.selected_node
                 sess = self.selected_session
                 if (not node or not sess

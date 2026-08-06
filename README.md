@@ -464,9 +464,28 @@ legacy `/tmp` pid file so you don't end up with two daemons.
 │ NODE / SESSION list│ live tmux capture-pane │
 │ (incl. localhost)  │ preview of selected    │
 ├────────────────────┴────────────────────────┤
-│ squeue jobs panel  (toggle with `j`)        │
+│ squeue jobs panel  (switch view with `j`)   │
 └─────────────────────────────────────────────┘
 ```
+
+`z` cycles which of those panes are on screen, and remembers the choice for
+next time. The default spends 44% of the width on the preview and up to 14
+lines on the queue, which is the wrong shape on a small terminal or whenever
+the answer is in the table:
+
+```
+  split          wide           table          jobs
+┌─────┬─────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐
+│table│prev.│  │   table   │  │           │  │           │
+├─────┴─────┤  ├───────────┤  │   table   │  │   jobs    │
+│   jobs    │  │   jobs    │  │           │  │           │
+└───────────┘  └───────────┘  └───────────┘  └───────────┘
+```
+
+Four presses always return to where you started, so there is no second key to
+remember. A hidden preview also stops being captured — no SSH round trip per
+tick for a pane nobody can see. In `jobs` the arrow keys scroll the queue,
+since the table is not there to want them.
 
 | Key | Does | Acts on |
 | :-- | :--- | :------ |
@@ -480,6 +499,7 @@ legacy `/tmp` pid file so you don't end up with two daemons.
 | **v** | Read its output including scrollback, without attaching | selected row |
 | **k** | Toggle Slurm auto-renew before the walltime ends | selected row's job |
 | **j** | Switch the bottom panel: running / pending jobs | all jobs |
+| **z** | Cycle the layout: split → wide → table → jobs | whole screen |
 | **g** | Choose which login nodes to route through | whole session |
 | **r** | Refresh now (the table also refreshes on its own) | whole table |
 | **↑ / ↓** | Move the selection | table |
@@ -618,7 +638,9 @@ the note must never be the reason a `DEGRADED` line went unseen.
 Notes are keyed by **session name, not node**: a renewed batch job comes back
 on whatever node Slurm had free, and a note tied to the old node would vanish
 at exactly the moment the run it describes is still going. They live in
-`~/.config/autotmux/notes.json`.
+`~/.config/autotmux/notes.json`. The layout chosen with `z` is remembered
+separately, in `~/.config/autotmux/layout.json` — kept out of `config.toml`
+on purpose, since a keypress should not rewrite a hand-maintained file.
 
 ### Row order
 

@@ -3,6 +3,7 @@
 These don't need a running daemon — they point STATE_FILE at a temp
 file with synthetic content and exercise the UI logic directly.
 """
+import asyncio
 import json
 import os
 import shlex
@@ -97,10 +98,18 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         autotmux.AutotmuxApp._prewarm_interactive_async = no_prewarm
+        # The layout is persisted on every `z`. Without this the suite would
+        # rewrite the developer's own ~/.config/autotmux/layout.json.
+        self._layout_dir = tempfile.TemporaryDirectory()
+        self._saved_layout_path = autotmux.config.LAYOUT_PATH
+        autotmux.config.LAYOUT_PATH = os.path.join(
+            self._layout_dir.name, 'layout.json')
 
     def tearDown(self):
         autotmux._launch_daemon = self._saved_launch
         autotmux.AutotmuxApp._prewarm_interactive_async = self._saved_prewarm
+        autotmux.config.LAYOUT_PATH = self._saved_layout_path
+        self._layout_dir.cleanup()
 
     async def test_app_starts_and_renders_table(self):
         with tempfile.TemporaryDirectory() as td:
@@ -122,7 +131,7 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 upper = app.query_one('#upper').region
                 table = app.query_one('#left_pane').region
-                jobs = app.query_one('#jobs_panel').region
+                jobs = app.query_one('#jobs_scroll').region
                 self.assertEqual(table.height, upper.height)
                 self.assertGreaterEqual(upper.height, 12)
                 self.assertLessEqual(jobs.height, 8)
@@ -1144,6 +1153,242 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
                              '10.0')
             self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 5))),
                              '')
+
+
+class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
+    """`z` trades panes for room.
+
+    The default split spends 44% of the width on the live preview and up to 14
+    lines on the queue. That is the right default and the wrong shape on an
+    80x24 terminal, or whenever the answer is in the table.
+    """
+
+    def setUp(self):
+        self._saved_launch = autotmux._launch_daemon
+        autotmux._launch_daemon = lambda: (True, '')
+        self._saved_prewarm = autotmux.AutotmuxApp._prewarm_interactive_async
+
+        async def no_prewarm(_app, _nodes, _source_pool):
+            return None
+
+        autotmux.AutotmuxApp._prewarm_interactive_async = no_prewarm
+        self._layout_dir = tempfile.TemporaryDirectory()
+        self._saved_layout_path = autotmux.config.LAYOUT_PATH
+        autotmux.config.LAYOUT_PATH = os.path.join(
+            self._layout_dir.name, 'layout.json')
+
+    def tearDown(self):
+        autotmux._launch_daemon = self._saved_launch
+        autotmux.AutotmuxApp._prewarm_interactive_async = self._saved_prewarm
+        autotmux.config.LAYOUT_PATH = self._saved_layout_path
+        self._layout_dir.cleanup()
+
+    async def test_z_walks_the_cycle_and_comes_back(self):
+        """No second key to undo it: pressing z enough times always restores
+        the view you started from."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                seen = [app.layout_mode]
+                for _ in autotmux.config.LAYOUT_MODES:
+                    await pilot.press('z')
+                    await pilot.pause()
+                    seen.append(app.layout_mode)
+                self.assertEqual(seen[:-1], list(autotmux.config.LAYOUT_MODES))
+                self.assertEqual(seen[-1], seen[0])
+
+    async def test_each_mode_shows_exactly_the_panes_it_names(self):
+        expected = {
+            #             table  preview  jobs
+            'split': (True, True, True),
+            'wide': (True, False, True),
+            'table': (True, False, False),
+            'jobs': (False, False, True),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                for mode, (table, preview, jobs) in expected.items():
+                    with self.subTest(mode=mode):
+                        app.layout_mode = mode
+                        app._apply_layout()
+                        await pilot.pause()
+                        self.assertEqual(
+                            bool(app.query_one('#left_pane').display), table)
+                        self.assertEqual(
+                            bool(app.query_one('#right_pane_scroll').display),
+                            preview)
+                        self.assertEqual(
+                            bool(app.query_one('#jobs_scroll').display), jobs)
+                        # An empty #upper still reserves 1fr of the body.
+                        self.assertEqual(
+                            bool(app.query_one('#upper').display),
+                            table or preview)
+
+    async def test_a_table_with_no_preview_uses_the_whole_width(self):
+        """Hiding the preview is pointless if the table keeps its 56%."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                split = app.query_one('#left_pane').region.width
+                await pilot.press('z')          # -> wide
+                await pilot.pause()
+                wide = app.query_one('#left_pane').region.width
+                self.assertGreater(wide, split)
+                self.assertGreaterEqual(wide, 99)
+
+    async def test_expanded_jobs_outgrow_the_fourteen_line_cap(self):
+        """The cap protects the table. With the table gone it only wastes
+        most of the terminal."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(100, 40)) as pilot:
+                await pilot.pause()
+                normal = app.query_one('#jobs_scroll').region.height
+                self.assertLessEqual(normal, 14)
+                app.layout_mode = 'jobs'
+                app._apply_layout()
+                await pilot.pause()
+                self.assertGreater(
+                    app.query_one('#jobs_scroll').region.height, 14)
+
+    async def test_jobs_only_hands_the_arrow_keys_to_the_queue(self):
+        """A long squeue is unreadable if only the mouse can scroll it -- and
+        the table must keep the arrows in every other mode."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                jobs = app.query_one('#jobs_scroll')
+                self.assertFalse(jobs.can_focus)
+                self.assertTrue(app.table.has_focus)
+
+                app.layout_mode = 'jobs'
+                app._apply_layout()
+                await pilot.pause()
+                self.assertTrue(jobs.can_focus)
+                self.assertTrue(jobs.has_focus)
+
+                app.layout_mode = 'split'
+                app._apply_layout()
+                await pilot.pause()
+                self.assertFalse(jobs.can_focus)
+                self.assertTrue(app.table.has_focus)
+
+    async def test_a_hidden_preview_stops_costing_ssh_round_trips(self):
+        """Capturing a pane nobody can see is a per-tick SSH round trip spent
+        on nothing -- over a slow login gateway that is the expensive one."""
+        calls = []
+
+        async def record(node, session):
+            calls.append((node, session))
+            return {'ok': True, 'content': 'hello'}
+
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app._spawn_preview_capture = record
+                # Pin the selection: the attention ordering puts an offline
+                # placeholder first, and placeholders are never captured.
+                app.selected_node = 'gpu1'
+                app.selected_session = 'train'
+                app._selection_changed_at = 0.0
+
+                app.layout_mode = 'table'
+                app._apply_layout()
+                calls.clear()
+                for _ in range(20):
+                    await asyncio.sleep(0.05)
+                    await pilot.pause()
+                self.assertEqual(calls, [], 'hidden preview kept fetching')
+
+                app.layout_mode = 'split'
+                app._apply_layout()
+                for _ in range(60):
+                    await asyncio.sleep(0.05)
+                    await pilot.pause()
+                    if calls:
+                        break
+                self.assertTrue(calls, 'preview never resumed once shown again')
+
+    async def test_the_layout_is_remembered_for_the_next_run(self):
+        """It is chosen to fit a terminal, and that is usually the same
+        terminal tomorrow."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await pilot.press('z')
+                await pilot.pause()
+                self.assertEqual(app.layout_mode, 'wide')
+            self.assertEqual(autotmux.config.load_layout(), 'wide')
+            self.assertEqual(autotmux.AutotmuxApp().layout_mode, 'wide')
+
+    async def test_a_remembered_layout_is_what_gets_painted_first(self):
+        """Reading it after mount would flash the default and rearrange."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            autotmux.config.save_layout('table')
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertFalse(app.query_one('#jobs_scroll').display)
+                self.assertFalse(app.query_one('#right_pane_scroll').display)
+
+    def test_an_unreadable_preference_never_stops_the_app_starting(self):
+        with mock.patch.object(autotmux.config, 'load_layout',
+                               side_effect=OSError('nfs is stuck')):
+            self.assertEqual(autotmux.AutotmuxApp().layout_mode,
+                             autotmux.config.LAYOUT_DEFAULT)
+
+    def test_an_unknown_mode_falls_back_instead_of_hiding_everything(self):
+        """A hand-edited file must not be able to produce a blank screen."""
+        self.assertEqual(autotmux.layout_spec('nonsense'),
+                         autotmux.layout_spec(autotmux.config.LAYOUT_DEFAULT))
+        self.assertEqual(autotmux.layout_spec(None)['table'], True)
+
+    def test_every_mode_leaves_something_on_screen(self):
+        for mode in autotmux.config.LAYOUT_MODES:
+            with self.subTest(mode=mode):
+                spec = autotmux.layout_spec(mode)
+                self.assertTrue(spec['table'] or spec['preview']
+                                or spec['jobs'])
+                self.assertTrue(spec['label'])
+
+    async def test_the_key_that_left_the_footer_is_advertised_where_it_acts(self):
+        """`j` gave up its footer slot to `z`. Hiding it is only safe because
+        the panel it controls prints the key in its own title -- if that stops
+        being true, the key becomes undiscoverable outside `?`."""
+        by_key = {b.key: b for b in autotmux.AutotmuxApp.BINDINGS}
+        self.assertFalse(by_key['j'].show)
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertIn('[j:', str(app.jobs_view.render()))
+                await pilot.press('j')
+                await pilot.pause()
+                self.assertIn('[j:', str(app.jobs_view.render()))
+
+    def test_only_the_jobs_only_mode_expands_the_queue(self):
+        """Expanding it while the table is up would push the table out."""
+        for mode in autotmux.config.LAYOUT_MODES:
+            spec = autotmux.layout_spec(mode)
+            if spec['expand_jobs']:
+                self.assertFalse(spec['table'], mode)
+                self.assertFalse(spec['preview'], mode)
 
 
 class MousePreferenceTests(unittest.TestCase):

@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -267,6 +268,80 @@ class SessionNoteTests(unittest.TestCase):
     def test_a_blank_session_name_is_refused(self):
         with tempfile.TemporaryDirectory() as td:
             self.assertFalse(config.save_note('', 'x', self._path(td)))
+
+
+class LayoutPreferenceTests(unittest.TestCase):
+    """Which panes are on screen, remembered between runs."""
+
+    def _path(self, td):
+        return os.path.join(td, 'layout.json')
+
+    def test_the_cycle_visits_every_mode_once_and_wraps(self):
+        mode = config.LAYOUT_DEFAULT
+        seen = [mode]
+        for _ in config.LAYOUT_MODES:
+            mode = config.next_layout(mode)
+            seen.append(mode)
+        self.assertEqual(seen[:-1], list(config.LAYOUT_MODES))
+        self.assertEqual(seen[-1], config.LAYOUT_DEFAULT)
+
+    def test_an_unknown_mode_resolves_to_the_default_not_the_end(self):
+        """A name from a hand-edited file, or from a newer release, must not
+        make the key look dead on its first press."""
+        for value in ('nonsense', '', None, 42, []):
+            with self.subTest(value=value):
+                self.assertEqual(config.next_layout(value),
+                                 config.LAYOUT_DEFAULT)
+
+    def test_a_mode_round_trips(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            self.assertTrue(config.save_layout('jobs', path))
+            self.assertEqual(config.load_layout(path), 'jobs')
+
+    def test_a_missing_file_is_the_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(config.load_layout(self._path(td)),
+                             config.LAYOUT_DEFAULT)
+
+    def test_a_hand_edited_file_cannot_blank_the_screen(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            for content in ('not json', '[]', '{}', '{"mode": "nope"}',
+                            '{"mode": null}', '{"mode": 3}'):
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write(content)
+                with self.subTest(content=content):
+                    self.assertEqual(config.load_layout(path),
+                                     config.LAYOUT_DEFAULT)
+
+    def test_an_oversized_file_is_ignored_rather_than_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write(' ' * (config._LAYOUT_FILE_LIMIT + 10))
+            self.assertEqual(config.load_layout(path), config.LAYOUT_DEFAULT)
+
+    def test_an_unknown_mode_is_never_written(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            self.assertFalse(config.save_layout('nonsense', path))
+            self.assertFalse(os.path.exists(path))
+
+    def test_an_unwritable_location_reports_failure_without_raising(self):
+        self.assertFalse(config.save_layout('wide', '/proc/nope/layout.json'))
+
+    def test_a_failed_write_leaves_the_previous_choice_intact(self):
+        """The temp file is renamed into place, so a crash mid-write cannot
+        leave a half-written preference behind."""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._path(td)
+            config.save_layout('wide', path)
+            with mock.patch('os.replace', side_effect=OSError('boom')):
+                self.assertFalse(config.save_layout('jobs', path))
+            self.assertEqual(config.load_layout(path), 'wide')
+            leftovers = [n for n in os.listdir(td) if n.startswith('.layout')]
+            self.assertEqual(leftovers, [])
 
 
 if __name__ == '__main__':
