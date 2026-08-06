@@ -1246,6 +1246,27 @@ def _local_attach_argv(session: str) -> list[str]:
     return ['tmux', 'attach-session', '-d', '-t', session]
 
 
+def _handover_banner(node: str, session: str) -> str:
+    """The line printed as the dashboard hands the terminal over.
+
+    A tmux session that finished hours ago paints one static screen and then
+    nothing. With the table gone and no other output, that is exactly what a
+    hung dashboard looks like -- so the one thing worth saying is what you are
+    now looking at and which key brings the table back.
+    """
+    if session == _START_SHELL_SESSION:
+        return (f'\n[atmux] shell on {node} — exit returns to the dashboard.')
+    label = _session_label(session)
+    if node == 'localhost':
+        where = 'this machine'
+    else:
+        where = node
+    # The prefix is whatever the user has bound; naming the default is a hint,
+    # not a promise, so it is qualified rather than stated outright.
+    return (f'\n[atmux] attaching to {label} on {where} — detach '
+            f'(prefix then d, Ctrl-B d by default) returns to the dashboard.')
+
+
 def _open_new_terminal_window(node: str, session: str) -> tuple[bool, str]:
     """Open a separate terminal window already attached to this session.
 
@@ -4490,6 +4511,12 @@ class AutotmuxApp(App):
         step_ok = True
         restore_ok = True
         with self.suspend():
+            # Say what is about to own the terminal, and how to get back.
+            # Handing it over silently makes a finished session
+            # indistinguishable from a hung dashboard: the table vanishes, a
+            # run that ended hours ago paints one static screen, and nothing
+            # on it names what you are looking at or which key returns.
+            print(_handover_banner(node, sess), flush=True)
             if nest:
                 step_ok = _tmux_step_aside()
                 if not step_ok:

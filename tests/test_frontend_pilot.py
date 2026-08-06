@@ -1238,6 +1238,28 @@ class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
         commands, so it only ever offered Textual's built-ins."""
         self.assertFalse(autotmux.AutotmuxApp.ENABLE_COMMAND_PALETTE)
 
+    def test_the_handover_says_what_you_are_looking_at_and_how_to_return(self):
+        """A session that finished hours ago paints one static screen. With
+        the table gone and nothing naming it, that is indistinguishable from a
+        hung dashboard -- which is exactly how it was misread in practice."""
+        banner = autotmux._handover_banner('holygpu8a17504', '4gpu')
+        self.assertIn('4gpu', banner)
+        self.assertIn('holygpu8a17504', banner)
+        self.assertIn('d', banner)
+        self.assertIn('dashboard', banner)
+
+    def test_the_shell_handover_says_exit_rather_than_detach(self):
+        """`s` opens a plain shell: there is nothing to detach from."""
+        banner = autotmux._handover_banner(
+            'gpu1', autotmux._START_SHELL_SESSION)
+        self.assertIn('exit', banner)
+        self.assertNotIn('detach', banner)
+
+    def test_the_banner_never_leaks_a_placeholder_name(self):
+        for session in (autotmux._START_SHELL_SESSION, autotmux._OFFLINE_SESSION):
+            banner = autotmux._handover_banner('gpu1', session)
+            self.assertNotIn('\x00', banner)
+
     def test_rare_keys_are_hidden_but_still_bound(self):
         by_key = {b.key: b for b in autotmux.AutotmuxApp.BINDINGS}
         for key in ('r', 't'):
