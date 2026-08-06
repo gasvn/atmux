@@ -504,8 +504,8 @@ class IdleAnnouncementTests(unittest.TestCase):
         daemon._notify_cfg.update(
             enabled=True, webhook_url='https://x.test/h', idle_notify=300)
         self.patchers = [
-            mock.patch.object(config, 'NOTIFY_CLAIM_PATH',
-                              os.path.join(self.temp.name, 'claims.json')),
+            mock.patch.object(config, 'NOTIFY_CLAIM_DIR',
+                              os.path.join(self.temp.name, 'claims')),
             mock.patch.object(
                 daemon.notify, 'post',
                 side_effect=lambda u, t, to: (self.sent.append(t), (True, ''))[1]),
@@ -575,9 +575,9 @@ class IdleAnnouncementTests(unittest.TestCase):
                 daemon._idle_announced.clear()
                 # A fresh claim file per case: the shared claim is what stops a
                 # second announcement, and it would mask the second case.
-                with mock.patch.object(config, 'NOTIFY_CLAIM_PATH',
+                with mock.patch.object(config, 'NOTIFY_CLAIM_DIR',
                                        os.path.join(self.temp.name,
-                                                    f'claim{index}.json')):
+                                                    f'claims{index}')):
                     with mock.patch.object(daemon, '_capture_pane', **outcome):
                         self._poll(900)
                 self.assertEqual(len(self.sent), 1)

@@ -1307,7 +1307,7 @@ def _notify_expiring_jobs(node_infos: dict) -> None:
         job_id = str(job.get('job_id') or '')
         # Every login node's daemon polls the same squeue and reaches this
         # point together; the shared claim decides which one actually speaks.
-        if not notify.claim_job(config.NOTIFY_CLAIM_PATH, job_id):
+        if not notify.claim_job(config.NOTIFY_CLAIM_DIR, job_id):
             with _notify_lock:
                 _notified_jobs.add(job_id)
             log.info(f'job {job_id} reminder already sent by another daemon')
@@ -1321,7 +1321,7 @@ def _notify_expiring_jobs(node_infos: dict) -> None:
             log.info(f'sent expiry reminder for job {job_id}')
             return
         # Hand the claim back too, or no daemon retries until it expires.
-        notify.release_claim(config.NOTIFY_CLAIM_PATH, job_id)
+        notify.release_claim(config.NOTIFY_CLAIM_DIR, job_id)
         log.warning(f'job {job_id} reminder not delivered: {error}')
 
     for job in due:
@@ -1370,7 +1370,7 @@ def _notify_started_jobs(node_infos: dict) -> None:
     def deliver(job: dict) -> None:
         job_id = str(job.get('job_id') or '')
         key = f'start:{job_id}'
-        if not notify.claim_job(config.NOTIFY_CLAIM_PATH, key):
+        if not notify.claim_job(config.NOTIFY_CLAIM_DIR, key):
             return
         ok, error = notify.post(
             _notify_cfg['webhook_url'], notify.build_start_message(job),
@@ -1378,7 +1378,7 @@ def _notify_started_jobs(node_infos: dict) -> None:
         if ok:
             log.info(f'sent start notice for job {job_id}')
             return
-        notify.release_claim(config.NOTIFY_CLAIM_PATH, key)
+        notify.release_claim(config.NOTIFY_CLAIM_DIR, key)
         with _notify_lock:
             _started_jobs.discard(job_id)
         log.warning(f'job {job_id} start notice not delivered: {error}')
@@ -1444,7 +1444,7 @@ def _notify_idle_sessions(node: str, info: dict) -> None:
     def deliver(entry: dict) -> None:
         # Every login node's daemon watches the same sessions.
         key = f"idle:{entry['node']}:{entry['session']}"
-        if not notify.claim_job(config.NOTIFY_CLAIM_PATH, key,
+        if not notify.claim_job(config.NOTIFY_CLAIM_DIR, key,
                                 ttl=float(_notify_cfg['idle_cooldown'])):
             return
         text = notify.build_idle_message(
@@ -1458,7 +1458,7 @@ def _notify_idle_sessions(node: str, info: dict) -> None:
             return
         # Undo both fences so the next poll can retry rather than losing the
         # notice for a whole cooldown.
-        notify.release_claim(config.NOTIFY_CLAIM_PATH, key)
+        notify.release_claim(config.NOTIFY_CLAIM_DIR, key)
         with _notify_lock:
             _idle_announced.get(entry['node'], set()).discard(entry['session'])
         log.warning(f'idle notice not delivered: {error}')

@@ -12,8 +12,7 @@ must never delay or break the poll loop that drives the dashboard.
 
 from __future__ import annotations
 
-import errno
-import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -193,74 +192,131 @@ def jobs_from_state(state: dict) -> list[dict]:
 
 
 CLAIM_TTL = 7 * 24 * 3600
-_CLAIM_LIMIT = 4096
+_CLAIM_SWEEP_LIMIT = 4096
+_CLAIM_LABEL_RE = re.compile(r'[^A-Za-z0-9_.-]+')
 
 
-def claim_job(path: str, job_id: str, *, ttl: float = CLAIM_TTL,
+def _claim_name(key: str) -> str:
+    """A filename for an arbitrary claim key.
+
+    Keys carry node and session names, which the user chooses and which may
+    hold ``/`` or ``..``, so the readable part is only a label: identity comes
+    from a digest of the original key, and two distinct keys can never land on
+    one file.
+    """
+    digest = hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]
+    label = _CLAIM_LABEL_RE.sub('-', key).strip('-')[:48]
+    return f'{label}.{digest}' if label else digest
+
+
+def _claim_age(path: str, wall: float) -> float | None:
+    """Seconds since a claim was taken, or None if that cannot be read."""
+    try:
+        with open(path, encoding='utf-8') as handle:
+            stamp = float(handle.read(64).strip())
+    except (OSError, ValueError):
+        # Empty because a write was cut short, or written by an older
+        # release. The NFS server's mtime is one clock for every login node,
+        # which beats treating the claim as ageless and never expiring it.
+        try:
+            stamp = os.stat(path).st_mtime
+        except OSError:
+            return None
+    return wall - stamp
+
+
+def _take_claim(path: str, wall: float) -> bool:
+    """Create the claim, or report that another daemon got there first."""
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, f'{wall:.3f}\n'.encode('ascii'))
+    except OSError:
+        # The claim is ours either way -- the file exists, and its mtime
+        # still dates it well enough to expire.
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return True
+
+
+def _sweep_claims(directory: str, wall: float) -> None:
+    """Drop claims past the longest TTL any caller uses.
+
+    Always ``CLAIM_TTL``, never the caller's: the record used to be one JSON
+    file pruned with whichever TTL happened to be passed, so an idle notice
+    (1 h) silently evicted the job-expiry claims that were meant to last a
+    week. Per-key files make each TTL its own business; this only stops a
+    long-lived home accumulating every session name the user has ever used.
+    """
+    try:
+        names = os.listdir(directory)[:_CLAIM_SWEEP_LIMIT]
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(directory, name)
+        age = _claim_age(path, wall)
+        if age is not None and age >= CLAIM_TTL:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def claim_job(directory: str, job_id: str, *, ttl: float = CLAIM_TTL,
               now: float | None = None) -> bool:
     """Whether *this* daemon is the one that should announce ``job_id``.
 
     Runtime state is node-local, but a cluster runs one daemon per login node
     against the same ``squeue`` -- so every one of them reaches the same
     conclusion at the same moment and, without a shared record, the user gets
-    one message per login node. The record lives on shared home beside the
-    other config, guarded by the same advisory lock the keep-alive registry
-    uses.
+    one message per login node.
 
-    Fails open: if the record cannot be read or written, the reminder is still
-    sent. A duplicate message is a far smaller harm than a silent one.
+    One file per claim, taken with ``O_CREAT|O_EXCL``. The previous design
+    held an ``flock`` around a single shared JSON record, and on FASRC's
+    NFSv3 home that lock returned ENOLCK whenever four daemons contended for
+    it -- every one of them then took the fail-open path below and posted, so
+    a single quiet session produced four identical Slack messages within the
+    same second. ``O_EXCL`` creation does not go through the NFS lock manager
+    at all; raced from four login nodes at once it yielded exactly one winner,
+    eight rounds out of eight.
+
+    Still fails open on an unusable directory: a duplicate message is a far
+    smaller harm than a silent one. That is only sound because the failure is
+    now genuinely rare rather than the normal path.
     """
     job_id = str(job_id)
     wall = time.time() if now is None else float(now)
-    directory = os.path.dirname(path)
     try:
-        if directory:
-            os.makedirs(directory, mode=0o700, exist_ok=True)
-        lock_fd = os.open(f'{path}.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
     except OSError as error:
         log.warning(f'reminder claim unavailable ({error}); sending anyway')
         return True
+    path = os.path.join(directory, _claim_name(job_id))
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            with open(path, encoding='utf-8') as handle:
-                record = json.load(handle)
-        except (OSError, ValueError):
-            record = {}
-        if not isinstance(record, dict):
-            record = {}
-        # Drop expired entries so a long-lived home does not accumulate every
-        # JobID the user has ever run.
-        fresh = {
-            key: value for key, value in list(record.items())[:_CLAIM_LIMIT]
-            if isinstance(value, (int, float)) and not isinstance(value, bool)
-            and wall - float(value) < ttl
-        }
-        if job_id in fresh:
+        if _take_claim(path, wall):
+            _sweep_claims(directory, wall)
+            return True
+        age = _claim_age(path, wall)
+        if age is None or age < ttl:
             return False
-        fresh[job_id] = wall
-        tmp = f'{path}.{os.getpid()}.tmp'
+        # Aged out. Two daemons may both unlink here, but only one O_EXCL
+        # create can succeed afterwards, so the notice still goes out once.
         try:
-            with open(tmp, 'w', encoding='utf-8') as handle:
-                json.dump(fresh, handle)
-            os.replace(tmp, path)
-        except OSError as error:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            log.warning(f'could not record reminder claim ({error}); '
-                        'sending anyway')
-        return True
-    except OSError as error:
-        if error.errno not in (errno.EACCES, errno.EAGAIN):
-            log.warning(f'reminder claim failed ({error}); sending anyway')
-        return True
-    finally:
-        try:
-            os.close(lock_fd)
-        except OSError:
+            os.unlink(path)
+        except FileNotFoundError:
             pass
+        return _take_claim(path, wall)
+    except OSError as error:
+        log.warning(f'reminder claim failed ({error}); sending anyway')
+        return True
 
 
 def idle_sessions(node: str, info: dict, threshold: float) -> list[dict]:
@@ -443,7 +499,7 @@ def build_idle_message(entry: dict, *, link: bool = False) -> str:
     return text[:_MAX_TEXT]
 
 
-def release_claim(path: str, key: str) -> None:
+def release_claim(directory: str, key: str) -> None:
     """Give a claim back after a failed send.
 
     The claim has to be taken before posting, or two daemons both post while
@@ -451,38 +507,10 @@ def release_claim(path: str, key: str) -> None:
     silence the notice until the TTL expires -- so hand it back and let the
     next poll, on this host or another, try again.
     """
-    key = str(key)
     try:
-        lock_fd = os.open(f'{path}.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        os.unlink(os.path.join(directory, _claim_name(str(key))))
     except OSError:
-        return
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            with open(path, encoding='utf-8') as handle:
-                record = json.load(handle)
-        except (OSError, ValueError):
-            return
-        if not isinstance(record, dict) or key not in record:
-            return
-        record.pop(key, None)
-        tmp = f'{path}.{os.getpid()}.tmp'
-        try:
-            with open(tmp, 'w', encoding='utf-8') as handle:
-                json.dump(record, handle)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-    except OSError:
-        return
-    finally:
-        try:
-            os.close(lock_fd)
-        except OSError:
-            pass
+        pass
 
 
 def post(url: str, text: str, timeout: float) -> tuple[bool, str]:

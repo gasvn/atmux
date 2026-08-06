@@ -28,12 +28,16 @@ KEEPALIVE_PATH = os.environ.get(
     os.path.expanduser('~/.config/autotmux/keepalive.json'),
 )
 
-# Which job expiry reminders have already been announced. Shared home, not the
-# node-local runtime dir: one daemon runs per login node and they all reach the
-# same conclusion at once, so the record has to be visible to all of them.
-NOTIFY_CLAIM_PATH = os.environ.get(
+# Which notices have already gone out. Shared home, not the node-local runtime
+# dir: one daemon runs per login node and they all reach the same conclusion at
+# once, so the record has to be visible to all of them.
+#
+# A directory of one file per claim, not a single JSON record. The record it
+# replaces was guarded by an flock, and flock over NFSv3 home returns ENOLCK
+# under contention -- so on a real cluster it never deduplicated anything.
+NOTIFY_CLAIM_DIR = os.environ.get(
     'AUTOTMUX_NOTIFY_CLAIM',
-    os.path.expanduser('~/.config/autotmux/notified-jobs.json'),
+    os.path.expanduser('~/.config/autotmux/claims'),
 )
 
 # Gateway choices made in the TUI live separately from the hand-written

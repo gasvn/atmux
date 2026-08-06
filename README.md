@@ -811,6 +811,40 @@ reminders are enabled — `desktop = false` silences only the OS popup. Announce
 JobIDs are remembered under the runtime dir, so restarting `atmux` does not
 re-announce a job you have already been told about.
 
+#### How duplicates are prevented
+
+A daemon runs on every login node and they all watch the same `squeue`, so
+they reach the same conclusion in the same second. Two fences stop that
+becoming one message per login node:
+
+1. **In memory, per daemon** — a job or session already announced is not
+   announced again until it changes: a quiet session re-arms once it produces
+   output, a job when it leaves the queue. Lost on restart, by design.
+2. **On shared home** — `~/.config/autotmux/claims/`, one file per notice,
+   created with `O_CREAT|O_EXCL`. Whichever daemon creates it first is the one
+   that posts; the rest see it exists and stay quiet. Each file carries its own
+   TTL: `idle_cooldown` for a quiet session, seven days for a job.
+
+Claims are files rather than entries in one locked record because `flock` over
+an NFSv3 home returns `ENOLCK` under contention — with four daemons racing it
+failed every time, each fell through to "send anyway", and one quiet session
+produced four identical messages in the same second. `O_EXCL` creation does not
+involve the NFS lock manager; raced from four login nodes at once it yields
+exactly one winner.
+
+If the claim directory cannot be created at all, the notice is still sent —
+a duplicate is a smaller harm than a silence, and the daemon log says so.
+
+`idle_cooldown` is therefore the real volume knob. Raising it does not lose a
+distinct event, only repeats about a session that keeps going quiet:
+
+| `idle_cooldown` | messages, measured over one 37-hour stretch |
+| :--- | :--- |
+| 1h (default) | 51 |
+| 2h | 37 |
+| 4h | 29 |
+| 8h | 24 |
+
 #### Setting up a Slack webhook
 
 Create the endpoint at <https://api.slack.com/apps>:

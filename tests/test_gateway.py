@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest import mock
 
@@ -691,7 +692,7 @@ class JobReminderClaimTests(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.path = os.path.join(self.temp.name, 'notified.json')
+        self.path = os.path.join(self.temp.name, 'claims')
 
     def tearDown(self):
         self.temp.cleanup()
@@ -710,21 +711,25 @@ class JobReminderClaimTests(unittest.TestCase):
         self.assertTrue(notify.claim_job(self.path, '42', ttl=0))
 
     def test_the_record_is_created_with_its_directory(self):
-        nested = os.path.join(self.temp.name, 'cfg', 'notified.json')
+        nested = os.path.join(self.temp.name, 'cfg', 'claims')
         self.assertTrue(notify.claim_job(nested, '42'))
-        self.assertTrue(os.path.exists(nested))
+        self.assertTrue(os.path.isdir(nested))
 
     def test_an_unusable_record_fails_open(self):
         """A duplicate reminder is a far smaller harm than a silent one."""
-        self.assertTrue(
-            notify.claim_job('/nonexistent-dir/notified.json', '42'))
+        self.assertTrue(notify.claim_job('/nonexistent-dir/claims', '42'))
 
-    def test_a_corrupt_record_does_not_suppress_the_reminder(self):
-        for junk in ('not json', '[]', 'null', ''):
-            with open(self.path, 'w') as handle:
+    def test_a_corrupt_claim_still_expires(self):
+        """A write cut short by a crash leaves an empty file. Falling back to
+        the server's mtime keeps it from becoming a claim that never ages."""
+        self.assertTrue(notify.claim_job(self.path, '42'))
+        target = os.path.join(self.path, notify._claim_name('42'))
+        for junk in ('', 'not a number', '\x00'):
+            with open(target, 'w') as handle:
                 handle.write(junk)
             with self.subTest(junk=junk):
-                self.assertTrue(notify.claim_job(self.path, '42'))
+                self.assertFalse(notify.claim_job(self.path, '42'))
+                self.assertTrue(notify.claim_job(self.path, '42', ttl=0))
 
     def test_a_released_claim_can_be_taken_again(self):
         """The claim is taken before sending, so a failed send has to hand it
@@ -742,13 +747,91 @@ class JobReminderClaimTests(unittest.TestCase):
 
     def test_releasing_something_unclaimed_is_harmless(self):
         notify.release_claim(self.path, 'never-claimed')
-        notify.release_claim('/nonexistent-dir/x.json', '42')
+        notify.release_claim('/nonexistent-dir/claims', '42')
+
+    def test_a_short_ttl_never_expires_another_kind_of_claim(self):
+        """The single shared record was pruned with whichever TTL the caller
+        happened to pass, so an idle notice (1 h) quietly evicted the job
+        expiry claims that were supposed to last a week -- and the reminder
+        went out twice."""
+        now = 1_000_000.0
+        self.assertTrue(notify.claim_job(self.path, '42', now=now))
+        # An idle notice an hour later, with its own much shorter TTL.
+        self.assertTrue(notify.claim_job(self.path, 'idle:n:s', ttl=3600,
+                                         now=now + 7200))
+        self.assertFalse(notify.claim_job(self.path, '42', now=now + 7200))
+
+    def test_a_key_cannot_escape_the_claim_directory(self):
+        """Session names reach this from tmux and are not path components."""
+        for key in ('idle:../../etc/passwd:s', 'a/b/c', '..', '/abs'):
+            with self.subTest(key=key):
+                self.assertTrue(notify.claim_job(self.path, key))
+                name = notify._claim_name(key)
+                self.assertNotIn('/', name)
+                self.assertEqual(
+                    os.path.dirname(os.path.join(self.path, name)), self.path)
+
+    def test_similar_keys_do_not_collide_onto_one_file(self):
+        """The readable label is lossy, so identity has to come from the
+        digest -- or two sessions would share one claim and one would go
+        unannounced."""
+        first, second = 'idle:node:a/b', 'idle:node:a-b'
+        self.assertNotEqual(notify._claim_name(first),
+                            notify._claim_name(second))
+        self.assertTrue(notify.claim_job(self.path, first))
+        self.assertTrue(notify.claim_job(self.path, second))
+
+    def test_daemons_racing_from_separate_processes_yield_one_winner(self):
+        """The property the previous implementation failed in production.
+
+        It held an flock around one shared JSON record; on NFSv3 home that
+        lock returned ENOLCK the moment four login nodes contended for it, so
+        every daemon took the fail-open path and one quiet session produced
+        four identical Slack messages in the same second. A same-process test
+        could never have caught it -- the contention has to be real.
+        """
+        workers = 6
+        start = time.time() + 0.5
+        children = []
+        # Created up front so the children only ever make bare syscalls and
+        # os._exit -- they never take an interpreter lock (logging's included)
+        # that a thread in this process could have been holding at fork time.
+        os.makedirs(self.path, mode=0o700, exist_ok=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', DeprecationWarning)
+            for _ in range(workers):
+                read_fd, write_fd = os.pipe()
+                pid = os.fork()
+                if pid == 0:                  # child
+                    try:
+                        os.close(read_fd)
+                        while time.time() < start:
+                            time.sleep(0.002)
+                        won = notify.claim_job(self.path, 'contended')
+                        os.write(write_fd, b'1' if won else b'0')
+                    finally:
+                        os._exit(0)
+                os.close(write_fd)
+                children.append((pid, read_fd))
+
+        winners = 0
+        for pid, read_fd in children:
+            try:
+                winners += os.read(read_fd, 1) == b'1'
+            finally:
+                os.close(read_fd)
+                os.waitpid(pid, 0)
+        self.assertEqual(winners, 1, f'{winners} of {workers} daemons posted')
 
     def test_the_record_stays_bounded(self):
+        now = 1_000_000.0
         for i in range(200):
-            notify.claim_job(self.path, str(i))
-        with open(self.path) as handle:
-            self.assertLessEqual(len(json.load(handle)), notify._CLAIM_LIMIT)
+            notify.claim_job(self.path, str(i), now=now)
+        self.assertEqual(len(os.listdir(self.path)), 200)
+        # Long past every TTL: the next claim sweeps the stale ones away.
+        notify.claim_job(self.path, 'later', now=now + notify.CLAIM_TTL + 1)
+        self.assertEqual(os.listdir(self.path),
+                         [notify._claim_name('later')])
 
 
 class LocalSessionIdleTests(unittest.TestCase):
