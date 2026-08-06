@@ -546,8 +546,27 @@ keeps it, so adding a cluster never renames rows you already know. A cluster
 with no reachable entry point gets one visible row carrying the error rather
 than quietly disappearing, and the subtitle says `⚠ cluster unreachable: lab`.
 
-The `g` dialog edits the primary cluster only; the others are configured in
-the files above and are preserved when the dialog writes.
+#### Editing clusters from the dashboard
+
+`g` manages all of them. The **Cluster** row at the top picks which one you are
+editing; the alias list, the extra-aliases field and the agent command below it
+all follow that choice, and switching away keeps your edits.
+
+```
+ Cluster  main            ▼   new cluster name        Add     Remove
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ ▐X▌ k6      ▐X▌ k7     ▐X▌ k8     ▐X▌ b8    ▐ ▌ zgx             │
+ └──────────────────────────────────────────────────────────────────┘
+```
+
+Type a name and press **Add** for a new cluster, then select its login nodes.
+**Remove** deletes the one you are on — it is disabled for the primary cluster,
+which is `gateways` and has no file shape that can express its absence.
+Emptying a cluster's alias list also deletes it. **Test** probes the cluster you
+are editing, using that cluster's own `agent_command` and `control_path`.
+
+Settings the dialog does not show — `control_path`, and any `agent_command`
+belonging to a cluster you did not open — are carried through a save untouched.
 
 ### Layout
 
@@ -583,7 +602,7 @@ since the table is not there to want them.
 | **k** | Toggle Slurm auto-renew before the walltime ends | selected row's job |
 | **j** | Switch the bottom panel: running / pending jobs | all jobs |
 | **z** | Cycle the layout: split → wide → table → jobs | whole screen |
-| **g** | Choose which login nodes to route through | whole session |
+| **g** | Manage clusters and their login nodes | whole session |
 | **r** | Refresh now (the table also refreshes on its own) | whole table |
 | **↑ / ↓** | Move the selection | table |
 | **?** | Show this list in the app | — |

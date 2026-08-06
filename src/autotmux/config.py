@@ -716,12 +716,18 @@ def clean_clusters(value, exclude=()) -> dict:
         control = None
         if isinstance(entry, dict):
             hosts = entry.get('gateways')
-            if 'agent_command' in entry:
+            # As with control_path below: absent or None is "not set", and
+            # the TUI writes the field for every cluster whether or not it
+            # carries a value.
+            if entry.get('agent_command') is not None:
                 command = _client_agent_command(entry['agent_command'])
                 if command is None:
                     log.warning(
                         f'ignoring invalid agent_command in cluster {name!r}')
-            if 'control_path' in entry:
+            # None is "not set", which is not the same as invalid -- the TUI
+            # writes the field for every cluster, most of them unset, and
+            # warning on each one buried the real messages.
+            if entry.get('control_path') is not None:
                 # Also per-machine: an MFA helper keeps authenticated masters
                 # for one cluster and knows nothing about a plain key-auth
                 # box, where "" (manage our own) is what you want.
@@ -785,11 +791,13 @@ def _apply_client_state(cfg: dict) -> dict:
         cfg['gateways'] = list(state['gateways'])
         cfg['agent_command'] = list(state['agent_command'])
         # Absent from the file means "the TUI never wrote any", not "none":
-        # the connection dialog only edits the primary group, so clusters
-        # configured in config.toml have to survive it.
+        # a config.toml cluster has to survive a dialog save that did not
+        # mention it. Copied entry-for-entry -- an entry is a record now, and
+        # list()-ing one turned its gateways into its own field names.
         if state.get('clusters'):
-            cfg['clusters'] = {name: list(hosts)
-                               for name, hosts in state['clusters'].items()}
+            cfg['clusters'] = {
+                name: dict(entry) if isinstance(entry, dict) else list(entry)
+                for name, entry in state['clusters'].items()}
     cfg['clusters'] = clean_clusters(cfg.get('clusters'),
                                      exclude=(PRIMARY_CLUSTER,))
     return cfg

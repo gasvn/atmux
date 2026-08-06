@@ -39,7 +39,8 @@ from textual.coordinate import Coordinate
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input, Label, SelectionList, Static,
+    Button, DataTable, Footer, Header, Input, Label, Select, SelectionList,
+    Static,
 )
 import rich.text
 
@@ -2912,6 +2913,10 @@ class ConnectionManager(ModalScreen[dict | None]):
         color: $accent;
     }
     #connection_help {
+        /* Label defaults to width:auto, which lays the text out on one line
+           and lets the container clip the rest -- so the explanation was
+           silently cut at whatever fitted. Only a full-width box wraps. */
+        width: 100%;
         height: auto;
     }
     #connection_status {
@@ -2923,6 +2928,23 @@ class ConnectionManager(ModalScreen[dict | None]):
         height: 1fr;
         min-height: 4;
         border: solid $primary-darken-2;
+    }
+    #connection_cluster_row {
+        height: 1;
+        margin-bottom: 1;
+    }
+    #connection_cluster_label {
+        width: 8;
+    }
+    #connection_cluster {
+        width: 20;
+    }
+    #connection_new_cluster {
+        width: 1fr;
+    }
+    #connection_cluster_row Button {
+        width: 10;
+        min-width: 1;
     }
     #connection_buttons {
         height: 1;
@@ -2942,23 +2964,60 @@ class ConnectionManager(ModalScreen[dict | None]):
     def __init__(self, settings: dict, aliases: list[str]) -> None:
         super().__init__()
         self._settings = dict(settings)
-        current = list(settings.get('gateways') or ())
-        self._aliases = list(dict.fromkeys([*current, *aliases]))
+        # One editable record per cluster, primary included. The dialog edits
+        # them one at a time; everything it did not touch -- control_path, in
+        # particular -- has to survive the round trip or saving would quietly
+        # delete it.
+        self._clusters: dict[str, dict] = {
+            config.PRIMARY_CLUSTER: {
+                'gateways': list(settings.get('gateways') or ()),
+                'agent_command': list(
+                    settings.get('agent_command') or ['atmux-agent']),
+                'control_path': None,
+            }
+        }
+        for name, entry in (settings.get('clusters') or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            self._clusters[str(name)] = {
+                'gateways': list(entry.get('gateways') or ()),
+                'agent_command': list(entry.get('agent_command') or ()) or None,
+                'control_path': entry.get('control_path'),
+            }
+        self._current = config.PRIMARY_CLUSTER
+        known = [host for entry in self._clusters.values()
+                 for host in entry['gateways']]
+        self._aliases = list(dict.fromkeys([*known, *aliases]))
+
+    def _cluster_options(self) -> list[tuple[str, str]]:
+        return [(name, name) for name in self._clusters]
 
     def compose(self) -> ComposeResult:
-        selected = set(self._settings.get('gateways') or ())
+        entry = self._clusters[self._current]
+        selected = set(entry['gateways'])
         choices = [
             (alias, alias, alias in selected) for alias in self._aliases
         ]
-        command = shlex.join(
-            list(self._settings.get('agent_command') or ['atmux-agent']))
+        command = shlex.join(entry['agent_command'] or ['atmux-agent'])
         with Vertical(id="connection_dialog"):
             yield Label("Connections", id="connection_title", markup=False)
             yield Label(
-                "AutoTmux found these literal Host aliases in ~/.ssh/config. "
-                "Use Space to select one or more login nodes; the fastest "
-                "healthy route is chosen automatically.",
+                # Short on purpose: at 60x20 this dialog is the whole screen
+                # and every line here is one the Save button does not get.
+                "A cluster is several ways in to ONE place — AutoTmux races "
+                "them. A machine somewhere else needs its own cluster. Space "
+                "selects; clusters merge into one table.",
                 id="connection_help", markup=False)
+            with Horizontal(id="connection_cluster_row"):
+                yield Label("Cluster ", id="connection_cluster_label",
+                            markup=False)
+                yield Select(self._cluster_options(), value=self._current,
+                             allow_blank=False, id="connection_cluster",
+                             compact=True)
+                yield Input(placeholder="new cluster name",
+                            id="connection_new_cluster", compact=True)
+                yield Button("Add", id="connection_add", compact=True)
+                yield Button("Remove", id="connection_remove", compact=True)
             yield SelectionList(*choices, id="connection_aliases", compact=True)
             yield Input(
                 placeholder="Additional SSH aliases (space or comma separated)",
@@ -2977,10 +3036,91 @@ class ConnectionManager(ModalScreen[dict | None]):
                     compact=True)
 
     def on_mount(self) -> None:
+        self._sync_remove_button()
         if self._aliases:
             self.query_one("#connection_aliases", SelectionList).focus()
         else:
             self.query_one("#connection_extra", Input).focus()
+
+    # ── cluster switching ────────────────────────────────────────────────
+    def _sync_remove_button(self) -> None:
+        # The primary cluster is `gateways`; there is no file shape that can
+        # express its absence, so it is the one that cannot be removed.
+        self.query_one("#connection_remove", Button).disabled = (
+            self._current == config.PRIMARY_CLUSTER)
+
+    def _capture_current(self) -> None:
+        """Fold the widgets back into the cluster being edited."""
+        entry = self._clusters.get(self._current)
+        if entry is None:
+            return
+        try:
+            gateways, command = self._selection()
+        except ValueError:
+            # Keep whatever is valid; switching away must not lose the rest
+            # because of a half-typed alias.
+            gateways = list(
+                self.query_one("#connection_aliases", SelectionList).selected)
+            command = entry['agent_command']
+        entry['gateways'] = gateways
+        entry['agent_command'] = command
+
+    def _load_cluster(self, name: str) -> None:
+        entry = self._clusters[name]
+        self._current = name
+        aliases = self.query_one("#connection_aliases", SelectionList)
+        selected = set(entry['gateways'])
+        for alias in self._aliases:
+            if alias in selected:
+                aliases.select(alias)
+            else:
+                aliases.deselect(alias)
+        self.query_one("#connection_extra", Input).value = ' '.join(
+            host for host in entry['gateways'] if host not in self._aliases)
+        self.query_one("#connection_agent", Input).value = shlex.join(
+            entry['agent_command'] or ['atmux-agent'])
+        self._sync_remove_button()
+
+    def on_select_changed(self, event) -> None:
+        event.stop()
+        name = event.value
+        if not isinstance(name, str) or name == self._current:
+            return
+        if name not in self._clusters:
+            return
+        self._capture_current()
+        self._load_cluster(name)
+
+    def action_add_cluster(self) -> None:
+        field = self.query_one("#connection_new_cluster", Input)
+        name = field.value.strip()
+        if config.CLUSTER_NAME_RE.fullmatch(name) is None:
+            self._show_error(
+                'cluster name: letters, digits, - and _ (max 32)')
+            return
+        if name in self._clusters:
+            self._show_error(f'cluster {name!r} already exists')
+            return
+        self._capture_current()
+        self._clusters[name] = {
+            'gateways': [], 'agent_command': None, 'control_path': None}
+        field.value = ''
+        select = self.query_one("#connection_cluster", Select)
+        select.set_options(self._cluster_options())
+        select.value = name
+        self._load_cluster(name)
+        self._show_error(f'select this cluster\'s login node(s) for {name}')
+
+    def action_remove_cluster(self) -> None:
+        if self._current == config.PRIMARY_CLUSTER:
+            return
+        removed = self._current
+        self._clusters.pop(removed, None)
+        select = self.query_one("#connection_cluster", Select)
+        select.set_options(self._cluster_options())
+        select.value = config.PRIMARY_CLUSTER
+        self._load_cluster(config.PRIMARY_CLUSTER)
+        self._show_error(f'removed cluster {removed}')
 
     def _selection(self) -> tuple[list[str], list[str]]:
         gateways = list(
@@ -3011,15 +3151,34 @@ class ConnectionManager(ModalScreen[dict | None]):
 
     def action_save(self) -> None:
         try:
-            gateways, command = self._selection()
+            self._capture_current()
+            primary = self._clusters[config.PRIMARY_CLUSTER]
+            gateways, command = self._selection() if (
+                self._current == config.PRIMARY_CLUSTER) else (
+                primary['gateways'], primary['agent_command'])
+            if self._current == config.PRIMARY_CLUSTER:
+                primary['gateways'], primary['agent_command'] = gateways, command
+            gateways = list(primary['gateways'])
+            command = primary['agent_command'] or ['atmux-agent']
             if not gateways:
-                raise ValueError('select or enter at least one SSH alias')
+                raise ValueError(
+                    f'cluster {config.PRIMARY_CLUSTER} needs at least one '
+                    'SSH alias')
         except ValueError as error:
             self._show_error(error)
             return
+        # An emptied cluster is how you delete one; only the primary is
+        # required to have members.
+        extra = {
+            name: {'gateways': entry['gateways'],
+                   'agent_command': entry['agent_command'],
+                   'control_path': entry['control_path']}
+            for name, entry in self._clusters.items()
+            if name != config.PRIMARY_CLUSTER and entry['gateways']
+        }
         self.dismiss({
             'mode': 'gateway', 'gateways': gateways,
-            'agent_command': command,
+            'agent_command': command, 'clusters': extra,
         })
 
     async def _test_selection(self) -> None:
@@ -3031,11 +3190,17 @@ class ConnectionManager(ModalScreen[dict | None]):
             self._show_error(error)
             return
         status = self.query_one("#connection_status", Label)
-        status.update(f"Testing {len(gateways)} gateway(s)…")
+        status.update(f"Testing {self._current}: {len(gateways)} gateway(s)…")
         settings = dict(config.CLIENT_DEFAULTS)
         settings.update(self._settings)
         settings['gateways'] = gateways
         settings['agent_command'] = command
+        # This cluster's own control_path, not the global one: testing zgx
+        # through an MFA helper's socket that only FASRC has would fail for a
+        # reason that has nothing to do with zgx.
+        control_path = self._clusters[self._current].get('control_path')
+        if control_path is not None:
+            settings['control_path'] = control_path
         try:
             pool = gateway_client.GatewayPool(settings)
             results = await _offload_for(
@@ -3065,6 +3230,10 @@ class ConnectionManager(ModalScreen[dict | None]):
         button_id = event.button.id
         if button_id == 'connection_test':
             await self._test_selection()
+        elif button_id == 'connection_add':
+            self.action_add_cluster()
+        elif button_id == 'connection_remove':
+            self.action_remove_cluster()
         elif button_id == 'connection_local':
             command = config._client_agent_command(
                 self.query_one("#connection_agent", Input).value)
@@ -3197,7 +3366,7 @@ class AutotmuxApp(App):
         # buys the footer the room for `z`, which has nowhere else to appear.
         Binding("j", "toggle_jobs_view", "Jobs panel", show=False),
         Binding("z", "cycle_layout", "Layout"),
-        Binding("g", "manage_connections", "Login nodes"),
+        Binding("g", "manage_connections", "Clusters"),
         Binding("e", "edit_note", "Note", show=False),
         Binding("n", "new_session", "New session", show=False),
         Binding("x", "kill_session", "Kill session", show=False),
@@ -3238,7 +3407,7 @@ class AutotmuxApp(App):
         ("View", [
             ("z", "Cycle layout: split → wide → table → jobs", "remembered"),
             ("e", "Label this session with what it is for", "shows in STATUS"),
-            ("g", "Pick which login nodes to route through", "whole session"),
+            ("g", "Add clusters and pick their login nodes", "whole session"),
             ("r", "Refresh now (it also refreshes itself)", "whole table"),
             ("↑ / ↓", "Move the selection", "table"),
             ("q", "Quit", "AutoTmux"),
@@ -3492,9 +3661,13 @@ class AutotmuxApp(App):
         mode = result.get('mode')
         gateways = list(result.get('gateways') or ())
         command = result.get('agent_command') or ['atmux-agent']
-        config.save_client_state(mode, gateways, command)
+        config.save_client_state(mode, gateways, command,
+                                 result.get('clusters'))
         settings = config.load_client()
-        pool = (gateway_client.GatewayPool(settings)
+        # ClusterPool, not GatewayPool: rebuilding a single-cluster pool here
+        # would silently drop every other cluster until the next restart.
+        pool = (gateway_client.ClusterPool(
+                    config.client_clusters(settings), settings)
                 if mode == 'gateway' else None)
         return settings, pool
 

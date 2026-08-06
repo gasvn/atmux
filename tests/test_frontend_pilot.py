@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -234,6 +234,15 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                     save = app.screen.query_one('#connection_save')
                     self.assertLessEqual(save.region.right, 60)
                     self.assertLessEqual(save.region.bottom, 20)
+                    # Every control has to be reachable, not just Save: the
+                    # cluster row was added above the list and pushed the
+                    # buttons off a 20-row terminal until the help text
+                    # earned its space back.
+                    for widget in ('#connection_cluster', '#connection_add',
+                                   '#connection_remove', '#connection_aliases'):
+                        element = app.screen.query_one(widget)
+                        self.assertLessEqual(element.region.bottom, 20, widget)
+                        self.assertLessEqual(element.region.right, 60, widget)
 
     async def test_jobs_panel_marks_stale_squeue_data(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1391,6 +1400,197 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(spec['preview'], mode)
 
 
+class ConnectionClusterEditingTests(unittest.IsolatedAsyncioTestCase):
+    """`g` has to manage every cluster, not just the primary one.
+
+    Editing one cluster at a time is fine; silently dropping the others when
+    the dialog saves is not, and that is what it used to do.
+    """
+
+    def setUp(self):
+        self._saved_launch = autotmux._launch_daemon
+        autotmux._launch_daemon = lambda: (True, '')
+        self._saved_prewarm = autotmux.AutotmuxApp._prewarm_interactive_async
+
+        async def no_prewarm(_app, _nodes, _source_pool):
+            return None
+
+        autotmux.AutotmuxApp._prewarm_interactive_async = no_prewarm
+
+    def tearDown(self):
+        autotmux._launch_daemon = self._saved_launch
+        autotmux.AutotmuxApp._prewarm_interactive_async = self._saved_prewarm
+
+    def _settings(self, **overrides):
+        settings = dict(autotmux.config.CLIENT_DEFAULTS)
+        settings.update({
+            'mode': 'gateway',
+            'gateways': ['k6', 'k7'],
+            'agent_command': ['atmux-agent'],
+            'clusters': {'zgx': {
+                'gateways': ['zgx'],
+                'agent_command': ['/opt/venv/bin/atmux-agent'],
+                'control_path': '',
+            }},
+        })
+        settings.update(overrides)
+        return settings
+
+    @asynccontextmanager
+    async def _dialog(self, settings, aliases=('k6', 'k7', 'k8')):
+        app = autotmux.AutotmuxApp()
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                dialog = autotmux.ConnectionManager(settings, list(aliases))
+                await app.push_screen(dialog)
+                await pilot.pause()
+                yield dialog, pilot
+
+    async def test_every_configured_cluster_is_offered(self):
+        async with self._dialog(self._settings()) as (dialog, _pilot):
+            self.assertEqual(list(dialog._clusters),
+                             [autotmux.config.PRIMARY_CLUSTER, 'zgx'])
+            select = dialog.query_one('#connection_cluster', autotmux.Select)
+            self.assertEqual(select.value, autotmux.config.PRIMARY_CLUSTER)
+
+    async def test_saving_after_editing_only_the_primary_keeps_the_rest(self):
+        """The bug: the dialog wrote {mode, gateways, agent_command} and every
+        other cluster went with it."""
+        async with self._dialog(self._settings()) as (dialog, pilot):
+            saved = {}
+            dialog.dismiss = lambda result: saved.update(result or {})
+            dialog.query_one(
+                '#connection_aliases', autotmux.SelectionList).select('k8')
+            dialog.action_save()
+            await pilot.pause()
+            self.assertEqual(sorted(saved['gateways']), ['k6', 'k7', 'k8'])
+            self.assertIn('zgx', saved['clusters'])
+            self.assertEqual(saved['clusters']['zgx']['gateways'], ['zgx'])
+
+    async def test_settings_the_dialog_cannot_edit_survive_a_save(self):
+        """control_path is not on screen anywhere. Round-tripping it is the
+        only thing stopping a save from deleting it."""
+        async with self._dialog(self._settings()) as (dialog, pilot):
+            saved = {}
+            dialog.dismiss = lambda result: saved.update(result or {})
+            dialog.action_save()
+            await pilot.pause()
+            self.assertEqual(saved['clusters']['zgx']['control_path'], '')
+            self.assertEqual(saved['clusters']['zgx']['agent_command'],
+                             ['/opt/venv/bin/atmux-agent'])
+
+    async def test_switching_cluster_shows_that_cluster_selection(self):
+        async with self._dialog(self._settings()) as (dialog, pilot):
+            aliases = dialog.query_one(
+                '#connection_aliases', autotmux.SelectionList)
+            self.assertEqual(sorted(aliases.selected), ['k6', 'k7'])
+            dialog.query_one(
+                '#connection_cluster', autotmux.Select).value = 'zgx'
+            await pilot.pause()
+            self.assertEqual(dialog._current, 'zgx')
+            self.assertEqual(list(aliases.selected), ['zgx'])
+            self.assertEqual(
+                dialog.query_one('#connection_agent', autotmux.Input).value,
+                '/opt/venv/bin/atmux-agent')
+
+    async def test_edits_to_one_cluster_survive_switching_away_and_back(self):
+        async with self._dialog(self._settings()) as (dialog, pilot):
+            aliases = dialog.query_one(
+                '#connection_aliases', autotmux.SelectionList)
+            aliases.select('k8')
+            dialog.query_one(
+                '#connection_cluster', autotmux.Select).value = 'zgx'
+            await pilot.pause()
+            dialog.query_one('#connection_cluster', autotmux.Select).value = (
+                autotmux.config.PRIMARY_CLUSTER)
+            await pilot.pause()
+            self.assertEqual(sorted(aliases.selected), ['k6', 'k7', 'k8'])
+
+    async def test_a_new_cluster_can_be_added_and_filled_in(self):
+        async with self._dialog(self._settings()) as (dialog, pilot):
+            dialog.query_one(
+                '#connection_new_cluster', autotmux.Input).value = 'lab'
+            dialog.action_add_cluster()
+            await pilot.pause()
+            self.assertEqual(dialog._current, 'lab')
+            self.assertEqual(
+                list(dialog.query_one('#connection_aliases',
+                                      autotmux.SelectionList).selected), [])
+            dialog.query_one('#connection_extra', autotmux.Input).value = 'ws'
+            saved = {}
+            dialog.dismiss = lambda result: saved.update(result or {})
+            dialog.action_save()
+            await pilot.pause()
+            self.assertEqual(saved['clusters']['lab']['gateways'], ['ws'])
+            # The primary is untouched by adding a cluster.
+            self.assertEqual(sorted(saved['gateways']), ['k6', 'k7'])
+
+    async def test_a_bad_cluster_name_is_refused_with_a_reason(self):
+        async with self._dialog(self._settings()) as (dialog, pilot):
+            for name in ('bad name', '', '-lead', 'x' * 40):
+                with self.subTest(name=name):
+                    dialog.query_one(
+                        '#connection_new_cluster', autotmux.Input).value = name
+                    dialog.action_add_cluster()
+                    await pilot.pause()
+                    self.assertNotIn(name, dialog._clusters)
+                    self.assertIn(
+                        'cluster name',
+                        str(dialog.query_one('#connection_status',
+                                             autotmux.Label).render()))
+
+    async def test_a_duplicate_cluster_name_is_refused(self):
+        async with self._dialog(self._settings()) as (dialog, pilot):
+            dialog.query_one(
+                '#connection_new_cluster', autotmux.Input).value = 'zgx'
+            dialog.action_add_cluster()
+            await pilot.pause()
+            self.assertEqual(list(dialog._clusters),
+                             [autotmux.config.PRIMARY_CLUSTER, 'zgx'])
+
+    async def test_a_cluster_can_be_removed_but_never_the_primary(self):
+        async with self._dialog(self._settings()) as (dialog, pilot):
+            remove = dialog.query_one('#connection_remove', autotmux.Button)
+            self.assertTrue(remove.disabled, 'primary must not be removable')
+            dialog.query_one(
+                '#connection_cluster', autotmux.Select).value = 'zgx'
+            await pilot.pause()
+            self.assertFalse(remove.disabled)
+            dialog.action_remove_cluster()
+            await pilot.pause()
+            self.assertEqual(list(dialog._clusters),
+                             [autotmux.config.PRIMARY_CLUSTER])
+            self.assertEqual(dialog._current,
+                             autotmux.config.PRIMARY_CLUSTER)
+
+    async def test_the_explanation_is_wrapped_rather_than_clipped(self):
+        """Label defaults to width:auto, which lays text out on one line and
+        lets the container cut the rest. The explanation of what a cluster
+        *is* is the one thing in this dialog that must not be half-shown."""
+        async with self._dialog(self._settings()) as (dialog, _pilot):
+            help_label = dialog.query_one('#connection_help')
+            text = str(help_label.render())
+            width = help_label.region.width
+            self.assertGreater(width, 0)
+            # At least as many lines as the text needs to fit that width.
+            self.assertGreaterEqual(help_label.region.height,
+                                    max(1, len(text) // width))
+
+    async def test_an_empty_primary_is_refused_not_saved(self):
+        async with self._dialog(
+                self._settings(gateways=[], clusters={})) as (dialog, pilot):
+            dismissed = []
+            dialog.dismiss = lambda result: dismissed.append(result)
+            dialog.action_save()
+            await pilot.pause()
+            self.assertEqual(dismissed, [])
+            self.assertIn('at least one',
+                          str(dialog.query_one('#connection_status',
+                                               autotmux.Label).render()))
+
+
 class MousePreferenceTests(unittest.TestCase):
     """Mouse reporting is what makes click-to-attach work and what stops the
     terminal selecting text, so the choice has to survive without a flag."""
@@ -1455,7 +1655,7 @@ class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
         # past 120 columns and made Textual clip "q Quit" to "q Q".
         self.assertEqual(shown['o'], 'New window')
         self.assertEqual(shown['k'], 'Auto-renew job')
-        self.assertEqual(shown['g'], 'Login nodes')
+        self.assertEqual(shown['g'], 'Clusters')
         for description in shown.values():
             self.assertEqual(description, description.strip())
             self.assertTrue(description[:1].isupper() or description[:1] == '↑')

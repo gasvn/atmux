@@ -372,6 +372,40 @@ class ClusterDefinitionTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(config.clean_clusters(value), {})
 
+    def test_a_saved_cluster_survives_being_read_back_intact(self):
+        """The dialog writes records, not host lists. Reading one back as a
+        list turned a cluster's gateways into its own field names, so zgx
+        came back pointing at hosts called "agent_command"."""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, 'connections.json')
+            with mock.patch.object(config, 'CLIENT_STATE_PATH', path), \
+                 mock.patch.object(config, 'CONFIG_PATH',
+                                   os.path.join(td, 'missing.toml')):
+                config.save_client_state(
+                    'gateway', ['k6'], ['atmux-agent'],
+                    clusters={'zgx': {
+                        'gateways': ['zgx'],
+                        'agent_command': ['/opt/venv/bin/atmux-agent'],
+                        'control_path': '',
+                    }})
+                cfg = config.load_client()
+        self.assertEqual(cfg['clusters']['zgx']['gateways'], ['zgx'])
+        self.assertEqual(cfg['clusters']['zgx']['agent_command'],
+                         ['/opt/venv/bin/atmux-agent'])
+        self.assertEqual(config.client_clusters(cfg)[1], (
+            'zgx', ('zgx',),
+            {'agent_command': ['/opt/venv/bin/atmux-agent'],
+             'control_path': ''}))
+
+    def test_an_unset_control_path_is_not_reported_as_invalid(self):
+        """The TUI writes the field for every cluster, most of them unset;
+        warning on each one buried the messages that mattered."""
+        with self.assertNoLogs(config.log, level='WARNING'):
+            cleaned = config.clean_clusters(
+                {'lab': {'gateways': ['ws'], 'control_path': None,
+                         'agent_command': None}})
+        self.assertEqual(cleaned['lab']['gateways'], ['ws'])
+
     def test_the_connection_dialog_cannot_delete_configured_clusters(self):
         """It only edits the primary group. Rewriting the file without the
         others would silently destroy them."""
