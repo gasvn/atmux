@@ -256,7 +256,7 @@ class _ServedFixture(unittest.TestCase):
 
 class AssetTests(_ServedFixture):
     def test_the_page_carries_its_own_terminal(self):
-        head, body = self.get('/')
+        head, body = self.get(web.CONSOLE)
         self.assertIn('200', head)
         self.assertIn(b'xterm.js', body)
         self.assertIn(b'app.js', body)
@@ -270,7 +270,7 @@ class AssetTests(_ServedFixture):
         inline (it must run before the assets that would 404, and any file it
         lived in would 404 for the same reason), so the policy admits that one
         text by hash and nothing else."""
-        head, body = self.get('/')
+        head, body = self.get(web.CONSOLE)
         inline = [tag for tag in re.findall(rb'<script[^>]*>', body)
                   if b'src=' not in tag]
         self.assertEqual(len(inline), 1, f'unexpected inline scripts: {inline}')
@@ -282,7 +282,7 @@ class AssetTests(_ServedFixture):
         is the blank page again."""
         import base64 as _b64
         import hashlib as _hashlib
-        _head, body = self.get('/')
+        _head, body = self.get(web.CONSOLE)
         served = re.search(rb'<script>(.*?)</script>', body, re.S)
         self.assertIsNotNone(served, 'no inline bootstrap in the page')
         digest = _hashlib.sha256(served.group(1)).digest()
@@ -299,7 +299,7 @@ class AssetTests(_ServedFixture):
     def test_the_policy_permits_the_socket_the_page_opens(self):
         """A CSP that blocks its own websocket produces a page that loads and
         then does nothing, which reads as a server fault."""
-        head, _body = self.get('/')
+        head, _body = self.get(web.CONSOLE)
         policy = [line for line in head.splitlines()
                   if line.lower().startswith('content-security-policy')][0]
         self.assertIn('ws:', policy)
@@ -317,7 +317,7 @@ class AssetTests(_ServedFixture):
     def test_a_failure_before_the_terminal_starts_is_visible(self):
         """Whatever breaks next should say so on screen rather than leaving
         the blank page this feature shipped with the first time."""
-        _head, body = self.get('/')
+        _head, body = self.get(web.CONSOLE)
         self.assertIn(b'id="boot"', body)
         _head, script = self.get('/app.js')
         self.assertIn(b"addEventListener('error'", script)
@@ -327,7 +327,7 @@ class AssetTests(_ServedFixture):
         whatever the client guessed -- which is the whole bug, restored, and
         invisible until someone opens it on a phone."""
         from autotmux import config
-        _head, body = self.get('/')
+        _head, body = self.get(web.CONSOLE)
         page = body.decode('utf-8')
         self.assertNotIn(web._LAYOUT_SLOT, page)
         widths = re.search(r'name="atmux-layout" content="([^"]*)"', page)
@@ -339,26 +339,31 @@ class AssetTests(_ServedFixture):
         """Read the asset list off the page rather than restating it here: a
         hand-kept list agrees with the page right up until one of them
         changes, and then it is a test that passes while the page 404s."""
-        _head, body = self.get('/')
-        page = body.decode('utf-8')
-        wanted = (re.findall(r'<script src="([^"]+)"', page) +
-                  re.findall(r'<link[^>]+href="([^"]+)"', page))
-        self.assertGreaterEqual(len(wanted), 3, f'no assets found: {wanted}')
-        for name in wanted:
-            with self.subTest(path=name):
-                head, asset = self.get('/' + name)
+        for page_path in ('/', web.CONSOLE):
+            _head, body = self.get(page_path)
+            page = body.decode('utf-8')
+            wanted = (re.findall(r'<script src="([^"]+)"', page) +
+                      re.findall(r'<link[^>]+href="([^"]+)"', page))
+            self.assertGreaterEqual(len(wanted), 2,
+                                    f'{page_path}: no assets found')
+            for name in wanted:
+                # Relative to the page, which is the point: the console lives
+                # under a prefix and its assets have to resolve there too.
+                target = page_path.rstrip('/') + '/' + name
+                with self.subTest(path=target):
+                    head, asset = self.get(target)
                 self.assertIn('200', head)
                 self.assertGreater(len(asset), 0)
 
     def test_the_terminal_is_vendored_not_fetched(self):
         """A device on a private network may have no route to a CDN, and the
         page's own CSP forbids one anyway."""
-        _head, body = self.get('/')
+        _head, body = self.get(web.CONSOLE)
         self.assertNotIn(b'cdn.', body)
         self.assertNotIn(b'https://unpkg', body)
 
     def test_the_page_forbids_loading_or_sending_anywhere_else(self):
-        head, _body = self.get('/')
+        head, _body = self.get(web.CONSOLE)
         self.assertIn("default-src 'self'", head)
         self.assertIn("frame-ancestors 'none'", head)
 
@@ -1283,3 +1288,124 @@ class PublishedControlsEndToEndTests(unittest.TestCase):
         and on a slow link it is noise competing with the screen."""
         text = self._run({}, seconds=8)
         self.assertNotIn('\x1b]%d;' % keypad.OSC, text)
+
+
+class DashboardTests(_ServedFixture):
+    """The reading half, served as data rather than as a screen.
+
+    Every problem the console has -- a grid that never divides the box, a
+    column budget, a font solved backwards from breakpoints, a keypad
+    standing in for touch xterm.js does not implement -- comes from sending
+    a rendering instead of the model. This sends the model.
+    """
+
+    def state(self):
+        _head, body = self.get('/api/state')
+        return json.loads(body.decode('utf-8'))
+
+    def test_the_root_is_the_dashboard_and_the_terminal_is_a_click_away(self):
+        _head, body = self.get('/')
+        page = body.decode('utf-8')
+        self.assertIn('dash.js', page)
+        self.assertNotIn('xterm.js', page)
+        self.assertIn('console/', page)
+        _head, console = self.get(web.CONSOLE)
+        self.assertIn(b'xterm.js', console)
+
+    def test_the_console_keeps_working_under_its_prefix(self):
+        """Its assets and its socket are addressed relative to the page, so
+        moving the page has to move them with it."""
+        head, _body = self.get(web.CONSOLE + 'app.js')
+        self.assertIn('200', head)
+        head, _body = self.get(web.CONSOLE.rstrip('/'))
+        self.assertIn('302', head)
+
+    def test_the_state_endpoint_answers_even_with_no_source(self):
+        """A dashboard that 500s because nothing has fetched yet is a
+        dashboard that looks broken on every cold start."""
+        data = self.state()
+        self.assertIsInstance(data, dict)
+
+    def test_the_page_asks_for_the_api_relative_to_itself(self):
+        """`tailscale serve --set-path /term` is why: an absolute /api/state
+        would reach for the host root, where nothing is mounted."""
+        with open(os.path.join(web.ASSETS, 'dash.js'), encoding='utf-8') as f:
+            js = f.read()
+        self.assertIn("new URL('api/", js)
+        self.assertNotIn("'/api/", js)
+
+    def test_the_page_renders_no_html_from_the_wire(self):
+        """Session names, node names and squeue output are all attacker-
+        adjacent in the sense that they come from a cluster. textContent
+        cannot execute; innerHTML can."""
+        with open(os.path.join(web.ASSETS, 'dash.js'), encoding='utf-8') as f:
+            js = f.read()
+        self.assertNotIn('innerHTML', js)
+        self.assertIn('textContent', js)
+
+
+class DashboardStateTests(unittest.TestCase):
+    """What /api/state promises a client, without a server in the way."""
+
+    def setUp(self):
+        from autotmux import statesource
+        self.statesource = statesource
+
+    def test_a_source_that_has_never_fetched_says_so_rather_than_lying(self):
+        source = self.statesource.StateSource(pool=object())
+        snap = source.snapshot()
+        self.assertIsNone(snap['age'])
+        self.assertFalse(snap['stale'])
+        self.assertEqual(snap['sessions'], [])
+
+    def test_a_failed_refresh_keeps_the_last_good_answer(self):
+        """A gateway being slow must not blank the dashboard. Going stale and
+        saying how stale is the honest failure."""
+        class Pool:
+            def __init__(self):
+                self.ok = True
+
+            def fetch_state(self):
+                if self.ok:
+                    return True, {'nodes': {'n1': {
+                        'alive': True, 'sessions': [('a', 1, 0)],
+                        'info': {'time': '1:00', 'nproc': '8', 'load': '1.0',
+                                 'sessions': [('a', 1, 0)]}}}}
+                raise OSError('gateway unreachable')
+
+        clock = [1000.0]
+        pool = Pool()
+        source = self.statesource.StateSource(pool=pool, refresh=5.0,
+                                              clock=lambda: clock[0])
+        self.assertTrue(source.refresh())
+        self.assertEqual(len(source.snapshot()['sessions']), 1)
+
+        pool.ok = False
+        clock[0] += 60.0
+        self.assertFalse(source.refresh())
+        snap = source.snapshot()
+        self.assertEqual(len(snap['sessions']), 1, 'the last answer was lost')
+        self.assertTrue(snap['stale'])
+        self.assertGreaterEqual(snap['age'], 60.0)
+        self.assertIn('unreachable', snap['error'])
+
+    def test_it_never_raises_at_the_call_site(self):
+        class Exploding:
+            def fetch_state(self):
+                raise RuntimeError('boom')
+
+        source = self.statesource.StateSource(pool=Exploding())
+        self.assertFalse(source.refresh())
+        self.assertIsInstance(source.snapshot(), dict)
+
+    def test_a_refusing_pool_is_not_treated_as_an_empty_cluster(self):
+        """`ok=False` means "I could not tell you", not "there is nothing".
+        Overwriting a good answer with it is how a dashboard reports every
+        session gone at the moment the network hiccups."""
+        class Refusing:
+            def fetch_state(self):
+                return False, {}
+
+        source = self.statesource.StateSource(pool=Refusing())
+        self.assertFalse(source.refresh())
+        self.assertIsNone(source.snapshot()['age'])

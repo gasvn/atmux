@@ -2121,10 +2121,20 @@ class TouchControlSurfaceTests(unittest.IsolatedAsyncioTestCase):
 
         autotmux.AutotmuxApp._prewarm_interactive_async = no_prewarm
         self._saved_env = os.environ.get(autotmux.keypad.TOUCH_ENV)
+        # The layout is persisted, so without this the test reads whichever
+        # mode the developer last left the real dashboard in -- and in the
+        # queue-only mode the table is not on screen, so Attach is not in the
+        # live bindings and every assertion here is about a different screen.
+        self._layout_dir = tempfile.TemporaryDirectory()
+        self._saved_layout_path = autotmux.config.LAYOUT_PATH
+        autotmux.config.LAYOUT_PATH = os.path.join(
+            self._layout_dir.name, 'layout.json')
 
     def tearDown(self):
         autotmux._launch_daemon = self._saved_launch
         autotmux.AutotmuxApp._prewarm_interactive_async = self._saved_prewarm
+        autotmux.config.LAYOUT_PATH = self._saved_layout_path
+        self._layout_dir.cleanup()
         if self._saved_env is None:
             os.environ.pop(autotmux.keypad.TOUCH_ENV, None)
         else:
@@ -2141,12 +2151,36 @@ class TouchControlSurfaceTests(unittest.IsolatedAsyncioTestCase):
             app = autotmux.AutotmuxApp()
             async with app.run_test(size=size) as pilot:
                 await pilot.pause()
-                # The bar follows the same poll that publishes to a browser;
-                # focus settles a beat after mount, and Attach is bound on
-                # the table rather than on the app.
-                await asyncio.sleep(0.6)
-                await pilot.pause()
+                # Wait for the condition, not for a duration. Attach is bound
+                # on the table, so it only joins the live set once focus has
+                # settled there -- and a fixed sleep that is long enough on
+                # one machine is a test that fails on another for no reason
+                # anybody can act on.
+                # Wait for the *bar*, not for the app's bindings. The bar
+                # follows on its own poll, so a test that clicks as soon as
+                # the binding exists can catch it mid-rebuild -- which is
+                # how a press aimed at one button reached another.
+                bars = app.query(autotmux.TouchBar)
+                if bars:
+                    await self._until(pilot, lambda: 'Attach' in [
+                        str(b.label) for b in bars.first().query(
+                            autotmux.Button)])
+                else:
+                    await self._until(pilot, lambda: 'Attach' in [
+                        k['l'] for k in
+                        autotmux.keypad.keys_for(app.active_bindings)])
                 yield app, pilot
+
+    async def _until(self, pilot, predicate, timeout=5.0):
+        """Pump the app until predicate() holds, or fail saying what did not."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            await pilot.pause()
+            if predicate():
+                await pilot.pause()
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError(f'condition never held within {timeout}s')
 
     async def test_a_keyboard_terminal_is_left_exactly_as_it_was(self):
         async with self._app('') as (app, _pilot):
@@ -2197,9 +2231,8 @@ class TouchControlSurfaceTests(unittest.IsolatedAsyncioTestCase):
         async with self._app('local') as (app, pilot):
             bar = app.query_one(autotmux.TouchBar)
             await pilot.press('question_mark')
-            await pilot.pause()
-            await asyncio.sleep(0.6)
-            await pilot.pause()
+            await self._until(pilot, lambda: 'Close' in
+                              [str(b.label) for b in bar.query(autotmux.Button)])
             labels = [str(b.label) for b in bar.query(autotmux.Button)]
             self.assertIn('Close', labels)
             self.assertNotIn('Kill session', labels)
@@ -2251,8 +2284,10 @@ class TouchControlSurfaceTests(unittest.IsolatedAsyncioTestCase):
             target = next(b for b in bar.query(autotmux.Button)
                           if str(b.label) == 'Refresh now')
             await pilot.click(target, offset=(target.region.width // 2, 1))
-            await pilot.pause()
-            await asyncio.sleep(0.4)
-            await pilot.pause()
+            # Give the poll several chances to renumber the bar behind the
+            # press; the point is that it does not.
+            for _ in range(6):
+                await pilot.pause()
+                await asyncio.sleep(0.1)
             self.assertEqual([str(b.label) for b in bar.query(autotmux.Button)],
                              before)

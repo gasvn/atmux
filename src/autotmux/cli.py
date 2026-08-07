@@ -51,6 +51,20 @@ from autotmux import (
     config, gateway as gateway_client, ipc, keepalive, keypad, lifecycle,
     notify, paths, urlhandler, warm_registry, webcontrol,
 )
+from autotmux import model
+# The rows the table is built from are the model, not the view, and the
+# browser client renders the same ones as a list. Imported rather than
+# duplicated: two derivations of "which session is stale" is two answers.
+# The two idle thresholds are deliberately NOT re-exported. They are
+# rebound at runtime by apply_idle_thresholds(), and `from x import name`
+# copies the binding -- a reader here would keep answering 300 forever
+# while the model had moved on. Reach for model.IDLE_* instead.
+from autotmux.model import (                                    # noqa: F401
+    _IDLE_DOT, _OFFLINE_SESSION, _START_SHELL_SESSION,
+    _attention_rank, _coerce_idle_seconds, _format_idle, _idle_marker,
+    _idle_tier, _looks_stale, _session_label, _split_idle_marker,
+    build_session_rows,
+)
 
 STATE_FILE = paths.STATE_FILE
 CTL_DIR = paths.CTL_DIR
@@ -69,8 +83,6 @@ _CONTROL_COMMAND_SLOTS = threading.Semaphore(4)
 _SLURM_COMMAND_SLOTS = threading.Semaphore(2)
 _DAEMON_LAUNCH_SLOTS = threading.Semaphore(1)
 _FRONTEND_COMMAND_CLEANUP_GRACE = 2.0
-_OFFLINE_SESSION = '\x00autotmux:offline'
-_START_SHELL_SESSION = '\x00autotmux:start-shell'
 # Display prefix the gateway pool gives a login node (see gateway._login_key).
 _LOGIN_NODE_PREFIX = 'login--'
 _UI_FILE_READ_TIMEOUT = 2.5
@@ -305,19 +317,7 @@ def _valid_node(node: str) -> bool:
     return isinstance(node, str) and bool(_NODE_RE.fullmatch(node))
 
 
-def _node_label(node: str) -> str:
-    """Compact display name for a node.
-
-    A fully-qualified login host runs to ~37 characters, and the table sizes
-    NODE to its widest value -- so one such row pushed SESSION, the column
-    users actually navigate by, clean off a narrow terminal. Routing always
-    uses the real name from the row tuple; this is display only.
-    """
-    name = str(node)
-    if name.startswith(_LOGIN_NODE_PREFIX):
-        host = name[len(_LOGIN_NODE_PREFIX):]
-        return 'login:' + (host.split('.', 1)[0] or host)
-    return name.split('.', 1)[0] or name
+_node_label = model.node_label
 
 
 def _time_left_label(value) -> str:
@@ -443,15 +443,6 @@ def _session_cell(session: str, windows) -> str:
     return f'{label} ·{count}' if count > 1 else label
 
 
-def _session_label(session: str) -> str:
-    """Visible label for an internal row target token."""
-    if session == _OFFLINE_SESSION:
-        return '<offline>'
-    if session == _START_SHELL_SESSION:
-        # Short on purpose: the placeholder appears on every node without a
-        # session, so its width sets the SESSION column for the whole table.
-        return '<shell>'
-    return str(session)
 
 
 def _ctl_path(node: str) -> str:
@@ -2401,174 +2392,27 @@ class WarmSlavePool:
         return matched_result
 
 
-def _attention_rank(row) -> int:
-    """Where a row belongs in the table, by how much it wants a decision.
-
-    Ordering by node name gave the top of the table to whichever host sorted
-    first, which says nothing.  What earns the top is *recent change*: a
-    session that has just gone quiet is a run that has probably finished or
-    wedged, and that is the moment a decision is worth making.
-
-    The rank is deliberately coarse and slow-moving -- a row changes tier at
-    most twice per quiet spell -- because a table that re-sorts while the
-    cursor is in it is worse than one that is merely ordered badly.  A session
-    quiet for hours sinks *below* the working ones: it is not news any more,
-    and leaving it on top would push live work off the screen.
-    """
-    session = row[1]
-    status = str(row[4])
-    if session == _OFFLINE_SESSION or status.startswith('DEGRADED'):
-        return 0
-    if session == _START_SHELL_SESSION:
-        return 4                       # a placeholder, not somebody's work
-    marker, _rest = _split_idle_marker(status)
-    if marker:
-        return 3 if _looks_stale(marker) else 1
-    return 2
 
 
-def build_session_rows(state: dict) -> list:
-    """Turn daemon state into a flat list of display rows.
-
-    Each row: (node, session, wins, time_left, status, cpu, load)
-    `cpu` is how many processors the machine has and `load` is its 1-min load
-    average -- both node-wide, so dividing one by the other means something.
-    Together they tell the user whether attaching will be snappy or sluggish.
-    """
-    rows = []
-    if not isinstance(state, dict):
-        return rows
-    nodes = state.get('nodes', {})
-    if not isinstance(nodes, dict):
-        return rows
-    for node, nd in nodes.items():
-        if not isinstance(node, str) or not isinstance(nd, dict):
-            continue
-        info = nd.get('info', {})
-        if not isinstance(info, dict):
-            info = {}
-        time_left = str(info.get('time', '') or '')
-        cpu = str(info.get('nproc', '') or '')
-        load = str(info.get('load', '') or '')
-        try:
-            escape_time = int(str(info.get('escape_time', '') or ''))
-        except (TypeError, ValueError):
-            escape_time = 0
-        latency_warning = (
-            f'⚠ ESC {escape_time}ms'
-            if node != 'localhost' and escape_time > 50 else '')
-        last_error = str(nd.get('last_error') or '')
-        network_info = nd.get('network')
-        network_warning = ''
-        if isinstance(network_info, dict) and network_info.get('state') in {
-                'suspect', 'offline', 'half-open'}:
-            retry = network_info.get('retry_in', 0)
-            if not isinstance(retry, (int, float)) or isinstance(retry, bool):
-                retry = 0
-            reason = ' '.join(str(network_info.get('reason') or '').split())[:24]
-            phase = 'testing' if network_info.get('state') == 'half-open' else 'retry'
-            network_warning = f'⚠ NET {phase} {max(0, int(math.ceil(retry)))}s'
-            if reason:
-                network_warning += f': {reason}'
-        if not nd.get('alive'):
-            status = f'OFFLINE: {last_error[:30]}' if last_error else 'OFFLINE'
-            rows.append((node, _OFFLINE_SESSION, '-', time_left, status, cpu, load))
-            continue
-        sessions = nd.get('sessions', [])
-        if not isinstance(sessions, (list, tuple)):
-            sessions = []
-        added = False
-        if sessions:
-            for s in sessions:
-                idle = None
-                if isinstance(s, (list, tuple)):
-                    if not s:
-                        continue
-                    name = str(s[0])
-                    wins = str(s[1]) if len(s) > 1 else '?'
-                    if len(s) > 2:
-                        idle = _coerce_idle_seconds(s[2])
-                elif isinstance(s, str):
-                    name, wins = s, '?'
-                else:
-                    continue
-                status = (f'DEGRADED: {last_error[:30]}'
-                          if last_error else 'Active')
-                marker = _idle_marker(idle)
-                if marker:
-                    status = f'{marker} {status}'
-                if latency_warning:
-                    status = f'{status} · {latency_warning}'
-                if network_warning:
-                    status = f'{status} · {network_warning}'
-                rows.append((node, name, wins, time_left, status, cpu, load))
-                added = True
-        if not added:
-            status = (f'DEGRADED: {last_error[:30]}'
-                      if last_error else 'No sessions')
-            if network_warning:
-                status = f'{status} · {network_warning}'
-            rows.append((node, _START_SHELL_SESSION, '-', time_left, status, cpu, load))
-    rows.sort(key=lambda r: (_attention_rank(r), r[0], _session_label(r[1])))
-    return rows
 
 
 # A pane nobody has touched for a while is usually a finished run or a shell
 # waiting on a prompt.  Surfacing that costs nothing -- tmux already tracks the
 # last activity per session -- and saves opening each one to check.
-IDLE_HINT_SECONDS = 300
-IDLE_STALE_SECONDS = 3600
-_IDLE_DOT = '●'
 _IDLE_STYLES = {'idle': 'yellow', 'stale': 'red'}
 
 
 def _apply_idle_thresholds() -> None:
-    """Adopt the configured idle thresholds, if the config can be read.
-
-    Kept as module state because ``build_session_rows`` is a plain function
-    shared by the TUI and its tests; a failed read simply leaves the defaults.
-    """
-    global IDLE_HINT_SECONDS, IDLE_STALE_SECONDS
-    try:
-        cfg = config.load_client()
-        hint = int(cfg['idle_hint'])
-        stale = int(cfg['idle_stale'])
-    except Exception:
-        return
-    IDLE_HINT_SECONDS = hint
-    # A "stale" tier below the hint would colour every flagged session red.
-    IDLE_STALE_SECONDS = max(stale, hint)
+    """Adopt the configured idle thresholds. The model owns them now."""
+    model.apply_idle_thresholds()
 
 
-def _coerce_idle_seconds(value):
-    """Accept only a real, finite, non-negative idle count."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if not math.isfinite(value) or value < 0:
-        return None
-    return int(value)
 
 
-def _idle_tier(idle) -> str:
-    idle = _coerce_idle_seconds(idle)
-    if idle is None or idle < IDLE_HINT_SECONDS:
-        return ''
-    return 'stale' if idle >= IDLE_STALE_SECONDS else 'idle'
 
 
-def _format_idle(idle: int) -> str:
-    if idle >= 86400:
-        return f'{idle // 86400}d'
-    if idle >= 3600:
-        return f'{idle // 3600}h'
-    return f'{idle // 60}m'
 
 
-def _idle_marker(idle) -> str:
-    """``● 12m`` once a session has been quiet past the hint threshold."""
-    if not _idle_tier(idle):
-        return ''
-    return f'{_IDLE_DOT} {_format_idle(_coerce_idle_seconds(idle))}'
 
 
 def _literal_cell(value) -> rich.text.Text:
@@ -2600,15 +2444,6 @@ def _status_text(status) -> str:
     return text
 
 
-def _split_idle_marker(status) -> tuple[str, str]:
-    """Separate a leading ``● 15m`` marker from the rest of the STATUS text."""
-    text = str(status)
-    if not text.startswith(_IDLE_DOT):
-        return '', text
-    parts = text.split(' ', 2)
-    if len(parts) < 3:
-        return text, ''
-    return f'{parts[0]} {parts[1]}', parts[2]
 
 
 def _idle_cell(marker) -> rich.text.Text:
@@ -2622,17 +2457,6 @@ def _idle_cell(marker) -> rich.text.Text:
     return cell
 
 
-def _looks_stale(text: str) -> bool:
-    """Whether a rendered marker represents the longer, redder tier."""
-    unit = text[len(_IDLE_DOT):].strip().split()[0] if len(text) > 1 else ''
-    if unit.endswith(('h', 'd')):
-        return True
-    if unit.endswith('m'):
-        try:
-            return int(unit[:-1]) * 60 >= IDLE_STALE_SECONDS
-        except ValueError:
-            return False
-    return False
 
 
 class ClickToAttachDataTable(DataTable):
@@ -4279,84 +4103,27 @@ class AutotmuxApp(App):
 
     @staticmethod
     def _ka_entry_matches(entry: dict, job_id, job_name) -> bool:
-        tracked = keepalive.job_family_id(entry.get('job_id'))
-        current = keepalive.job_family_id(job_id)
-        if tracked is not None:
-            return tracked == current
-        # Legacy name-wide registry entry.
-        return (isinstance(job_name, str)
-                and entry.get('job_name') == job_name)
+        return model.entry_matches(entry, job_id, job_name)
 
     def _ka_find_entry(self, job_id, job_name) -> dict | None:
-        return next((entry for entry in self._ka_entries
-                     if self._ka_entry_matches(entry, job_id, job_name)), None)
+        return model.find_entry(self._ka_entries, job_id, job_name)
 
     @staticmethod
     def _ka_status_for_entry(ka_status: dict, entry: dict) -> dict:
-        entry_id = entry.get('entry_id')
-        if isinstance(entry_id, str) and isinstance(ka_status.get(entry_id), dict):
-            return ka_status[entry_id]
-        name = entry.get('job_name')
-        if isinstance(name, str) and isinstance(ka_status.get(name), dict):
-            return ka_status[name]
-        tracked = keepalive.job_family_id(entry.get('job_id'))
-        if tracked:
-            for status in ka_status.values():
-                if (isinstance(status, dict)
-                        and keepalive.job_family_id(status.get('job_id')) == tracked):
-                    return status
-        return {}
+        return model.status_for_entry(ka_status, entry)
 
     @staticmethod
     def _ka_suffix(ka_state: dict) -> str:
         """Status text appended to a registered row's STATUS cell."""
-        if not isinstance(ka_state, dict):
-            ka_state = {}
-        st = ka_state.get('state', 'healthy')
-        if st == 'paused':
-            n = ka_state.get('attempts', 0)
-            error = str(ka_state.get('last_error') or '').strip()
-            detail = f': {error[:28]}' if error else ''
-            return f' · ⚠ keep-alive PAUSED ✕{n}{detail}'
-        if st == 'renewing':
-            return ' · ⟳ renewing…'
-        return ' · ⟳ keep-alive'
+        return model.keepalive_suffix(ka_state)
 
     def _decorate_keepalive(self, rows, state):
-        """Fold keep-alive marker/status into the STATUS cell of rows whose
-        job is registered. Membership comes from the off-loop name stash
-        (`_ka_entries`); live status from the daemon-published `keepalive` block."""
-        reg = self._ka_entries
-        if not reg:
-            return rows
-        if not isinstance(state, dict):
-            return rows
-        ka_status = state.get('keepalive', {}) or {}
-        if not isinstance(ka_status, dict):
-            ka_status = {}
-        nodes = state.get('nodes', {}) or {}
-        if not isinstance(nodes, dict):
-            nodes = {}
-        node_job = {}
-        for n, nd in nodes.items():
-            if not isinstance(nd, dict):
-                continue
-            info = nd.get('info', {}) or {}
-            if isinstance(info, dict):
-                node_job[n] = (info.get('job_id'), info.get('job_name'))
-        out = []
-        for r in rows:
-            job_id, job_name = node_job.get(r[0], (None, None))
-            entry = self._ka_find_entry(job_id, job_name)
-            # Renewal is driven from Slurm on the login node, independently of
-            # whether this node's SSH master is currently reachable. Show the
-            # intent on both <Start Shell> and OFFLINE rows.
-            if entry is not None:
-                suffix = self._ka_suffix(
-                    self._ka_status_for_entry(ka_status, entry))
-                r = (r[0], r[1], r[2], r[3], r[4] + suffix, r[5], r[6])
-            out.append(r)
-        return out
+        """Fold the keep-alive marker into registered rows.
+
+        The browser dashboard shows the same marker from the same function:
+        two answers to "is this job being renewed" is one of them wrong.
+        """
+        return model.decorate_keepalive(rows, state, self._ka_entries)
 
     @staticmethod
     def _daemon_age_seconds(updated: str, updated_monotonic=None,

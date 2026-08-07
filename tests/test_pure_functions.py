@@ -706,8 +706,8 @@ class SessionActivityParsingTests(unittest.TestCase):
 
 class IdleMarkerTests(unittest.TestCase):
     def test_quiet_sessions_are_marked_only_past_the_threshold(self):
-        self.assertEqual(autotmux._idle_marker(autotmux.IDLE_HINT_SECONDS - 1), '')
-        self.assertEqual(autotmux._idle_marker(autotmux.IDLE_HINT_SECONDS), '● 5m')
+        self.assertEqual(autotmux._idle_marker(autotmux.model.IDLE_HINT_SECONDS - 1), '')
+        self.assertEqual(autotmux._idle_marker(autotmux.model.IDLE_HINT_SECONDS), '● 5m')
         self.assertEqual(autotmux._idle_marker(900), '● 15m')
         self.assertEqual(autotmux._idle_marker(7200), '● 2h')
         self.assertEqual(autotmux._idle_marker(90_000), '● 1d')
@@ -1006,10 +1006,11 @@ class MissingBinaryMessageTests(unittest.TestCase):
 
 class IdleThresholdConfigTests(unittest.TestCase):
     def setUp(self):
-        self._saved = (autotmux.IDLE_HINT_SECONDS, autotmux.IDLE_STALE_SECONDS)
+        self._saved = (autotmux.model.IDLE_HINT_SECONDS, autotmux.model.IDLE_STALE_SECONDS)
 
     def tearDown(self):
-        autotmux.IDLE_HINT_SECONDS, autotmux.IDLE_STALE_SECONDS = self._saved
+        (autotmux.model.IDLE_HINT_SECONDS,
+         autotmux.model.IDLE_STALE_SECONDS) = self._saved
 
     def _apply(self, body: str):
         with tempfile.TemporaryDirectory() as td:
@@ -1018,7 +1019,7 @@ class IdleThresholdConfigTests(unittest.TestCase):
                 handle.write(body)
             with mock.patch.object(autotmux.config, 'CONFIG_PATH', path):
                 autotmux._apply_idle_thresholds()
-        return autotmux.IDLE_HINT_SECONDS, autotmux.IDLE_STALE_SECONDS
+        return autotmux.model.IDLE_HINT_SECONDS, autotmux.model.IDLE_STALE_SECONDS
 
     def test_thresholds_come_from_config(self):
         self.assertEqual(

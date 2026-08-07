@@ -40,6 +40,7 @@ import threading
 from . import config
 from . import keypad
 from . import paths
+from . import statesource
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'webassets')
 
@@ -287,7 +288,12 @@ def _layout_meta() -> str:
     return f'<meta name="atmux-layout" content="{widths}">'
 # Ours, and therefore worth re-fetching. Everything else is vendored and only
 # changes when the package does.
-_VOLATILE_ASSETS = frozenset({'index.html', 'app.js', 'manifest.json'})
+_VOLATILE_ASSETS = frozenset({'index.html', 'app.js', 'manifest.json',
+                              'dash.html', 'dash.js'})
+
+# Where the terminal lives now that the root is the dashboard. Trailing slash
+# so every asset the page asks for resolves under it.
+CONSOLE = '/console/'
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -300,14 +306,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = self.path.split('?', 1)[0]
-        if path == '/ws':
+        # The socket is addressed relative to whichever page opened it, so
+        # the console at /console/ asks for /console/ws. One rule rather than
+        # a list of mount points: the page must keep working wherever it is
+        # mounted, which is the whole reason it uses a relative URL.
+        if path == '/ws' or path.endswith('/ws'):
             self._websocket()
+        elif path == '/api/state':
+            self._state()
         elif path in ('/', '/index.html'):
+            # The dashboard, not the terminal. Reading a list is what a phone
+            # is here for; the terminal is for the one thing that genuinely
+            # needs a pty, and lives a click away.
+            self._asset('dash.html')
+        elif path == CONSOLE:
             self._asset('index.html')
+        elif path == CONSOLE.rstrip('/'):
+            self._redirect(CONSOLE)
         elif path == '/healthz':
             self._bytes(b'{"ok":true}\n', _ASSET_TYPES['.json'])
+        elif path.startswith(CONSOLE):
+            self._asset(path[len(CONSOLE):])
         else:
             self._asset(path.lstrip('/'))
+
+    def _redirect(self, where: str) -> None:
+        self.send_response(302)
+        self.send_header('Location', where)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def _state(self) -> None:
+        """The dashboard's model, as JSON.
+
+        Served from a cached background refresh rather than fetched here: a
+        fetch is an SSH round trip to every gateway, and a phone polling on a
+        timer would otherwise open more connections than a person ever did.
+        """
+        source = self.server.state
+        if source is None:
+            self._bytes(b'{"error":"no state source"}\n',
+                        _ASSET_TYPES['.json'])
+            return
+        body = json.dumps(source.snapshot(), ensure_ascii=False)
+        self._bytes(body.encode('utf-8'), _ASSET_TYPES['.json'])
 
     def _asset(self, name: str) -> None:
         # Names come off the wire; only ever serve a plain file from one
@@ -475,6 +517,9 @@ class Server(http.server.ThreadingHTTPServer):
         self.argv = list(argv)
         self.env = dict(env or {})
         self.verbose = bool(verbose)
+        # One refresh loop for every client. Started by serve(); None in the
+        # tests that only exercise the transport.
+        self.state = None
 
 
 # ── entry point ───────────────────────────────────────────────────────────
@@ -490,6 +535,11 @@ def default_argv() -> list[str]:
 def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
           argv: list[str] | None = None, verbose: bool = False) -> None:
     server = Server((host, port), argv or default_argv(), verbose=verbose)
+    # One background refresh shared by every client. Started before the first
+    # request so the dashboard has something to draw rather than an empty
+    # list that looks like "no sessions".
+    server.state = statesource.StateSource()
+    server.state.start()
     where = f'http://{host}:{port}/'
     print(f'[atmux-web] serving {" ".join(server.argv)} on {where}')
     if host in ('127.0.0.1', 'localhost', '::1'):
