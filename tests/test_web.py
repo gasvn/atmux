@@ -457,12 +457,25 @@ class TouchKeypadTests(unittest.TestCase):
             cls.html = f.read()
 
     def _page(self, name):
-        # Anchored to the start of the line: "atmux: [" contains "tmux: [",
-        # and an unanchored search silently returns the wrong page.
-        block = re.search(r'^    ' + name + r': \[(.*?)\n    \]',
-                          self.js, re.S | re.M)
-        self.assertIsNotNone(block, f'no {name} page in the keypad')
-        return re.findall(r"\['([^']+)', ", block.group(1))
+        """Every key label on one keypad page.
+
+        Brace-matched rather than pattern-matched: the pages nest, and a
+        non-greedy regex quietly returned a different page's keys -- which is
+        worse than failing, because the assertion still passes.
+        """
+        start = re.search(r'^    ' + name + r': \{', self.js, re.M)
+        self.assertIsNotNone(start, f'no {name} page in the keypad')
+        index, depth = start.end() - 1, 0
+        while index < len(self.js):
+            if self.js[index] == '{':
+                depth += 1
+            elif self.js[index] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        return re.findall(r"\['((?:[^'\\]|\\.)*)'",
+                          self.js[start.end():index])
 
     def test_the_keypad_offers_every_key_atmux_binds(self):
         """A bound key with no button is unreachable on a phone. This fails
@@ -544,6 +557,41 @@ class TouchKeypadTests(unittest.TestCase):
         time."""
         self.assertIn("getElementById('kbd')", self.js)
         self.assertIn('changedTouches.length === 2', self.js)
+
+    def test_the_page_carries_its_own_alphabet(self):
+        """iOS would not raise its own keyboard by any route we could find --
+        focus() presents one only as a side effect of scrolling the element
+        into view, and every path into that was either suppressed by xterm or
+        lost to whichever control was touched. Keys that are just bytes on the
+        websocket cannot fail that way, so the page brings its own."""
+        letters = set(re.findall(r"\['([a-z])','\1'\]", self.js))
+        missing = set('abcdefghijklmnopqrstuvwxyz') - letters
+        self.assertEqual(missing, set(), f'no key for: {sorted(missing)}')
+
+    def test_a_session_name_can_be_typed_without_the_os_keyboard(self):
+        """`n` accepts config.NEW_SESSION_RE, so a name made only of the
+        characters it allows has to be typeable on the pad."""
+        from autotmux import config
+        on_pad = set(self._page('abc')) | set(self._page('num'))
+        on_pad |= {c.upper() for c in on_pad if len(c) == 1}   # via shift
+        for name in ('train2', 'sweep_A', 'tu-debug', 'run@gpu', 'a+b'):
+            with self.subTest(name=name):
+                self.assertRegex(name, config.NEW_SESSION_RE)
+                unreachable = [c for c in name if c not in on_pad]
+                self.assertEqual(unreachable, [],
+                                 f'cannot type {unreachable} in {name!r}')
+
+    def test_shift_reaches_uppercase(self):
+        self.assertIn("'shift'", self.js)
+        self.assertIn('toUpperCase()', self.js)
+
+    def test_switching_page_retells_the_terminal_its_size(self):
+        """The keyboard is four rows and nav is one. Without a refit the
+        terminal keeps drawing rows that are now behind the keys."""
+        body = re.search(r'function buildPage\(name\) \{(.*?)\n  \}',
+                         self.js, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn('refit()', body.group(1))
 
     def test_pinch_zooms_the_font_and_not_the_page(self):
         """A zoomed viewport leaves you panning a grid that no longer fits,

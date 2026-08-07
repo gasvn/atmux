@@ -162,30 +162,59 @@
   // Not a terminal keyboard. These are the keys atmux actually uses, and a
   // generic Ctrl/Esc/Tab row was the wrong tool: on this screen you navigate
   // and you act, and both are single keys.
-  var ESC = '\x1b';
+  var ESC = '\x1b', BS = '\x7f';
   var PAGES = {
-    nav: [
+    nav: { wrap: true, rows: [[
       ['↑', ESC + '[A', 'rep'], ['↓', ESC + '[B', 'rep'],
       ['⏎ attach', '\r', 'wide'],
       ['←', ESC + '[D', 'rep'], ['→', ESC + '[C', 'rep'],
       ['esc', ESC], ['q', 'q']
-    ],
+    ]] },
     // Grouped the way the help screen groups them: connect, then session
     // lifecycle, then view.
-    atmux: [
+    atmux: { wrap: true, rows: [[
       ['s', 's'], ['o', 'o'], ['t', 't'],
       ['v', 'v'], ['e', 'e'], ['n', 'n'], ['x', 'x'],
       ['k', 'k'], ['j', 'j'], ['z', 'z'], ['g', 'g'],
       ['r', 'r'], ['?', '?']
-    ],
+    ]] },
     // Once you attach, the keys that matter are tmux's, and detach is the one
     // nobody can guess -- it is the whole reason the handover banner exists.
-    tmux: [
+    tmux: { wrap: true, rows: [[
       ['detach', '\x02d', 'wide'],
       ['^C', '\x03'], ['^D', '\x04'], ['^Z', '\x1a'],
       ['^B', '\x02'], ['tab', '\t'],
       ['PgUp', ESC + '[5~', 'rep'], ['PgDn', ESC + '[6~', 'rep']
-    ]
+    ]] },
+    // Our own keyboard, because iOS will not reliably raise its own: focus()
+    // presents the keyboard only as a side effect of scrolling the element
+    // into view, and every route into that behaviour is either suppressed by
+    // xterm (preventScroll) or lost to whichever control was touched. These
+    // keys are just bytes on the websocket, so they cannot fail that way.
+    //
+    // Typing here is rare and short -- naming a session, a note, a cluster --
+    // so the layout optimises for finding a key once, not for touch-typing.
+    abc: { rows: [
+      [['q','q'],['w','w'],['e','e'],['r','r'],['t','t'],
+       ['y','y'],['u','u'],['i','i'],['o','o'],['p','p']],
+      [['a','a'],['s','s'],['d','d'],['f','f'],['g','g'],
+       ['h','h'],['j','j'],['k','k'],['l','l']],
+      [['⇧', null, 'shift'],['z','z'],['x','x'],['c','c'],['v','v'],
+       ['b','b'],['n','n'],['m','m'],['⌫', BS, 'rep']],
+      [['123', null, 'layer:num'],['-','-'],['_','_'],
+       ['space', ' ', 'wide'],['.','.'],['/','/'],['⏎', '\r']]
+    ] },
+    num: { rows: [
+      [['1','1'],['2','2'],['3','3'],['4','4'],['5','5'],
+       ['6','6'],['7','7'],['8','8'],['9','9'],['0','0']],
+      [['-','-'],['_','_'],['=','='],['+','+'],['[','['],
+       [']',']'],['{','{'],['}','}'],['|','|'],['\\','\\']],
+      [[':',':'],[';',';'],["'","'"],['"','"'],[',',','],
+       ['.','.'],['?','?'],['~','~'],['⌫', BS, 'rep']],
+      [['abc', null, 'layer:abc'],['!','!'],['@','@'],['#','#'],
+       ['$','$'],['%','%'],['&','&'],['*','*'],
+       ['space', ' ', 'wide'],['⏎', '\r']]
+    ] }
   };
 
   var keys = document.getElementById('keys');
@@ -202,48 +231,94 @@
     haptic();
   }
 
+  // One-shot, like a phone keyboard: it releases after the next letter rather
+  // than latching, because the thing being typed is a name, not a sentence.
+  var shift = false;
+  function setShift(on) {
+    shift = on;
+    Array.prototype.forEach.call(keys.querySelectorAll('.key'),
+      function (button) {
+        if (button.dataset.shift === 'y') {
+          button.classList.toggle('on', on);
+        } else if (button.dataset.letter) {
+          button.textContent = on ? button.dataset.letter.toUpperCase()
+                                  : button.dataset.letter;
+        }
+      });
+  }
+
   function buildPage(name) {
     page = name;
     keys.textContent = '';
-    PAGES[name].forEach(function (entry) {
-      var label = entry[0], seq = entry[1], flag = entry[2];
-      var button = document.createElement('button');
-      button.className = 'key' + (flag === 'wide' ? ' wide' : '');
-      button.textContent = label;
-      button.setAttribute('aria-label', label);
-      // pointerdown, not click: a key should fire the moment it is touched,
-      // and holding an arrow should repeat rather than needing ten taps.
-      var timer = null, interval = null;
-      function down(event) {
-        event.preventDefault();
-        press(seq);
-        button.classList.add('down');
-        if (flag === 'rep') {
-          timer = setTimeout(function () {
-            interval = setInterval(function () { press(seq); }, 70);
-          }, 400);
-        }
-      }
-      function up() {
-        button.classList.remove('down');
-        clearTimeout(timer); clearInterval(interval);
-        timer = interval = null;
-      }
-      button.addEventListener('pointerdown', down);
-      button.addEventListener('pointerup', up);
-      button.addEventListener('pointercancel', up);
-      button.addEventListener('pointerleave', up);
-      // Stop the browser turning a held key into a text selection or a
-      // context menu.
-      button.addEventListener('contextmenu', function (e) {
-        e.preventDefault();
+    PAGES[name].rows.forEach(function (row) {
+      var line = document.createElement('div');
+      line.className = 'krow' + (PAGES[name].wrap ? ' wrap' : '');
+      row.forEach(function (entry) {
+        line.appendChild(buildKey(entry[0], entry[1], entry[2]));
       });
-      keys.appendChild(button);
+      keys.appendChild(line);
     });
+    shift = false;
     Array.prototype.forEach.call(
       document.querySelectorAll('#tabs [data-page]'), function (tab) {
-        tab.classList.toggle('on', tab.dataset.page === name);
+        tab.classList.toggle('on', tab.dataset.page === name
+                             || (name === 'num' && tab.dataset.page === 'abc'));
       });
+    // The pad's height changes with the page -- the keyboard is four rows and
+    // nav is one -- and the terminal has to be told, or tmux keeps drawing for
+    // rows that are now behind the keys.
+    refit();
+  }
+
+  function buildKey(label, seq, flag) {
+    var button = document.createElement('button');
+    button.className = 'key' + (flag === 'wide' ? ' wide' : '');
+    button.textContent = label;
+    button.setAttribute('aria-label', label);
+    if (flag === 'shift') button.dataset.shift = 'y';
+    if (/^[a-z]$/.test(seq || '')) button.dataset.letter = seq;
+
+    var timer = null, interval = null;
+    function fire() {
+      if (flag === 'shift') { setShift(!shift); return; }
+      if (flag && flag.indexOf('layer:') === 0) {
+        buildPage(flag.slice(6));
+        return;
+      }
+      var out = seq;
+      if (shift && button.dataset.letter) {
+        out = seq.toUpperCase();
+        setShift(false);
+      }
+      press(out);
+    }
+    // pointerdown, not click: a key should fire the moment it is touched,
+    // and holding an arrow should repeat rather than needing ten taps.
+    function down(event) {
+      event.preventDefault();
+      fire();
+      button.classList.add('down');
+      if (flag === 'rep') {
+        timer = setTimeout(function () {
+          interval = setInterval(fire, 70);
+        }, 400);
+      }
+    }
+    function up() {
+      button.classList.remove('down');
+      clearTimeout(timer); clearInterval(interval);
+      timer = interval = null;
+    }
+    button.addEventListener('pointerdown', down);
+    button.addEventListener('pointerup', up);
+    button.addEventListener('pointercancel', up);
+    button.addEventListener('pointerleave', up);
+    // Stop the browser turning a held key into a text selection or a context
+    // menu.
+    button.addEventListener('contextmenu', function (e) {
+      e.preventDefault();
+    });
+    return button;
   }
 
   Array.prototype.forEach.call(

@@ -39,9 +39,14 @@
     padding-bottom: env(safe-area-inset-bottom);
     user-select: none; -webkit-user-select: none;
   }
-  #keys {
-    display: flex; flex-wrap: wrap; gap: 6px; padding: 7px 7px 4px;
-  }
+  #keys { padding: 7px 7px 4px; }
+  .krow { display: flex; gap: 5px; margin-bottom: 5px; }
+  .krow.wrap { flex-wrap: wrap; gap: 6px; }
+  /* A keyboard row is fixed-width cells: ten keys must fit across a phone,
+     so they shrink together rather than wrapping into an unrecognisable
+     shape. */
+  .krow:not(.wrap) .key { flex: 1 1 0; min-width: 0; padding: 0 2px; font-size: 16px; }
+  .krow:not(.wrap) .key.wide { flex: 2.4 1 0; font-size: 13px; }
   .key {
     flex: 1 0 auto; min-width: 46px;    /* 44px is Apple's minimum target */
     min-height: 44px; padding: 0 8px;
@@ -53,6 +58,7 @@
   }
   .key.wide { flex: 3 0 auto; }
   .key.down { background: #4a4a58; border-color: #6f6f80; }
+  .key.on { background: #3c5a8a; border-color: #5b82bd; color: #fff; }
   #tabs {
     display: flex; gap: 6px; padding: 0 7px 7px; align-items: center;
   }
@@ -94,6 +100,7 @@
       <button data-page="nav">nav</button>
       <button data-page="atmux">atmux</button>
       <button data-page="tmux">tmux</button>
+      <button data-page="abc">abc</button>
       <span class="spacer"></span>
       <button id="fontminus" aria-label="smaller">A−</button>
       <button id="fontplus" aria-label="larger">A+</button>

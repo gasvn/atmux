@@ -1051,8 +1051,8 @@ and unassigned), and without this there is no way to send an arrow, `Esc` or
 
 ```
   ↑     ↓     ⏎ attach     ←     →     esc    q
- ────────────────────────────────────────────────
-  nav  atmux  tmux                    A−  A+  ⌨
+ ──────────────────────────────────────────────────────
+  nav  atmux  tmux  abc                    A−  A+  ⌨
 ```
 
 - **nav** is the default: arrows repeat when held, so a long table is one
@@ -1065,8 +1065,15 @@ and unassigned), and without this there is no way to send an arrow, `Esc` or
 - **A− / A+** and pinch-to-zoom change the font size, and it is remembered.
   Pinch deliberately zooms the *font* and not the page: a zoomed viewport
   leaves you panning a grid that no longer fits.
-- **⌨** raises the software keyboard, which is otherwise kept down. The
-  terminal keeps focus either way (`inputmode="none"`), so an iPad with a
+- **abc** is a full keyboard built into the page. iOS would not reliably
+  raise its own by any route: it presents the keyboard only as a side effect
+  of the scroll-into-view that `focus()` performs, and xterm calls
+  `focus({preventScroll: true})`, which suppresses it silently. Keys that are
+  just bytes on the websocket cannot fail that way. Shift is one-shot, `123`
+  reaches the symbols, and a test checks that every character
+  `NEW_SESSION_RE` accepts can actually be typed.
+- **⌨** still asks the OS for its keyboard, for anyone whose platform obliges.
+  The terminal keeps focus either way (`inputmode="none"`), so an iPad with a
   hardware keyboard behaves like a desktop and never loses half its screen to
   a keyboard it does not need.
 
