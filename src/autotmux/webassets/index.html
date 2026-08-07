@@ -30,9 +30,23 @@
     display: flex; flex-direction: column;
     height: 100dvh;
     transform-origin: top left;
+    /* viewport-fit=cover puts the page under the notch and the rounded
+       corners, which is what makes the background reach every edge -- but it
+       also means the insets are ours to apply. Without these the notch sits
+       on top of a column of the terminal, and what you see is a black band
+       down one side in landscape. */
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    box-sizing: border-box;
   }
   #term {
-    flex: 1 1 auto; min-height: 0; padding: 2px 4px;
+    flex: 1 1 auto; min-height: 0;
+    /* No horizontal padding. FitAddon floors the column count, so the
+       terminal is already narrower than its box by up to one character --
+       spending another eight pixels on padding widens that gap for nothing.
+       The background matches so the remainder does not read as a border. */
+    padding: 2px 0 0 2px;
+    background: #0b0b0c;
     touch-action: pan-y;                /* keep vertical scroll, drop the
                                            double-tap-to-zoom delay */
   }
@@ -42,6 +56,7 @@
     flex: 0 0 auto; display: block;
     background: #141418; border-top: 1px solid #2a2a30;
     padding-bottom: env(safe-area-inset-bottom);
+    box-sizing: border-box;
     user-select: none; -webkit-user-select: none;
   }
   /* Typing mode: xterm's helper textarea is normally a one-cell element

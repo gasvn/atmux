@@ -805,3 +805,50 @@ class MountPathTests(unittest.TestCase):
         self.assertEqual(derive('/term/'), '/term/ws')
         self.assertEqual(derive('/term/index.html'), '/term/ws')
         self.assertEqual(derive('/a/b/'), '/a/b/ws')
+
+
+class SafeAreaTests(unittest.TestCase):
+    """viewport-fit=cover is what lets the background reach every edge of a
+    notched phone -- and it makes the insets ours to apply. Skip them and the
+    notch sits on top of a column of the terminal, which reads as a black band
+    down one side."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(web.ASSETS, 'index.html'), encoding='utf-8') as f:
+            cls.html = f.read()
+
+    def test_cover_is_paired_with_every_inset(self):
+        """Taking the full screen without handing back the insets is the bug;
+        one implies the other."""
+        if 'viewport-fit=cover' not in self.html:
+            self.skipTest('not claiming the full screen')
+        for side in ('left', 'right', 'bottom'):
+            with self.subTest(side=side):
+                self.assertIn(f'env(safe-area-inset-{side})', self.html)
+
+    def test_the_inset_padding_does_not_shrink_the_box_it_is_on(self):
+        """Padding on a fixed, full-width element without border-box makes it
+        wider than the screen, which trades a black band for a scrollbar."""
+        app = re.search(r'#app \{(.*?)\}', self.html, re.S)
+        self.assertIsNotNone(app)
+        self.assertIn('box-sizing: border-box', app.group(1))
+
+    def test_the_terminal_spends_no_width_on_padding(self):
+        """FitAddon floors the column count, so the terminal is already
+        narrower than its box by up to one character; horizontal padding
+        widens that remainder for nothing."""
+        term = re.search(r'#term \{(.*?)\}', self.html, re.S)
+        self.assertIsNotNone(term)
+        padding = re.search(r'padding: ([^;]+);', term.group(1))
+        self.assertIsNotNone(padding)
+        parts = padding.group(1).split()
+        # top right bottom left -- right must be 0, and left at most a hair.
+        right = parts[1] if len(parts) > 1 else parts[0]
+        self.assertEqual(right, '0', f'terminal padding: {padding.group(1)}')
+
+    def test_the_remainder_matches_the_terminal_background(self):
+        """Whatever the flooring leaves over is visible; it should read as
+        part of the terminal rather than as a border around it."""
+        term = re.search(r'#term \{(.*?)\}', self.html, re.S)
+        self.assertIn('#0b0b0c', term.group(1))
