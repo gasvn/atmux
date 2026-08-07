@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import unittest
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -239,6 +240,18 @@ class _ServedFixture(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
 
+    def _open(self, path='/ws'):
+        sock = socket.create_connection((self.host, self.port), timeout=15)
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall(
+            f'GET {path} HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n'
+            f'Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n'
+            f'Sec-WebSocket-Version: 13\r\n\r\n'.encode())
+        head = b''
+        while b'\r\n\r\n' not in head:
+            head += sock.recv(4096)
+        return sock, key, head.decode('latin-1')
+
     def get(self, path: str) -> tuple[str, bytes]:
         sock = socket.create_connection((self.host, self.port), timeout=10)
         sock.sendall(f'GET {path} HTTP/1.1\r\nHost: t\r\n'
@@ -382,18 +395,6 @@ class AssetTests(_ServedFixture):
 
 
 class WebsocketBridgeTests(_ServedFixture):
-    def _open(self):
-        sock = socket.create_connection((self.host, self.port), timeout=15)
-        key = base64.b64encode(os.urandom(16)).decode()
-        sock.sendall(
-            f'GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n'
-            f'Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n'
-            f'Sec-WebSocket-Version: 13\r\n\r\n'.encode())
-        head = b''
-        while b'\r\n\r\n' not in head:
-            head += sock.recv(4096)
-        return sock, key, head.decode('latin-1')
-
     def test_the_upgrade_completes_and_proves_it_read_the_key(self):
         sock, key, head = self._open()
         try:
@@ -1209,7 +1210,9 @@ class ControlSurfaceTests(_ServedFixture):
     def test_a_touch_client_asks_for_buttons_in_its_socket_url(self):
         url = _extract(self.js, 'socketURL')
         self.assertIn('touch=1', url)
-        self.assertIn('touch ?', url, 'the flag must depend on the client')
+        # Conditional on the client, not always sent: a laptop asking for
+        # buttons is a laptop whose footer gets hidden for nothing.
+        self.assertRegex(url, r'if \(touch\)')
 
     def test_the_server_only_tells_the_app_when_the_client_said_so(self):
         handler = web.Handler.__new__(web.Handler)
@@ -1409,3 +1412,152 @@ class DashboardStateTests(unittest.TestCase):
         source = self.statesource.StateSource(pool=Refusing())
         self.assertFalse(source.refresh())
         self.assertIsNone(source.snapshot()['age'])
+
+
+class AttachTargetTests(_ServedFixture):
+    """A tap on a row has to land in that session.
+
+    Opening the dashboard instead is a screen that costs a tap and answers
+    nothing -- it is the same list you just tapped, which is exactly how it
+    was reported. The target rides in the socket URL because the pty is
+    created when the socket is upgraded and there is no channel before that.
+    """
+
+    def argv_for(self, path: str) -> list:
+        handler = web.Handler.__new__(web.Handler)
+        handler.server = self.server
+        handler.path = path
+        return handler._client_argv()
+
+    def test_a_valid_target_reaches_the_program(self):
+        self.assertEqual(
+            self.argv_for('/ws?attach=holygpu8a11104:newclaw'),
+            list(self.COMMAND) + ['--attach=holygpu8a11104:newclaw'])
+
+    def test_the_other_verb_opens_the_dashboard_standing_on_the_row(self):
+        """Two verbs cover every action rather than one flag per action:
+        renew, kill, note, view output and ssh all act on the highlighted
+        row, so landing on the right row makes all of them reachable."""
+        self.assertEqual(
+            self.argv_for('/ws?select=holygpu8a11104:newclaw'),
+            list(self.COMMAND) + ['--select=holygpu8a11104:newclaw'])
+
+    def test_only_the_verbs_on_the_list_are_accepted(self):
+        """A whitelist, not a passthrough: this arrives in a URL."""
+        for verb in ('run', 'exec', 'shell', 'open-url', 'cluster'):
+            with self.subTest(verb=verb):
+                self.assertEqual(self.argv_for(f'/ws?{verb}=n:s'),
+                                 list(self.COMMAND))
+
+    def test_the_target_survives_the_other_parameters(self):
+        self.assertIn('--attach=login--zgx:autoscientists',
+                      self.argv_for('/ws?touch=1&attach='
+                                    'login--zgx%3Aautoscientists'))
+
+    def test_it_is_one_argv_element_so_nothing_can_split_it(self):
+        """`--attach -- value` does not survive argparse, and a separate word
+        whose value starts with a dash is read as an option."""
+        extra = self.argv_for('/ws?attach=n:s')[len(self.COMMAND):]
+        self.assertEqual(len(extra), 1)
+        self.assertTrue(extra[0].startswith('--attach='))
+
+    def test_a_target_that_is_not_one_is_refused_rather_than_passed_on(self):
+        """This arrives in a URL, and a URL is untrusted: anyone who can
+        reach this socket can craft one. Refusing leaves the dashboard, which
+        is the safe thing to open."""
+        for value in ('--version', '-rf:x', 'nocolon', 'node:sess;rm -rf /',
+                      'a' * 200 + ':b', 'n:s\nmore', '', ':', 'n:', ':s',
+                      '$(id):x', '../../etc:passwd'):
+            for verb in ('attach', 'select'):
+                with self.subTest(verb=verb, value=value):
+                    path = (f'/ws?{verb}='
+                            + urllib.parse.quote(value, safe=''))
+                    self.assertEqual(self.argv_for(path), list(self.COMMAND))
+
+    def test_the_socket_closes_saying_the_program_finished(self):
+        """A phone drops this socket every time it locks, so the page
+        reconnects by default. Detaching must not leave you watching a
+        terminal reconnect to nothing forever."""
+        sock, _key, _head = self._open()
+        try:
+            sock.sendall(client_frame(b'', 0x8))       # ask it to close
+            raw = b''
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            sock.close()
+        # /bin/cat is still running -- the client hung up, the program did
+        # not finish -- so this close must NOT claim it did.
+        self.assertNotIn(b'exit', raw)
+
+    def test_a_program_that_finishes_says_so(self):
+        server = web.Server(('127.0.0.1', 0), ['/bin/echo', 'done'])
+        host, port = server.server_address[:2]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            sock = socket.create_connection((host, port), timeout=15)
+            key = base64.b64encode(os.urandom(16)).decode()
+            sock.sendall(
+                f'GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n'
+                f'Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n'
+                f'Sec-WebSocket-Version: 13\r\n\r\n'.encode())
+            raw = b''
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                try:
+                    chunk = sock.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                raw += chunk
+            sock.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        # A close frame carrying 1000 and the reason the page keys off.
+        self.assertIn(struct.pack('!H', 1000) + b'exit', raw)
+
+
+class AttachLinkTests(unittest.TestCase):
+    """The two pages either side of the tap."""
+
+    @classmethod
+    def setUpClass(cls):
+        for name in ('dash.js', 'app.js'):
+            with open(os.path.join(web.ASSETS, name), encoding='utf-8') as f:
+                setattr(cls, name.split('.')[0], f.read())
+
+    def test_a_row_offers_both_verbs(self):
+        """Attaching is what you want nine times in ten; everything else
+        lives on the row the dashboard is standing on."""
+        self.assertIn("go('attach', row)", self.dash)
+        self.assertIn("go('select', row)", self.dash)
+        self.assertIn("stopPropagation", self.dash)
+
+    def test_the_list_puts_the_session_in_the_link(self):
+        body = _extract(self.dash, 'go')
+        self.assertIn('searchParams.set(verb', body)
+        self.assertIn("row.node + ':' + row.session", body)
+        # The routing name, not the label: login:zgx is for reading.
+        self.assertNotIn('node_label', body)
+
+    def test_only_a_real_session_gets_a_target(self):
+        """A node with no sessions has nothing to attach to, and asking for
+        one would be asking for a session named after a sentinel."""
+        self.assertIn("row.kind === 'session'", _extract(self.dash, 'go'))
+
+    def test_the_console_forwards_the_target_to_the_socket(self):
+        body = _extract(self.app, 'socketURL')
+        self.assertIn("'attach', 'select'", body)
+        self.assertIn('encodeURIComponent', body)
+
+    def test_a_finished_program_returns_to_the_list(self):
+        self.assertIn("event.reason === 'exit'", self.app)
+        self.assertIn("event.code === 1000", self.app)

@@ -75,12 +75,24 @@
   function socketURL() {
     var scheme = location.protocol === 'https:' ? 'wss' : 'ws';
     var base = location.pathname.replace(/[^/]*$/, '');
-    // Say whether this client draws its own controls. It is a property of
-    // the client, not of the server -- a phone and a laptop reach the same
-    // process -- and the socket URL is the only place to say it before the
-    // dashboard exists to be told.
+    // Everything the pty needs to know goes here, because the pty is created
+    // when this socket is upgraded and there is no channel before that.
+    //
+    //   touch   whether this client draws its own controls -- a property of
+    //           the client, not the server: a phone and a laptop reach the
+    //           same process
+    //   attach  which session to land in, forwarded from the page's own URL
+    //           so that tapping a row on the list goes to that session
+    //           rather than to a second copy of the list
+    var query = [];
+    if (touch) query.push('touch=1');
+    var here = new URLSearchParams(location.search);
+    ['attach', 'select'].forEach(function (verb) {
+      var target = here.get(verb);
+      if (target) query.push(verb + '=' + encodeURIComponent(target));
+    });
     return scheme + '://' + location.host + base + 'ws' +
-           (touch ? '?touch=1' : '');
+           (query.length ? '?' + query.join('&') : '');
   }
 
   function connect() {
@@ -88,10 +100,18 @@
     ws.binaryType = 'arraybuffer';
     ws.onopen = function () { retry = 0; say('connected'); sendResize(); };
     ws.onmessage = function (event) { term.write(new Uint8Array(event.data)); };
-    ws.onclose = function () {
+    ws.onclose = function (event) {
       if (closed) return;
-      // A phone drops the socket every time it locks or changes network, so
-      // reconnecting is the normal case, not the exceptional one.
+      // The program finished -- you detached, or quit the dashboard. Going
+      // back to the list is what happens next; reconnecting would put you on
+      // a terminal reconnecting to nothing, forever.
+      if (event && event.code === 1000 && event.reason === 'exit') {
+        closed = true;
+        location.href = new URL('../', location.href).toString();
+        return;
+      }
+      // Otherwise the socket dropped, which a phone does every time it locks
+      // or changes network -- the normal case, not the exceptional one.
       retry = Math.min(retry + 1, 6);
       say('reconnecting…', true);
       setTimeout(connect, Math.min(500 * Math.pow(2, retry - 1), 10000));

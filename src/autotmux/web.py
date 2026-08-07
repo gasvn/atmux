@@ -36,6 +36,7 @@ import struct
 import sys
 import termios
 import threading
+import urllib.parse
 
 from . import config
 from . import keypad
@@ -423,6 +424,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._pump()
 
+    # NODE:SESSION, strictly. Anchored, bounded, and refusing a leading dash
+    # so the value can never be read as an option however it is passed on.
+    # This arrives in a URL, and a URL is untrusted: anyone who can reach
+    # this socket can craft one.
+    _ATTACH = re.compile(r'^(?![-])[A-Za-z0-9._@-]{1,120}'
+                         r':(?![-])[A-Za-z0-9._@-]{1,120}$')
+
+    def _query(self) -> dict:
+        raw = self.path.split('?', 1)[1] if '?' in self.path else ''
+        out = {}
+        for part in raw.split('&'):
+            if not part:
+                continue
+            key, _, value = part.partition('=')
+            out[urllib.parse.unquote_plus(key)] = urllib.parse.unquote_plus(
+                value)
+        return out
+
+    # What a link may ask the program to do, and the flag it becomes. Two
+    # entries rather than one per action on purpose: `attach` is the verb you
+    # want nine times in ten, and `select` covers every other one at once --
+    # every action in the dashboard acts on the highlighted row, so landing
+    # on the right row makes all of them reachable without a keyboard and
+    # without a flag each.
+    #
+    # A whitelist, not a passthrough: this arrives in a URL.
+    _VERBS = {'attach': '--attach', 'select': '--select'}
+
+    def _client_argv(self) -> list:
+        """What to run for this client: the dashboard, or one session.
+
+        Tapping a row on the list has to land on that session. Opening the
+        dashboard instead is a screen that costs a tap and answers nothing --
+        it is the same list you just tapped.
+
+        The target reaches the program as its own argv element through
+        execvp, never through a shell, and never concatenated into anything.
+        """
+        query = self._query()
+        for verb, flag in self._VERBS.items():
+            target = query.get(verb, '')
+            if target and self._ATTACH.match(target):
+                return list(self.server.argv) + [f'{flag}={target}']
+        return list(self.server.argv)
     def _client_env(self) -> dict:
         """The environment this particular client's dashboard should see.
 
@@ -439,8 +484,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return env
 
     def _pump(self) -> None:
+        ended = False
         conn = self.connection
-        terminal = Terminal(self.server.argv, env=self._client_env())
+        terminal = Terminal(self._client_argv(), env=self._client_env())
         reader = FrameReader()
         conn.setblocking(False)
         try:
@@ -449,7 +495,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if terminal.fd in ready:
                     data = terminal.read()
                     if not data:
-                        break                                # the app exited
+                        ended = True                         # the app exited
+                        break
                     self._send(encode_frame(data))
                 if conn in ready:
                     try:
@@ -467,7 +514,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             terminal.close()
             try:
-                self._send(encode_frame(b'', _OP_CLOSE))
+                # A phone drops this socket every time it locks, so the page
+                # reconnects by default. It must not do that when the program
+                # is simply finished -- detaching from a session would leave
+                # you staring at a terminal reconnecting to nothing.
+                payload = (struct.pack('!H', 1000) + b'exit') if ended else b''
+                self._send(encode_frame(payload, _OP_CLOSE))
             except OSError:
                 pass
             self.close_connection = True

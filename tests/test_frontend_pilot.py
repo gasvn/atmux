@@ -2291,3 +2291,85 @@ class TouchControlSurfaceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.1)
             self.assertEqual([str(b.label) for b in bar.query(autotmux.Button)],
                              before)
+
+
+class PreselectedRowTests(unittest.IsolatedAsyncioTestCase):
+    """`--select NODE:SESSION` opens the dashboard standing on a row.
+
+    One flag rather than one per verb. Every action here acts on the
+    highlighted row, so landing on the right row is what makes renew, kill,
+    note, view-output and ssh reachable from a phone -- none of which has a
+    command line of its own, and none of which needs one.
+    """
+
+    def setUp(self):
+        self._saved_launch = autotmux._launch_daemon
+        autotmux._launch_daemon = lambda: (True, '')
+        self._saved_prewarm = autotmux.AutotmuxApp._prewarm_interactive_async
+
+        async def no_prewarm(_app, _nodes, _source_pool):
+            return None
+
+        autotmux.AutotmuxApp._prewarm_interactive_async = no_prewarm
+        self._layout_dir = tempfile.TemporaryDirectory()
+        self._saved_layout_path = autotmux.config.LAYOUT_PATH
+        autotmux.config.LAYOUT_PATH = os.path.join(
+            self._layout_dir.name, 'layout.json')
+
+    def tearDown(self):
+        autotmux._launch_daemon = self._saved_launch
+        autotmux.AutotmuxApp._prewarm_interactive_async = self._saved_prewarm
+        autotmux.config.LAYOUT_PATH = self._saved_layout_path
+        self._layout_dir.cleanup()
+
+    @asynccontextmanager
+    async def _app(self, select):
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp(select=select)
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await asyncio.sleep(0.4)
+                await pilot.pause()
+                yield app, pilot
+
+    async def test_the_cursor_lands_on_the_row_that_was_asked_for(self):
+        async with self._app(('gpu1', 'train')) as (app, _pilot):
+            self.assertEqual((app.selected_node, app.selected_session),
+                             ('gpu1', 'train'))
+
+    async def test_a_wish_survives_the_empty_first_paint(self):
+        """The first frame is painted against an empty state, and the rule
+        that drops a selection whose row has vanished would drop this one
+        before its row ever arrives."""
+        async with self._app(('localhost', 'main')) as (app, _pilot):
+            self.assertEqual((app.selected_node, app.selected_session),
+                             ('localhost', 'main'))
+
+    async def test_a_row_that_is_not_there_falls_back_rather_than_hanging(self):
+        async with self._app(('nowhere', 'nothing')) as (app, _pilot):
+            self.assertNotEqual(app.selected_node, 'nowhere')
+            self.assertTrue(app.all_sessions)
+
+    async def test_a_layout_with_no_rows_is_overridden_for_this_run_only(self):
+        """Being asked to stand on a row in a layout that shows none cannot
+        be honoured -- and the saved layout decides, so someone who last left
+        the queue on screen would tap a session and arrive somewhere with no
+        sessions in it."""
+        autotmux.config.save_layout('jobs')
+        async with self._app(None) as (app, _pilot):
+            self.assertEqual(app.layout_mode, 'jobs')
+        async with self._app(('gpu1', 'train')) as (app, _pilot):
+            self.assertTrue(autotmux.layout_spec(app.layout_mode)['table'])
+            self.assertEqual((app.selected_node, app.selected_session),
+                             ('gpu1', 'train'))
+        # And their preference is still theirs.
+        self.assertEqual(autotmux.config.load_layout(), 'jobs')
+
+    async def test_a_target_that_is_not_one_is_refused_before_it_gets_here(self):
+        for value in ('--version', 'nocolon', '', ':', 'n:', ':s', None,
+                      'a b:c'):
+            with self.subTest(value=value):
+                self.assertIsNone(autotmux._valid_select(value))
+        self.assertEqual(autotmux._valid_select('gpu1:train'),
+                         ('gpu1', 'train'))

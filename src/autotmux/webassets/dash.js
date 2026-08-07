@@ -97,14 +97,38 @@
       row.load + (row.cpu ? '/' + row.cpu : '')));
     button.appendChild(right);
 
-    // One action for now, and it is the honest one: acting on a session
-    // still happens in the dashboard's own UI, which is a terminal. Opening
-    // it here at least starts you on the right screen.
-    button.addEventListener('click', function () {
-      location.href = new URL('console/', location.href).toString();
-    });
+    // Land *on* the session, not on a second copy of this list. A tap that
+    // opens the dashboard is a screen that costs a tap and answers nothing,
+    // which is exactly what it did before the target rode along.
+    button.addEventListener('click', function () { go('attach', row); });
     item.appendChild(button);
+
+    // The other verb. Everything the dashboard can do -- renew, kill, note,
+    // view output, ssh, new window -- acts on the highlighted row, so opening
+    // it *on* this row makes all of them reachable rather than adding a
+    // button here for each and a flag over there for each.
+    if (row.kind === 'session') {
+      var more = document.createElement('button');
+      more.className = 'more';
+      more.type = 'button';
+      more.textContent = '⋯';
+      more.setAttribute('aria-label', 'actions for ' + row.label);
+      more.addEventListener('click', function (event) {
+        event.stopPropagation();
+        go('select', row);
+      });
+      item.appendChild(more);
+    }
     return item;
+  }
+
+  function go(verb, row) {
+    var url = new URL('console/', location.href);
+    if (row.kind === 'session' && row.node && row.session) {
+      // The routing name, not the label: login:zgx is for reading.
+      url.searchParams.set(verb, row.node + ':' + row.session);
+    }
+    location.href = url.toString();
   }
 
   function render(data) {

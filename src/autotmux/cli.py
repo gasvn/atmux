@@ -3497,9 +3497,12 @@ class AutotmuxApp(App):
     title = reactive(f"AutoTmux v{__version__}")
     sub_title = reactive("")
 
-    def __init__(self, *, offer_connection_setup: bool = False) -> None:
+    def __init__(self, *, offer_connection_setup: bool = False,
+                 select: tuple[str, str] | None = None) -> None:
         super().__init__()
         self._connection_setup_pending = bool(offer_connection_setup)
+        # (node, session) to open on, from --select. See on_mount.
+        self._select = select
         self._connection_manager_open = False
         self._help_open = False
         self._restart_attempts = []   # time.monotonic() of recent daemon restarts
@@ -3518,6 +3521,14 @@ class AutotmuxApp(App):
         try:
             self.layout_mode = config.load_layout()
         except Exception:
+            self.layout_mode = config.LAYOUT_DEFAULT
+        # Being asked to stand on a row, in a layout that shows no rows, is a
+        # request that cannot be honoured -- and it is the saved layout that
+        # decides, so someone who last left the queue on screen would tap a
+        # session and arrive somewhere with no sessions in it. Overridden for
+        # this run only: not saved, so a plain `atmux` still opens the way
+        # they left it.
+        if select and not layout_spec(self.layout_mode)['table']:
             self.layout_mode = config.LAYOUT_DEFAULT
         _apply_idle_thresholds()
         # A timed-out NFS registry read keeps running on its daemon thread.
@@ -3592,8 +3603,13 @@ class AutotmuxApp(App):
             self.set_interval(0.25, self._sync_touch_bar)
 
         self.all_sessions: list = []
-        self.selected_node = ""
-        self.selected_session = ""
+        # The row the cursor should land on. _refresh_table restores the
+        # cursor by (node, session) on every rebuild, so seeding it here is
+        # the whole of --select: the first paint already has the right row
+        # highlighted, and every action acts on the highlighted row.
+        preselect = getattr(self, '_select', None)
+        self.selected_node = preselect[0] if preselect else ""
+        self.selected_session = preselect[1] if preselect else ""
         # Latest daemon state (kept so the keep-alive toggle can look up the
         # highlighted row's job id/name without another read).
         self._last_state: dict = {}
@@ -3976,6 +3992,12 @@ class AutotmuxApp(App):
         # Structural change — full rebuild. Restore the cursor by
         # (node, session) so it sticks even if rows reorder.
         previous = (self.selected_node, self.selected_session)
+        # A row asked for with --select is a wish, not a selection: the first
+        # paint runs against an empty state, and the rule that drops a
+        # selection whose row has vanished would drop this one before its row
+        # ever arrives. Held separately until it does.
+        if getattr(self, '_select', None):
+            previous = self._select
         self.all_sessions = rows
         self.table.clear()
         for r in rows:
@@ -3994,6 +4016,9 @@ class AutotmuxApp(App):
             for i, r in enumerate(rows):
                 if (r[0], r[1]) == previous:
                     new_idx = i
+                    # Granted. From here it is an ordinary selection and
+                    # moves like one.
+                    self._select = None
                     break
             self.table.move_cursor(row=new_idx)
             # Reconcile the tracked selection with the row the cursor actually
@@ -5599,6 +5624,23 @@ def _published_direct_preference(node: str) -> bool:
     return _node_network_degraded(state, node)
 
 
+def _valid_select(target) -> tuple[str, str] | None:
+    """`NODE:SESSION` for --select, or None.
+
+    Same shape and the same scepticism as --attach: this reaches the process
+    from a browser URL by way of the web server, and a value that is not a
+    target should open the dashboard rather than something surprising.
+    """
+    if not isinstance(target, str) or ':' not in target:
+        return None
+    node, _, session = target.partition(':')
+    if not node or not session:
+        return None
+    if node != 'localhost' and not _valid_node(node):
+        return None
+    return node, session
+
+
 def _direct_attach(target: str) -> int:
     """`atmux -a NODE:SESSION` — skip the TUI and attach directly.
 
@@ -5698,6 +5740,13 @@ def _build_argparser():
                         help='Skip the TUI and attach directly to NODE:SESSION.')
     target.add_argument('--shell', dest='shell_node', metavar='NODE',
                         help='Skip the TUI and open a shell directly on NODE.')
+    target.add_argument(
+        '--select', dest='select', metavar='NODE:SESSION',
+        help='Open the TUI with this row already under the cursor. One flag '
+             'rather than one per verb: every action the dashboard has acts '
+             'on the highlighted row, so landing on the right row is what '
+             'makes all of them reachable from somewhere that is not a '
+             'keyboard.')
     target.add_argument(
         '--open-url', dest='open_url', metavar='URL',
         help='Attach from an atmux://attach/NODE/SESSION link. The URL is '
@@ -5962,6 +6011,7 @@ def main():
     # recovery worker when no singleton lock is held.
     AutotmuxApp(
         offer_connection_setup=_should_offer_connection_setup(args),
+        select=_valid_select(getattr(args, 'select', None)),
     ).run(mouse=_want_mouse(args))
 
 
