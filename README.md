@@ -1028,13 +1028,64 @@ atmux-web                       # binds 127.0.0.1:7681 only
 tailscale serve --bg 7681       # HTTPS, reachable only inside your tailnet
 ```
 
-Then open `https://<your-machine>.tail-scale.ts.net/` and, on iOS, *Add to Home
+Then open `https://<your-machine>.<tailnet>.ts.net/` and, on iOS, *Add to Home
 Screen* — it opens full-screen with its own icon. Nothing here authenticates a
 caller, so **never bind it to `0.0.0.0`**: anything that can open the port gets
-a shell. Loopback plus Tailscale is the whole security model. (If your tailnet
-has no HTTPS certificates, `tailscale serve --bg --http=8080
-http://127.0.0.1:7681` still works — the traffic is WireGuard-encrypted either
-way, but a PWA install wants HTTPS.)
+a shell. Loopback plus Tailscale is the whole security model.
+
+Two things that are not obvious:
+
+- On Linux, `tailscale serve` and `tailscale cert` want root. `sudo tailscale
+  set --operator=$USER` once removes that for good.
+- If your tailnet has no HTTPS certificates, or `serve` is not available,
+  `atmux-web --host <your tailnet IP>` reaches the same peers over plain HTTP.
+  It is the same security posture — `100.64.0.0/10` is the range Tailscale
+  hands out and nothing off the tailnet can route to it — and the traffic is
+  WireGuard-encrypted either way. A PWA install does want HTTPS, though.
+- Renaming a tailnet breaks `serve` until tailscaled restarts: the config is
+  keyed on the new name, the daemon reports the new name, and every request is
+  still answered by its own 404. The direct bind above is the way through it.
+
+### Run it where the machine stays on
+
+A laptop sleeps, and a dashboard you cannot reach is not a dashboard. Put
+`atmux-web` on whichever machine is always up — it needs to reach your login
+nodes, which on a 2FA cluster means riding the same persistent masters the
+desktop client does:
+
+```toml
+# ~/.config/autotmux/config.toml on the always-on host
+[client]
+mode = "gateway"
+gateways = ["k6", "k7", "k8", "b8"]
+control_path = "~/.ssh/cm-ssh2fa-%n"
+```
+
+A systemd user unit makes it start on demand and survive a logout
+(`loginctl enable-linger $USER` once, if it does not already):
+
+```ini
+# ~/.config/systemd/user/atmux-web.service
+[Unit]
+Description=AutoTmux dashboard in a browser
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/venv/atmux/bin/atmux-web --host 127.0.0.1 --port 7681
+Restart=on-failure
+Environment=TERM=xterm-256color
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user start atmux-web     # when you want it
+systemctl --user stop atmux-web      # when you do not
+systemctl --user enable atmux-web    # or have it always there
+journalctl --user -u atmux-web -f    # what it is doing
+```
 
 Dependencies: none. `pty`, `http.server` and a small WebSocket implementation
 are all in the standard library, and xterm.js is vendored in the package
