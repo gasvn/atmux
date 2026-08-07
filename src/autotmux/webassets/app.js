@@ -63,9 +63,18 @@
   // ── connection ────────────────────────────────────────────────────────
   var ws = null, retry = 0, closed = false;
 
-  function connect() {
+  // Relative to the page, not to the host root. `tailscale serve --set-path
+  // /atmux` puts this page at /atmux/, and a hard-coded /ws would reach for a
+  // socket that is not there -- which is how one hostname ends up able to
+  // carry only one service.
+  function socketURL() {
     var scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(scheme + '://' + location.host + '/ws');
+    var base = location.pathname.replace(/[^/]*$/, '');
+    return scheme + '://' + location.host + base + 'ws';
+  }
+
+  function connect() {
+    ws = new WebSocket(socketURL());
     ws.binaryType = 'arraybuffer';
     ws.onopen = function () { retry = 0; say('connected'); sendResize(); };
     ws.onmessage = function (event) { term.write(new Uint8Array(event.data)); };
