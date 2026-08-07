@@ -547,6 +547,52 @@ class TouchKeypadTests(unittest.TestCase):
         self.assertIn(str(keypad.OSC), self.js)
 
 
+    def test_movement_is_the_clients_and_cannot_be_published_away(self):
+        """The regression that made a phone unusable.
+
+        There are two kinds of key. Movement and escape are *terminal*
+        primitives -- true of every program, needed before anything has
+        published and after everything has stopped -- and they belong to this
+        client. Actions belong to the app. Deleting the first kind on the
+        theory that a tap replaces it is what happened, and it does not:
+
+            mouse click on a row : no move
+            finger tap on a row  : no move
+            arrow-down key       : MOVED
+
+        measured against the cursor colour, because the table re-sorts by
+        idle time every few seconds and that looks identical to a selection
+        moving. xterm.js has no touch support (issue #5377), and this table
+        attaches on a single click, so routing taps into it would turn a
+        mis-tap into an attach.
+        """
+        nav = re.search(r'var NAV_KEYS = \[(.*?)\];', self.js, re.S)
+        self.assertIsNotNone(nav, 'the client has no movement keys of its own')
+        sent = re.findall(r"k: '([^']*)'", nav.group(1))
+        self.assertIn('\\x1b[A', sent, 'no way to move up')
+        self.assertIn('\\x1b[B', sent, 'no way to move down')
+        self.assertIn('\\x1b', sent, 'no way out of anything')
+
+    def test_the_app_does_not_publish_movement_because_the_client_owns_it(self):
+        """Two sources for one key is how it ends up in neither."""
+        from autotmux import cli
+        keys = keypad.keys_for({})
+        self.assertEqual(keys, [])
+        for name in ('up', 'down', 'left', 'right'):
+            with self.subTest(key=name):
+                self.assertIn(name, keypad._SKIP)
+
+    def test_movement_survives_the_app_publishing_nothing(self):
+        """A reconnect, a program that is not this dashboard, a handover to
+        tmux: the published set empties and the phone must still work."""
+        render = _extract(self.js, 'renderKeys')
+        # renderKeys owns #keys and must not be able to touch the nav row.
+        self.assertIn("keys.textContent = ''", render)
+        self.assertNotIn('nav.', render)
+        build = _extract(self.js, 'renderNav')
+        self.assertIn('NAV_KEYS', build)
+        self.assertIn('id="nav"', self.html)
+
     def test_no_button_sends_a_key_atmux_does_not_bind(self):
         """A dead button is worse than a missing one: it teaches that the pad
         does not work. Every key comes from a binding that exists, so the

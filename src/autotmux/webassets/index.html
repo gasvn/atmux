@@ -83,6 +83,11 @@
     opacity: 0 !important; z-index: 5;
     resize: none; border: 0; padding: 0;
   }
+  /* Movement sits closest to the thumb and stays put. Nothing below it may
+     reflow it: a navigation key that moves because the app published a
+     different number of actions is a key you have to look for every time. */
+  #nav { padding: 7px 7px 0; }
+  #nav .key { font-size: 15px; }
   #keys { padding: 7px 7px 4px; }
   /* Fixed columns, never wrapping the row: flex-wrap stretched whichever key
      landed alone on the last line into a full-width button, which read as
@@ -143,6 +148,11 @@
        here. Empty until it says something, because a keypad invented for a
        program we cannot ask is a row of buttons that lie. -->
   <div id="pad">
+    <!-- Movement and escape. Not published by the app and not optional: they
+         are terminal primitives, they are the only way to move a cursor on a
+         screen with no keyboard, and they must survive anything the far end
+         does or stops doing. -->
+    <div id="nav"></div>
     <div id="keys"></div>
     <div id="tabs">
       <!-- No pages. The keys come from the dashboard and change with its

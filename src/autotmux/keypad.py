@@ -92,11 +92,20 @@ _NAMED = {
     'asterisk': '*',
 }
 
-# Never worth a button, for three separate reasons:
+# Not published, for three separate reasons. Note what this list is *not*:
+# it is not "keys a phone does not need". Movement is left out because it
+# belongs to the client, which owns terminal primitives and must offer them
+# whether or not anything is publishing -- see NAV_KEYS in app.js.
 #
-#   movement  the list is directly tappable and scrollable -- measured, a tap
-#             on a row moves the selection -- so arrows would spend the most
-#             valuable row on the pad duplicating a gesture that already works
+# It was once left out on the theory that a tap on a row selects it, which
+# is false. Measured against the cursor colour rather than against "did the
+# screen change" (the table re-sorts by idle time every few seconds, which
+# looks the same): a mouse click does not move the selection, a finger tap
+# does not move the selection, an arrow key does. xterm.js has no touch
+# support, and this table attaches on a single click, so routing taps into
+# it would turn a mis-tap into an attach.
+#
+#   movement  the client's, not the app's -- and the only way to move
 #   focus     you focus by touching the thing, so "Focus Next" is a button
 #             whose label means nothing to the person holding the phone
 #   quit      a key that closes the dashboard, one thumb-width from the rest

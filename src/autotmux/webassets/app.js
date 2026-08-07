@@ -193,7 +193,32 @@
   // would be guessing. The pad then offers only the keyboard.
   var KEYS_OSC = 7710;
 
+  // Except these. There are two kinds of key and only one of them belongs to
+  // the app: movement and escape are *terminal* primitives, true of every
+  // program, and they have to work when nothing has published anything at
+  // all -- during a reconnect, inside a program that is not this dashboard,
+  // after a handover to tmux.
+  //
+  // They were briefly deleted on the theory that a tap on a row selects it.
+  // It does not. Measured against the cursor colour rather than against "did
+  // the screen change" -- the table re-sorts by idle time every few seconds,
+  // which looks identical to a selection moving:
+  //
+  //     mouse click on a row : no move
+  //     finger tap on a row  : no move
+  //     arrow-down key       : MOVED
+  //
+  // xterm.js has no touch support (issue #5377, open), and the table attaches
+  // on a single click, so making taps reach it would turn a mis-tap into an
+  // attach. These are the only way to move, and the phone had none.
+  var NAV_KEYS = [
+    { k: '\x1b[A', l: '↑' },
+    { k: '\x1b[B', l: '↓' },
+    { k: '\x1b', l: 'esc' }
+  ];
+
   var keys = document.getElementById('keys');
+  var nav = document.getElementById('nav');
   var expander = document.getElementById('more');
   // Two rows fit under a phone's thumb without eating the dashboard. The
   // rest are one tap away rather than one page away.
@@ -209,6 +234,16 @@
   function press(seq) {
     sendText(seq);
     haptic();
+  }
+
+  function renderNav() {
+    if (!nav || nav.childElementCount) return;      // fixed; built once
+    var line = document.createElement('div');
+    line.className = 'krow';
+    NAV_KEYS.forEach(function (entry) {
+      line.appendChild(buildKey(entry.l, entry.k));
+    });
+    nav.appendChild(line);
   }
 
   function renderKeys() {
@@ -559,9 +594,10 @@
 
   if (touch) {
     document.body.classList.add('touch');
-    // Empty until the dashboard says what its keys are. The controls row is
-    // there from the start because the keyboard and the font size belong to
-    // this client, not to whatever it is showing.
+    // The published keys start empty; movement and escape do not, because
+    // they have to work before anything has published and after everything
+    // has stopped.
+    renderNav();
     renderKeys();
     setKeyboard(false);
   }
