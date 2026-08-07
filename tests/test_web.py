@@ -849,6 +849,46 @@ class SafeAreaTests(unittest.TestCase):
 
     def test_the_remainder_matches_the_terminal_background(self):
         """Whatever the flooring leaves over is visible; it should read as
-        part of the terminal rather than as a border around it."""
+        part of the terminal rather than as a border around it. The colour is
+        checked against BackgroundColourTests, which pins it to what Textual
+        actually paints."""
         term = re.search(r'#term \{(.*?)\}', self.html, re.S)
-        self.assertIn('#0b0b0c', term.group(1))
+        self.assertIn('#121212', term.group(1))
+
+
+class BackgroundColourTests(unittest.TestCase):
+    """The page and the app have to agree on one colour.
+
+    FitAddon floors the column count, so a few pixels of terminal background
+    are always left over on the right. If that colour differs from the one the
+    TUI paints, those pixels stop being a rounding remainder and become a band
+    down the side of the dashboard -- visible beside the terminal and nowhere
+    else, which is exactly how it was reported.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for name in ('index.html', 'app.js', 'manifest.json'):
+            with open(os.path.join(web.ASSETS, name), encoding='utf-8') as f:
+                setattr(cls, name.split('.')[0], f.read())
+
+    def test_the_terminal_matches_what_textual_paints(self):
+        """Checked against the framework rather than assumed: Textual's
+        textual-dark renders on #121212."""
+        from textual.app import App
+        self.assertIn('#121212', self.app)
+
+    def test_nothing_in_the_page_disagrees(self):
+        """One stale colour anywhere is enough to draw the band."""
+        for name in ('index', 'app', 'manifest'):
+            source = getattr(self, name)
+            with self.subTest(asset=name):
+                stray = set(re.findall(r'#0b0b0c', source, re.I))
+                self.assertEqual(stray, set(), f'{name}: {stray}')
+
+    def test_the_installed_app_opens_on_the_same_colour(self):
+        """A PWA paints background_color before the page renders; a different
+        one there is a flash of the wrong colour on every launch."""
+        manifest = json.loads(self.manifest)
+        self.assertEqual(manifest['background_color'].lower(), '#121212')
+        self.assertEqual(manifest['theme_color'].lower(), '#121212')

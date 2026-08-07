@@ -39,7 +39,12 @@
     macOptionIsMeta: true,
     // A tap is a click, and atmux attaches on a single click. Without this the
     // browser waits ~300ms to see whether a second tap is coming.
-    theme: { background: '#0b0b0c', foreground: '#d8d8dc' }
+    // #121212 is what Textual's textual-dark theme actually paints, checked
+    // rather than guessed. FitAddon floors the column count, so a few pixels
+    // of terminal background are always left over on the right -- and if that
+    // colour differs from the one the app paints, those pixels read as a
+    // black band down the side of the dashboard and nowhere else.
+    theme: { background: '#121212', foreground: '#d8d8dc' }
   });
   var fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
