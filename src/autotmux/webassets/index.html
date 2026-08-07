@@ -43,24 +43,34 @@
     padding-bottom: env(safe-area-inset-bottom);
     user-select: none; -webkit-user-select: none;
   }
+  /* Typing mode: xterm's helper textarea is normally a one-cell element
+     parked at the cursor. Stretched transparently over the terminal, a tap
+     lands on a real text input and the platform raises its keyboard by
+     itself -- which is the only route iOS honours. */
+  .xterm-helper-textarea.atmux-typing {
+    position: absolute !important;
+    left: 0 !important; top: 0 !important;
+    width: 100% !important; height: 100% !important;
+    opacity: 0 !important; z-index: 5;
+    resize: none; border: 0; padding: 0;
+  }
   #keys { padding: 7px 7px 4px; }
+  /* Fixed rows, never wrapping: flex-wrap stretched whichever key landed
+     alone on the last line into a full-width button, which read as something
+     important rather than as the leftover it was. */
   .krow { display: flex; gap: 5px; margin-bottom: 5px; }
-  .krow.wrap { flex-wrap: wrap; gap: 6px; }
-  /* A keyboard row is fixed-width cells: ten keys must fit across a phone,
-     so they shrink together rather than wrapping into an unrecognisable
-     shape. */
-  .krow:not(.wrap) .key { flex: 1 1 0; min-width: 0; padding: 0 2px; font-size: 16px; }
-  .krow:not(.wrap) .key.wide { flex: 2.4 1 0; font-size: 13px; }
+  .krow .key { flex: 1 1 0; min-width: 0; padding: 0 2px; }
+  .krow .key.wide { flex: 2 1 0; }
   .key {
-    flex: 1 0 auto; min-width: 46px;    /* 44px is Apple's minimum target */
-    min-height: 44px; padding: 0 8px;
+    min-height: 44px;                   /* Apple's minimum touch target */
+    padding: 0 4px;
     background: #26262c; color: #e2e2e6; border: 1px solid #383840;
     border-radius: 9px;
-    font: 15px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    font: 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
     -webkit-tap-highlight-color: transparent;
     touch-action: none;                 /* a held key repeats; it never scrolls */
+    overflow: hidden; text-overflow: clip; white-space: nowrap;
   }
-  .key.wide { flex: 3 0 auto; }
   .key.down { background: #4a4a58; border-color: #6f6f80; }
   .key.on { background: #3c5a8a; border-color: #5b82bd; color: #fff; }
   #tabs {

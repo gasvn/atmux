@@ -477,16 +477,33 @@ class TouchKeypadTests(unittest.TestCase):
         return re.findall(r"\['((?:[^'\\]|\\.)*)'",
                           self.js[start.end():index])
 
+    def _sent(self, name):
+        """The key each button on a page actually sends."""
+        start = re.search(r'^    ' + name + r': \{', self.js, re.M)
+        self.assertIsNotNone(start, f'no {name} page')
+        index, depth = start.end() - 1, 0
+        while index < len(self.js):
+            if self.js[index] == '{':
+                depth += 1
+            elif self.js[index] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        return re.findall(r"\['[^']*', '([^']*)'", self.js[start.end():index])
+
     def test_the_keypad_offers_every_key_atmux_binds(self):
         """A bound key with no button is unreachable on a phone. This fails
         the moment someone adds a binding without adding the button."""
         from autotmux import cli
         bound = {b.key for b in cli.AutotmuxApp.BINDINGS}
-        on_pad = set(self._page('atmux')) | set(self._page('nav'))
-        # `?` is bound under the name Textual gives the character.
-        if 'question_mark' in bound:
-            bound.discard('question_mark')
-            bound.add('?')
+        on_pad = set(self._sent('atmux')) | set(self._sent('nav'))
+        # `?` is bound under the name Textual gives the character; `q` quits
+        # the dashboard and is deliberately not a button anyone can hit by
+        # accident -- closing the tab does the same thing.
+        bound.discard('question_mark')
+        bound.discard('q')
+        bound.add('?')
         missing = {k for k in bound if len(k) == 1 and k not in on_pad}
         self.assertEqual(missing, set(),
                          f'no button for bound key(s): {sorted(missing)}')
@@ -498,9 +515,27 @@ class TouchKeypadTests(unittest.TestCase):
         bound = {b.key for b in cli.AutotmuxApp.BINDINGS}
         bound |= {b.key for b in cli.ClickToAttachDataTable.BINDINGS}
         bound.add('?')
+        for key in self._sent('atmux'):
+            with self.subTest(key=key):
+                self.assertIn(key, bound)
+
+    def test_every_key_says_what_it_does(self):
+        """A row of bare letters is unreadable on a phone -- `x` kills a
+        session and `z` changes the layout, and nothing on screen said so."""
         for label in self._page('atmux'):
-            with self.subTest(key=label):
-                self.assertIn(label, bound)
+            with self.subTest(label=label):
+                self.assertGreater(len(label), 1, f'{label!r} is just a letter')
+
+    def test_no_key_stretches_into_something_it_is_not(self):
+        """flex-wrap stretched whichever key landed alone on the last line
+        into a full-width button, which read as something important rather
+        than as the leftover it was -- and the one it did that to was `q`,
+        which quits."""
+        self.assertNotIn('.krow.wrap', self.html)
+        # Comments may still explain why; the declaration must be gone.
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        self.assertNotIn('flex-wrap', css)
+        self.assertRegex(css, r'\.krow \.key \{[^}]*flex: 1 1 0')
 
     def test_detach_is_offered_because_nobody_can_guess_it(self):
         """Ctrl-B then d. It is unreachable without a keyboard, and getting
@@ -508,6 +543,16 @@ class TouchKeypadTests(unittest.TestCase):
         would otherwise create."""
         self.assertIn('\\x02d', self.js)
         self.assertIn('detach', self._page('tmux'))
+
+    def test_typing_puts_a_real_input_under_the_finger(self):
+        """Two attempts at calling focus() from JavaScript failed silently.
+        Safari raises the keyboard when the tap itself lands on a focusable
+        element -- which is why every ordinary web form works and none of
+        that did."""
+        self.assertIn('atmux-typing', self.js)
+        self.assertIn('.xterm-helper-textarea.atmux-typing', self.html)
+        self.assertRegex(self.html, r'atmux-typing \{[^}]*opacity: 0')
+        self.assertRegex(self.html, r'atmux-typing \{[^}]*height: 100%')
 
     def test_arrows_repeat_when_held(self):
         """A table is navigated by arrow. Ten taps to move ten rows is the
@@ -552,11 +597,10 @@ class TouchKeypadTests(unittest.TestCase):
             with self.subTest(control=control):
                 self.assertRegex(self.js, r'keepFocus\(' + control + r'\)')
 
-    def test_there_is_more_than_one_way_to_raise_the_keyboard(self):
-        """One of them silently not working is how this broke the first
-        time."""
-        self.assertIn("getElementById('kbd')", self.js)
-        self.assertIn('changedTouches.length === 2', self.js)
+    def test_typing_mode_ends_when_the_keyboard_does(self):
+        """The stretched textarea covers the terminal. Left behind, it eats
+        the taps that should be attaching to a session."""
+        self.assertRegex(self.js, r"textarea\.addEventListener\('blur'")
 
     def test_switching_page_retells_the_terminal_its_size(self):
         """The pad's height changes with the page, and without a refit tmux

@@ -1066,16 +1066,23 @@ and unassigned), and without this there is no way to send an arrow, `Esc` or
 `Ctrl-C` from a touch screen:
 
 ```
-  ↑     ↓     ⏎ attach     ←     →     esc    q
+  ↑      ↓      ⏎ attach      esc
+  ←      →      ⌫             tab
  ────────────────────────────────────────────────
-  nav  atmux  tmux                    A−  A+  ⌨
+  nav   atmux   tmux              A−   A+   ⌨
 ```
 
 - **nav** is the default: arrows repeat when held, so a long table is one
   press rather than twenty taps.
-- **atmux** carries every bound key (`s o t v e n x k j z g r ?`). A test
-  fails if a binding is ever added without a button, or a button added for a
-  key nothing binds.
+- **atmux** carries every bound key, labelled: `ssh`, `window`, `local`,
+  `view`, `note`, `new`, `kill`, `renew`, `jobs`, `layout`, `clusters`,
+  `refresh`, `help`. A row of bare letters was unreadable — nothing on screen
+  distinguished `x` (kill a session) from `z` (change the layout). A test
+  fails if a binding is ever added without a button, if a button is added for
+  a key nothing binds, or if any label is a single character again.
+
+  `q` is deliberately absent: it quits the dashboard, and closing the tab does
+  the same thing without being one mis-tap away.
 - **tmux** is for once you have attached — including `detach`, which is
   `Ctrl-B d` and is otherwise unreachable without a keyboard.
 - **A− / A+** and pinch-to-zoom change the font size, and it is remembered.
@@ -1086,12 +1093,13 @@ and unassigned), and without this there is no way to send an arrow, `Esc` or
   keeps focus either way (`inputmode="none"`), so an iPad with a hardware
   keyboard behaves like a desktop.
 
-  Raising it takes some care. iOS presents the keyboard only as a side effect
-  of the scroll-into-view that `focus()` performs, and xterm calls
-  `focus({preventScroll: true})` — which suppresses it with no error anywhere
-  — so this focuses the textarea directly. Controls on the pad also suppress
-  their default `pointerdown`, because a button that takes focus first leaves
-  the keyboard belonging to the button rather than to the terminal.
+  Raising it takes some care, and two attempts at calling `focus()` from
+  JavaScript failed silently. Safari raises the keyboard when the *tap itself*
+  lands on a focusable element — which is why every ordinary web form works
+  and none of that did. So ⌨ does not focus anything: it stretches xterm's own
+  helper textarea transparently over the terminal, and the next tap lands on a
+  real text input. Tap-to-attach is off while it is, which is the right trade
+  — you are typing, not navigating, and the keypad still has arrows and ⏎.
 
   When it appears, the page resizes to `visualViewport` rather than to the
   layout viewport, which does not shrink for it. Without that the last rows —

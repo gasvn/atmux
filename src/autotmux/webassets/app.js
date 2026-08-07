@@ -119,40 +119,40 @@
     return true;
   });
 
-  // ── the software keyboard is opt-in ───────────────────────────────────
-  // atmux is a table you steer with arrows and act on with single letters, so
-  // the on-screen keyboard is almost never what you want -- and it costs half
-  // the screen. inputmode="none" keeps the textarea focused, so a *hardware*
-  // keyboard still works and the cursor stays live, while the software one
-  // stays down until it is asked for.
+  // ── the software keyboard ─────────────────────────────────────────────
+  // Two attempts at coaxing iOS into presenting it failed, and both failed
+  // silently. The reason is that we were calling focus() from JavaScript, and
+  // Safari only reliably raises the keyboard when the *tap itself* lands on a
+  // focusable element -- that is why every ordinary web form works and none of
+  // this did.
+  //
+  // So stop calling focus(). Typing mode stretches xterm's own helper textarea
+  // over the terminal, transparent: the next tap lands on a real text input
+  // and the platform does what it always does. Tap-to-attach is off while it
+  // is on, which is the right trade -- you are typing, not navigating, and the
+  // keypad still has arrows and ⏎.
   var kbdOpen = false;
   function setKeyboard(open) {
     if (!textarea) return;
     kbdOpen = open;
     var button = document.getElementById('kbd');
     if (button) button.classList.toggle('on', open);
+    textarea.classList.toggle('atmux-typing', open);
     if (open) {
       textarea.removeAttribute('inputmode');
+      // Worth a try: on a platform that does honour it this saves the tap.
+      try { textarea.focus(); } catch (e) {}
+      say('tap the screen to type');
     } else {
       textarea.setAttribute('inputmode', 'none');
-    }
-    // iOS decides which keyboard to present when the element takes focus and
-    // will not re-evaluate one that is already focused, so bounce it.
-    textarea.blur();
-    if (open) {
-      // Deliberately not term.focus(): that calls focus({preventScroll:true}),
-      // and iOS ties presenting the keyboard to the scroll-into-view that
-      // focus() would otherwise do. preventScroll suppresses the keyboard
-      // silently -- which is exactly why the ⌨ button did nothing at all.
-      textarea.focus();
-    } else {
+      textarea.blur();
       term.focus();
+      say('keyboard off');
     }
   }
 
-  // A button that takes focus first leaves nothing to bounce, and on iOS the
-  // keyboard then belongs to the button rather than the terminal. Suppressing
-  // the default pointerdown keeps focus where it is for every control here.
+  // A button that takes focus first leaves nothing for the terminal, so every
+  // control on the pad suppresses its default pointerdown.
   function keepFocus(element) {
     if (!element) return;
     element.addEventListener('pointerdown', function (e) { e.preventDefault(); });
@@ -163,29 +163,33 @@
   // generic Ctrl/Esc/Tab row was the wrong tool: on this screen you navigate
   // and you act, and both are single keys.
   var ESC = '\x1b', BS = '\x7f';
+  // Labelled, not lettered. A row of bare letters is unreadable on a phone --
+  // you cannot tell `x` (kill a session) from `z` (change the layout) without
+  // opening the help -- and flex-wrap stretched whichever key landed alone on
+  // the last line into a full-width button with no clue what it did. Fixed
+  // rows, and every key says what it does.
   var PAGES = {
-    nav: { wrap: true, rows: [[
-      ['↑', ESC + '[A', 'rep'], ['↓', ESC + '[B', 'rep'],
-      ['⏎ attach', '\r', 'wide'],
-      ['←', ESC + '[D', 'rep'], ['→', ESC + '[C', 'rep'],
-      ['esc', ESC], ['q', 'q']
-    ]] },
+    nav: { rows: [
+      [['↑', ESC + '[A', 'rep'], ['↓', ESC + '[B', 'rep'],
+       ['⏎ attach', '\r', 'wide'], ['esc', ESC]],
+      [['←', ESC + '[D', 'rep'], ['→', ESC + '[C', 'rep'],
+       ['⌫', BS, 'rep'], ['tab', '\t']]
+    ] },
     // Grouped the way the help screen groups them: connect, then session
     // lifecycle, then view.
-    atmux: { wrap: true, rows: [[
-      ['s', 's'], ['o', 'o'], ['t', 't'],
-      ['v', 'v'], ['e', 'e'], ['n', 'n'], ['x', 'x'],
-      ['k', 'k'], ['j', 'j'], ['z', 'z'], ['g', 'g'],
-      ['r', 'r'], ['?', '?']
-    ]] },
+    atmux: { rows: [
+      [['ssh', 's'], ['window', 'o'], ['local', 't'], ['view', 'v']],
+      [['note', 'e'], ['new', 'n'], ['kill', 'x'], ['renew', 'k']],
+      [['jobs', 'j'], ['layout', 'z'], ['clusters', 'g'],
+       ['refresh', 'r'], ['help', '?']]
+    ] },
     // Once you attach, the keys that matter are tmux's, and detach is the one
     // nobody can guess -- it is the whole reason the handover banner exists.
-    tmux: { wrap: true, rows: [[
-      ['detach', '\x02d', 'wide'],
-      ['^C', '\x03'], ['^D', '\x04'], ['^Z', '\x1a'],
-      ['^B', '\x02'], ['tab', '\t'],
-      ['PgUp', ESC + '[5~', 'rep'], ['PgDn', ESC + '[6~', 'rep']
-    ]] }
+    tmux: { rows: [
+      [['detach', '\x02d', 'wide'], ['^C', '\x03'], ['^D', '\x04']],
+      [['prefix', '\x02'], ['^Z', '\x1a'],
+       ['PgUp', ESC + '[5~', 'rep'], ['PgDn', ESC + '[6~', 'rep']]
+    ] }
   };
 
   var keys = document.getElementById('keys');
@@ -207,7 +211,7 @@
     keys.textContent = '';
     PAGES[name].rows.forEach(function (row) {
       var line = document.createElement('div');
-      line.className = 'krow' + (PAGES[name].wrap ? ' wrap' : '');
+      line.className = 'krow';
       row.forEach(function (entry) {
         line.appendChild(buildKey(entry[0], entry[1], entry[2]));
       });
@@ -291,21 +295,18 @@
   if (kbd) kbd.addEventListener('click', function (e) {
     e.preventDefault();
     setKeyboard(!kbdOpen);
-    say(kbdOpen ? 'keyboard on' : 'keyboard off');
   });
 
-  // Two ways in, because one of them not working is how this feature was
-  // broken: a two-finger tap on the terminal also raises the keyboard, and
-  // iOS sometimes dismisses it on its own, in which case tapping while it is
-  // meant to be up puts it back.
-  host.addEventListener('touchend', function (event) {
-    if (event.touches.length === 0 && event.changedTouches.length === 2) {
-      setKeyboard(true);
-      say('keyboard on');
-      return;
-    }
-    if (kbdOpen && document.activeElement !== textarea) setKeyboard(true);
-  });
+  // Leaving typing mode when the keyboard goes away on its own keeps the two
+  // in step: otherwise the invisible textarea stays over the terminal and
+  // swallows the taps that should be attaching to a session.
+  if (textarea) {
+    textarea.addEventListener('blur', function () {
+      if (kbdOpen) setTimeout(function () {
+        if (kbdOpen && document.activeElement !== textarea) setKeyboard(false);
+      }, 250);
+    });
+  }
 
   // Pinch to zoom the font. The page itself must not zoom -- a zoomed viewport
   // makes a terminal unreadable and unscrollable at once -- so this is the
