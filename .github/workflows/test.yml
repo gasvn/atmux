@@ -26,20 +26,32 @@ jobs:
       matrix:
         python-version: ['3.10', '3.11', '3.12']
     steps:
-      # An empty `ref` keeps checkout's own default (the triggering commit),
-      # so push and pull_request runs behave exactly as before.
       - uses: actions/checkout@v4
         with:
-          # github.event.inputs (not the `inputs` context) is defined for
-          # every event, so this expression is valid on push too.
-          ref: ${{ github.event.inputs.ref || '' }}
-          # Checkout's default shallow fetch asks the server for the ref by
-          # name, and git cannot fetch an abbreviated SHA -- `ref: de2b2b4`
-          # failed outright while the full 40 characters worked. Deepen only
-          # when a ref was typed, so ordinary push runs keep their one-commit
-          # clone. Quoted on purpose: `x && 0 || 1` yields 1 for every input,
-          # because 0 is falsy and the fallback then wins.
+          # Deepen only for a hand-dispatched run, which checks out its ref in
+          # the next step and needs real history to resolve it. Push and
+          # pull_request runs keep their one-commit clone and skip that step
+          # entirely, so they behave exactly as before.
+          #
+          # github.event.inputs (not the `inputs` context) is defined for every
+          # event, so this is valid on push too. Quoted on purpose: `x && 0 ||
+          # 1` yields 1 for every input, because 0 is falsy and the fallback
+          # then always wins.
           fetch-depth: ${{ github.event.inputs.ref && '0' || '1' }}
+
+      # actions/checkout's own `ref:` resolves branches, tags and full 40-char
+      # SHAs only -- `ref: de2b2b4` fails with "could not be found", and
+      # deepening the fetch does not change that. Plain git resolves an
+      # abbreviation, so the ref people actually copy out of `git log
+      # --oneline` works. Passed through the environment rather than
+      # interpolated into the script, so the value cannot become shell syntax.
+      - name: Check out the requested ref
+        if: github.event.inputs.ref != ''
+        env:
+          REF: ${{ github.event.inputs.ref }}
+        run: |
+          git checkout --detach "$REF"
+          git --no-pager log -1 --oneline
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
