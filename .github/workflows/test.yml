@@ -33,6 +33,13 @@ jobs:
           # github.event.inputs (not the `inputs` context) is defined for
           # every event, so this expression is valid on push too.
           ref: ${{ github.event.inputs.ref || '' }}
+          # Checkout's default shallow fetch asks the server for the ref by
+          # name, and git cannot fetch an abbreviated SHA -- `ref: de2b2b4`
+          # failed outright while the full 40 characters worked. Deepen only
+          # when a ref was typed, so ordinary push runs keep their one-commit
+          # clone. Quoted on purpose: `x && 0 || 1` yields 1 for every input,
+          # because 0 is falsy and the fallback then wins.
+          fetch-depth: ${{ github.event.inputs.ref && '0' || '1' }}
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:

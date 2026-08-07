@@ -720,6 +720,23 @@ KA_STATE = {
 
 
 class KeepAliveToggleTests(unittest.IsolatedAsyncioTestCase):
+
+    async def _row_with_marker(self, pilot, pick, limit=40):
+        """Wait for the *table* to carry the keep-alive marker.
+
+        Writing the registry and re-rendering the row are separate async
+        steps, so polling the file and then asserting on the row is a race.
+        It lost exactly once -- on CI, on 3.11 only -- with
+        `'keep-alive' not found in 'No sessions'`.
+        """
+        row = None
+        for _ in range(limit):
+            row = pick()
+            if row is not None and 'keep-alive' in row[4]:
+                return row
+            await pilot.pause()
+        return row
+
     def setUp(self):
         self._saved_launch = autotmux._launch_daemon
         autotmux._launch_daemon = lambda: (True, '')
@@ -785,7 +802,11 @@ class KeepAliveToggleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(entries[0]['entry_id'])
                 self.assertEqual(entries[0]['command'], '/home/x/train_job')
                 # Marker shows in the decorated STATUS cell.
-                row = [r for r in app.all_sessions if r[1] == 'train'][0]
+                row = await self._row_with_marker(
+                    pilot,
+                    lambda: next((r for r in app.all_sessions
+                                  if r[1] == 'train'), None))
+                self.assertIsNotNone(row)
                 self.assertIn('keep-alive', row[4])
                 # Toggle OFF
                 await pilot.press('k')
@@ -873,7 +894,10 @@ class KeepAliveToggleTests(unittest.IsolatedAsyncioTestCase):
                         break
                     await pilot.pause()
                 self.assertEqual(entries[0]['job_id'], '707')
-                row = app.all_sessions[0]
+                row = await self._row_with_marker(
+                    pilot,
+                    lambda: app.all_sessions[0] if app.all_sessions else None)
+                self.assertIsNotNone(row)
                 self.assertEqual(row[1], autotmux._START_SHELL_SESSION)
                 self.assertIn('keep-alive', row[4])
 
