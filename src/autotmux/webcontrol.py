@@ -75,17 +75,25 @@ def parse_serve_url(raw: str, port: int = DEFAULT_PORT) -> str:
         handlers = entry.get('Handlers') if isinstance(entry, dict) else None
         if not isinstance(handlers, dict):
             continue
-        for handler in handlers.values():
+        for path, handler in handlers.items():
             proxy = handler.get('Proxy') if isinstance(handler, dict) else ''
             if not isinstance(proxy, str) or f':{port}' not in proxy:
                 continue
             host, _, hostport = str(target).partition(':')
             if not host:
                 continue
+            # The mount path is the point of serving several things on one
+            # hostname; dropping it here would print an address that loads
+            # somebody else's service, or nothing.
+            mount = str(path) if isinstance(path, str) else '/'
+            if not mount.startswith('/'):
+                mount = '/' + mount
+            if not mount.endswith('/'):
+                mount += '/'
             # 443 is implied and never written; anything else has to show.
             if hostport in ('', '443'):
-                return f'https://{host}/'
-            return f'http://{host}:{hostport}/'
+                return f'https://{host}{mount}'
+            return f'http://{host}:{hostport}{mount}'
     return ''
 
 

@@ -232,14 +232,38 @@ class AssetTests(_ServedFixture):
         _head, script = self.get('/app.js')
         self.assertIn(b'/ws', script)
 
-    def test_the_page_has_no_inline_script(self):
-        """The CSP has no 'unsafe-inline' for scripts, so an inline <script>
-        is silently dropped and the page comes up blank with nothing logged
-        anywhere. That is exactly what happened; it must not happen twice."""
+    def test_the_only_inline_script_is_the_one_the_policy_admits(self):
+        """The CSP has no 'unsafe-inline', so an inline <script> is silently
+        dropped and the page comes up blank with nothing logged anywhere --
+        which is exactly what happened once. The bootstrap redirect has to be
+        inline (it must run before the assets that would 404, and any file it
+        lived in would 404 for the same reason), so the policy admits that one
+        text by hash and nothing else."""
+        head, body = self.get('/')
+        inline = [tag for tag in re.findall(rb'<script[^>]*>', body)
+                  if b'src=' not in tag]
+        self.assertEqual(len(inline), 1, f'unexpected inline scripts: {inline}')
+        self.assertIn(web.BOOTSTRAP_JS.encode('utf-8'), body)
+        self.assertIn(web.BOOTSTRAP_HASH, head)
+
+    def test_the_admitted_hash_matches_what_is_actually_served(self):
+        """A hash that has drifted from the script blocks it, and the symptom
+        is the blank page again."""
+        import base64 as _b64
+        import hashlib as _hashlib
         _head, body = self.get('/')
-        self.assertNotIn(b'<script>', body)
-        for tag in re.findall(rb'<script[^>]*>', body):
-            self.assertIn(b'src=', tag, f'inline script: {tag!r}')
+        served = re.search(rb'<script>(.*?)</script>', body, re.S)
+        self.assertIsNotNone(served, 'no inline bootstrap in the page')
+        digest = _hashlib.sha256(served.group(1)).digest()
+        self.assertEqual('sha256-' + _b64.b64encode(digest).decode(),
+                         web.BOOTSTRAP_HASH)
+
+    def test_a_missing_trailing_slash_is_corrected(self):
+        """tailscale serve --set-path prints the address without one, and
+        without a trailing slash every relative asset resolves against the
+        host root, where nothing is mounted."""
+        self.assertIn("endsWith('/')", web.BOOTSTRAP_JS)
+        self.assertIn('location.replace', web.BOOTSTRAP_JS)
 
     def test_the_policy_permits_the_socket_the_page_opens(self):
         """A CSP that blocks its own websocket produces a page that loads and

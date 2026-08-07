@@ -252,6 +252,26 @@ _ASSET_TYPES = {
     '.json': 'application/json; charset=utf-8',
 }
 _ASSET_NAME = re.compile(r'^[A-Za-z0-9._-]+$')
+
+# `tailscale serve --set-path /term` strips the prefix before proxying and
+# forwards no header saying what it was, so the server cannot know where it is
+# mounted and cannot issue the redirect itself. The browser can: it is the one
+# that knows the address it asked for.
+#
+# Without this, /term (which is the address tailscale's own output prints)
+# loads the page and then resolves every relative asset against the host root,
+# where nothing is mounted -- so the page comes up and stays empty.
+#
+# Inline because it has to run before the assets that would 404, and any file
+# it lived in would 404 for the same reason. The CSP admits exactly this text
+# by hash, so it is not a hole: nothing else inline can run.
+BOOTSTRAP_JS = (
+    "if(!location.pathname.endsWith('/')){"
+    "location.replace(location.pathname+'/'+location.search+location.hash)}"
+)
+BOOTSTRAP_HASH = 'sha256-' + base64.b64encode(
+    hashlib.sha256(BOOTSTRAP_JS.encode('utf-8')).digest()).decode('ascii')
+_BOOTSTRAP_SLOT = '<!--bootstrap-->'
 # Ours, and therefore worth re-fetching. Everything else is vendored and only
 # changes when the package does.
 _VOLATILE_ASSETS = frozenset({'index.html', 'app.js', 'manifest.json'})
@@ -289,6 +309,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             self.send_error(404)
             return
+        if name == 'index.html':
+            body = body.replace(
+                _BOOTSTRAP_SLOT.encode('ascii'),
+                f'<script>{BOOTSTRAP_JS}</script>'.encode('utf-8'))
         ctype = _ASSET_TYPES.get(os.path.splitext(name)[1],
                                  'application/octet-stream')
         # The vendored terminal never changes without a reinstall, and it is
@@ -314,7 +338,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # same-origin sockets ought to fall under 'self', and Safari has a long
         # history of disagreeing.
         self.send_header('Content-Security-Policy',
-                         "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                         "default-src 'self'; "
+                         f"script-src 'self' '{BOOTSTRAP_HASH}'; "
+                         "style-src 'self' 'unsafe-inline'; "
                          "connect-src 'self' ws: wss:; img-src 'self' data:; "
                          "frame-ancestors 'none'")
         self.send_header('Referrer-Policy', 'no-referrer')
