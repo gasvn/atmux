@@ -73,6 +73,22 @@ LAYOUT_PATH = os.environ.get(
 LAYOUT_MODES = ('split', 'wide', 'table', 'jobs')
 LAYOUT_DEFAULT = 'split'
 _LAYOUT_FILE_LIMIT = 4 * 1024
+
+# The widths this dashboard has layouts for, widest first. A contract rather
+# than a decoration: the TUI reflows on these numbers and the browser client
+# picks its font size to land on one of them. Both sides deciding
+# independently is exactly how a phone ended up at 56 columns -- too narrow
+# for either layout, so the table truncated STATUS away entirely and grew a
+# horizontal scrollbar of its own inside a full-screen app.
+#
+# Measured, not estimated, by rendering the real dashboard at each width:
+#   64 columns -> the header reads "STATU"      (the last column is cut)
+#   65 columns -> the header reads "STATUS"     (everything fits)
+#  118 columns -> the preview pane earns its keep; below it the table gets
+#                 56% of too little and the preview is too narrow to read.
+LAYOUT_SPLIT_WIDTH = 118
+LAYOUT_TABLE_WIDTH = 65
+LAYOUT_WIDTHS = (LAYOUT_SPLIT_WIDTH, LAYOUT_TABLE_WIDTH)
 # Session lifecycle, shared by the daemon that runs the command and the agent
 # that forwards it. A name tmux will accept as a target without ambiguity: it
 # uses ':' and '.' to address windows and panes, so a session carrying either

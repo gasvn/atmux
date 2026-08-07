@@ -18,39 +18,39 @@
   var touch = (navigator.maxTouchPoints || 0) > 0 ||
               window.matchMedia('(pointer: coarse)').matches;
 
-  // Font size is the single biggest lever on a phone, and xterm.js has no
-  // pinch-zoom of its own (issue #5377). Remember it: a size is a property of
-  // the device, and re-picking it on every visit is the kind of small friction
-  // that stops someone reaching for the phone at all.
+  // Font size is derived, not chosen -- see the layout section below. What is
+  // remembered here is only an override: someone who has pinched to read a
+  // detail should find that size again next visit, and everyone else should
+  // never have to think about it. null means "let the layout decide".
   var MIN_FONT = 7, MAX_FONT = 28;
   function storedFont() {
     try {
-      var v = parseFloat(localStorage.getItem('atmux.fontSize'));
+      var raw = localStorage.getItem('atmux.fontSize');
+      if (raw === null || raw === 'auto') return null;
+      var v = parseFloat(raw);
       if (v >= MIN_FONT && v <= MAX_FONT) return v;
     } catch (e) {}
-    return touch ? 11 : 13;
+    return null;
   }
+  var manualFont = storedFont();
 
   var term = new Terminal({
     cursorBlink: true,
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    fontSize: storedFont(),
+    // A seed for the first font measurement only; the layout replaces it
+    // before the first frame unless there is a stored override.
+    fontSize: manualFont || 13,
     scrollback: 5000,
     macOptionIsMeta: true,
-    // A tap is a click, and atmux attaches on a single click. Without this the
-    // browser waits ~300ms to see whether a second tap is coming.
-    // #121212 is what Textual's textual-dark theme actually paints, checked
-    // rather than guessed. FitAddon floors the column count, so a few pixels
-    // of terminal background are always left over on the right -- and if that
-    // colour differs from the one the app paints, those pixels read as a
-    // black band down the side of the dashboard and nowhere else.
+    // #121212 is what Textual's textual-dark theme actually paints. Matching
+    // it is worth doing, but it is not what keeps the edges clean: the app
+    // paints its table rows lighter than its own background, so no single
+    // colour can hide a strip that sits outside the canvas. Not leaving a
+    // strip is the actual fix, and that is the layout section's job.
     theme: { background: '#121212', foreground: '#d8d8dc' }
   });
-  var fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
   var host = document.getElementById('term');
   term.open(host);
-  fit.fit();
 
   var textarea = host.querySelector('textarea');
 
@@ -287,23 +287,49 @@
     });
 
   // ── font size ─────────────────────────────────────────────────────────
+  // An override, not the mechanism. Auto is the default and the thing to
+  // return to; these exist for reading one cramped detail, and for the screen
+  // the rules get wrong.
+  function remember(value) {
+    try {
+      if (value === null) localStorage.removeItem('atmux.fontSize');
+      else localStorage.setItem('atmux.fontSize', String(value));
+    } catch (e) {}
+  }
   function setFont(size) {
     size = Math.max(MIN_FONT, Math.min(MAX_FONT, Math.round(size * 2) / 2));
-    if (size === term.options.fontSize) return;
+    if (manualFont === size) return;
+    manualFont = size;
+    remember(size);
     term.options.fontSize = size;
-    try { localStorage.setItem('atmux.fontSize', String(size)); } catch (e) {}
+    markAuto();
+    announce = true;
     refit();
-    say(size + 'px · ' + term.cols + '×' + term.rows);
+  }
+  function setAutoFont() {
+    manualFont = null;
+    remember(null);
+    markAuto();
+    announce = true;
+    refit();
   }
   var minus = document.getElementById('fontminus');
   var plus = document.getElementById('fontplus');
-  keepFocus(minus); keepFocus(plus);
+  var autoButton = document.getElementById('fontauto');
+  function markAuto() {
+    if (autoButton) autoButton.classList.toggle('on', manualFont === null);
+  }
+  keepFocus(minus); keepFocus(plus); keepFocus(autoButton);
   if (minus) minus.addEventListener('click', function (e) {
     e.preventDefault(); setFont(term.options.fontSize - 1);
   });
   if (plus) plus.addEventListener('click', function (e) {
     e.preventDefault(); setFont(term.options.fontSize + 1);
   });
+  if (autoButton) autoButton.addEventListener('click', function (e) {
+    e.preventDefault(); setAutoFont();
+  });
+  markAuto();
   var kbd = document.getElementById('kbd');
   keepFocus(kbd);
   if (kbd) kbd.addEventListener('click', function (e) {
@@ -345,14 +371,117 @@
     return Math.sqrt(dx * dx + dy * dy);
   }
 
-  // ── sizing ────────────────────────────────────────────────────────────
+  // ── layout ────────────────────────────────────────────────────────────
+  // The screen decides the grid and the grid decides the font size -- not the
+  // other way round. Getting this backwards is what produced every symptom on
+  // a phone at once: a hard-coded 11px font gave 56 columns, which is too few
+  // for either of the dashboard's layouts, so the table truncated STATUS away
+  // and grew a scrollbar of its own; and FitAddon reserved a flat 14px for a
+  // scrollbar this app can never show, which at that font size is four
+  // characters of dead width down the right-hand side. Four characters is not
+  // a rounding error and no background colour hides it, because the strip is
+  // outside the canvas and the canvas is not one colour.
+  //
+  // So: own the arithmetic, and take the target width from the app itself.
+
+  // Widths the dashboard has layouts for, widest first, served by the page
+  // (config.LAYOUT_WIDTHS). Hard-coding them here would be the same mistake
+  // in a new place: a breakpoint one side does not know about is a breakpoint
+  // the other side lands just short of.
+  function layoutWidths() {
+    var meta = document.querySelector('meta[name="atmux-layout"]');
+    var out = String(meta && meta.content || '').split(',')
+      .map(function (n) { return parseInt(n, 10); })
+      .filter(function (n) { return n >= 20 && n <= 500; })
+      .sort(function (a, b) { return b - a; });
+    return out.length ? out : [118, 65];
+  }
+
+  // What one cell costs, in CSS pixels. xterm measures this from the rendered
+  // font; the painted screen is the fallback and the ground truth once a
+  // frame exists.
+  function cellSize() {
+    var d = null;
+    try { d = term._core._renderService.dimensions.css.cell; } catch (e) {}
+    if (d && d.width > 0 && d.height > 0) return { w: d.width, h: d.height };
+    var screen = host.querySelector('.xterm-screen');
+    var rect = screen && screen.getBoundingClientRect();
+    if (rect && rect.width > 0 && term.cols > 0 && term.rows > 0) {
+      return { w: rect.width / term.cols, h: rect.height / term.rows };
+    }
+    return null;
+  }
+
+  // Below this a phone is unreadable; above it a desktop is just wasteful,
+  // and the extra width is better spent on columns than on letter height.
+  var MIN_AUTO = 9, MAX_AUTO = 16;
+
+  // The widest layout this screen can afford at a legible size. Cell width is
+  // exactly proportional to font size -- checked across 7px to 16px, the
+  // ratio held to four decimals -- so one measurement fixes the constant and
+  // the rest is division.
+  function autoFont(width) {
+    var cell = cellSize();
+    if (!cell || !term.options.fontSize) return term.options.fontSize;
+    var perPoint = cell.w / term.options.fontSize;
+    var widths = layoutWidths();
+    for (var i = 0; i < widths.length; i++) {
+      // Round down: rounding up lands one column short of the target, which
+      // is the one place it must not land.
+      var size = Math.floor(width / widths[i] / perPoint * 2) / 2;
+      if (size >= MIN_AUTO) return Math.min(size, MAX_AUTO);
+    }
+    return MIN_AUTO;
+  }
+
+  function applyGrid() {
+    var box = host.getBoundingClientRect();
+    var cell = cellSize();
+    if (!cell || box.width < 1 || box.height < 1) return;
+    var cols = Math.max(2, Math.floor(box.width / cell.w));
+    var rows = Math.max(1, Math.floor(box.height / cell.h));
+    if (cols !== term.cols || rows !== term.rows) {
+      try { term.resize(cols, rows); } catch (e) { return; }
+    }
+    // Whatever is left over is now under one character wide and under one row
+    // tall, by construction. Sizing the terminal to its own grid hands that
+    // remainder to the page, which centres it: a hairline on each side rather
+    // than a band down one.
+    if (term.element) {
+      term.element.style.width = (cols * cell.w) + 'px';
+      term.element.style.height = (rows * cell.h) + 'px';
+    }
+    sendResize();
+    if (announce) {
+      announce = false;
+      say(term.options.fontSize + 'px · ' + cols + '×' + rows +
+          (manualFont === null ? ' · auto' : ''));
+    }
+  }
+  // Only say something when the size was asked for. Rotating a phone or
+  // raising the keyboard relays out too, and a toast on every one of those is
+  // noise over the thing you were reading.
+  var announce = false;
+
+  function relayout() {
+    if (manualFont === null) {
+      var box = host.getBoundingClientRect();
+      var size = box.width > 0 ? autoFont(box.width) : term.options.fontSize;
+      if (size && size !== term.options.fontSize) {
+        term.options.fontSize = size;
+        // The cell is re-measured from the DOM; give the browser the frame it
+        // needs before asking what a cell is worth now.
+        requestAnimationFrame(applyGrid);
+        return;
+      }
+    }
+    applyGrid();
+  }
+
   var refitTimer = null;
   function refit() {
     clearTimeout(refitTimer);
-    refitTimer = setTimeout(function () {
-      try { fit.fit(); } catch (e) { return; }
-      sendResize();
-    }, 60);
+    refitTimer = setTimeout(relayout, 60);
   }
 
   // The software keyboard shrinks the *visual* viewport and leaves the layout

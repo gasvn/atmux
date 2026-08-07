@@ -14,6 +14,9 @@
 <title>atmux</title>
 <link rel="stylesheet" href="xterm.css">
 <link rel="manifest" href="manifest.json">
+<!-- The widths the dashboard has layouts for, filled in by the server from
+     config.LAYOUT_WIDTHS. app.js sizes the font to land on one of them. -->
+<!--layout-->
 <!--bootstrap-->
 <style>
   html, body {
@@ -41,15 +44,25 @@
   }
   #term {
     flex: 1 1 auto; min-height: 0;
-    /* No horizontal padding. FitAddon floors the column count, so the
-       terminal is already narrower than its box by up to one character --
-       spending another eight pixels on padding widens that gap for nothing.
-       The background matches so the remainder does not read as a border. */
-    padding: 2px 0 0 2px;
+    /* No padding at all. A terminal is a grid of whole cells, so its size is
+       quantised and something is always left over; padding adds to that
+       leftover without buying anything. app.js sizes the terminal to exactly
+       its own grid and this box centres it, which turns the sub-character
+       remainder into a hairline on each side instead of a band down one. */
+    display: flex; align-items: center; justify-content: center;
     background: #121212;
     touch-action: pan-y;                /* keep vertical scroll, drop the
                                            double-tap-to-zoom delay */
   }
+  /* xterm's own stylesheet paints this element #000 and reserves a scrollbar
+     on it. Both show up as a black stripe beside the dashboard, because the
+     app draws its rows lighter than its background and nothing here is
+     covered by the canvas. Scrolling still works -- only the chrome goes. */
+  .xterm .xterm-viewport {
+    background-color: transparent !important;
+    scrollbar-width: none;
+  }
+  .xterm .xterm-viewport::-webkit-scrollbar { display: none; }
   /* The keypad exists only where there is no real keyboard. */
   #pad { display: none; }
   body.touch #pad {
@@ -132,6 +145,9 @@
       <button data-page="tmux">tmux</button>
       <span class="spacer"></span>
       <button id="fontminus" aria-label="smaller">A−</button>
+      <!-- Lit while the layout is choosing the size, which is the normal
+           state. Tapping it hands the decision back after a pinch. -->
+      <button id="fontauto" aria-label="automatic size">A</button>
       <button id="fontplus" aria-label="larger">A+</button>
       <button id="kbd" aria-label="keyboard">⌨</button>
     </div>
@@ -148,7 +164,6 @@
 </div>
 
 <script src="xterm.js"></script>
-<script src="addon-fit.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

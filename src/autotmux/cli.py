@@ -3421,13 +3421,11 @@ _LAYOUT_SPECS = {
 }
 
 
-# Below this the table alone needs the whole width. The number comes from the
-# one already in the CSS -- the columns want ~66 cells -- divided by the 56%
-# the table gets in the split view. Measured below it: at 110 columns STATUS
-# reads "OFFLINE: co", and on a 58-column phone the table gets 32, so session
-# names truncate and LEFT, LOAD and STATUS vanish outright while the 25
-# columns handed to the preview are too few to read anything in.
-_MIN_SPLIT_WIDTH = 118
+# Below this the table alone needs the whole width. Defined in config beside
+# the width the table needs on its own, because the browser client sizes its
+# font to land on these same numbers -- a breakpoint only one side knows about
+# is a breakpoint the other side lands just short of.
+_MIN_SPLIT_WIDTH = config.LAYOUT_SPLIT_WIDTH
 
 
 def layout_spec(mode) -> dict:

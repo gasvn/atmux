@@ -37,6 +37,7 @@ import sys
 import termios
 import threading
 
+from . import config
 from . import paths
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'webassets')
@@ -272,6 +273,17 @@ BOOTSTRAP_JS = (
 BOOTSTRAP_HASH = 'sha256-' + base64.b64encode(
     hashlib.sha256(BOOTSTRAP_JS.encode('utf-8')).digest()).decode('ascii')
 _BOOTSTRAP_SLOT = '<!--bootstrap-->'
+
+# The layout contract, handed to the page rather than duplicated in it. The
+# client cannot know which widths the dashboard has layouts for, and guessing
+# is how it settled on a font size that produced a column count fitting
+# neither. A meta tag, not a script: nothing to admit through the CSP.
+_LAYOUT_SLOT = '<!--layout-->'
+
+
+def _layout_meta() -> str:
+    widths = ','.join(str(int(width)) for width in config.LAYOUT_WIDTHS)
+    return f'<meta name="atmux-layout" content="{widths}">'
 # Ours, and therefore worth re-fetching. Everything else is vendored and only
 # changes when the package does.
 _VOLATILE_ASSETS = frozenset({'index.html', 'app.js', 'manifest.json'})
@@ -313,6 +325,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = body.replace(
                 _BOOTSTRAP_SLOT.encode('ascii'),
                 f'<script>{BOOTSTRAP_JS}</script>'.encode('utf-8'))
+            body = body.replace(_LAYOUT_SLOT.encode('ascii'),
+                                _layout_meta().encode('utf-8'))
         ctype = _ASSET_TYPES.get(os.path.splitext(name)[1],
                                  'application/octet-stream')
         # The vendored terminal never changes without a reinstall, and it is

@@ -21,6 +21,37 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from autotmux import web
 
 
+def _node():
+    """A javascript runtime, if this machine has one.
+
+    The layout arithmetic ships as javascript. Restating it in python here
+    would test the restatement, so where node exists the real function is
+    run; where it does not, those tests skip rather than pretend.
+    """
+    import shutil
+    return shutil.which('node')
+
+
+def _extract(source: str, name: str) -> str:
+    """One top-level `function name(...) {...}` out of app.js, by brace depth.
+
+    Not a regex: an earlier test in this file searched for a block with a
+    non-greedy pattern, matched the wrong one, and still asserted true. A
+    false pass is worse than a failure.
+    """
+    start = source.index(f'function {name}(')
+    depth, i = 0, source.index('{', start)
+    while i < len(source):
+        if source[i] == '{':
+            depth += 1
+        elif source[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return source[start:i + 1]
+        i += 1
+    raise AssertionError(f'unbalanced braces in {name}')
+
+
 def client_frame(payload: bytes, opcode: int = 0x2, fin: bool = True,
                  mask: bytes = b'\x01\x02\x03\x04') -> bytes:
     """A frame shaped the way a browser sends one: always masked."""
@@ -291,13 +322,33 @@ class AssetTests(_ServedFixture):
         _head, script = self.get('/app.js')
         self.assertIn(b"addEventListener('error'", script)
 
+    def test_the_served_page_carries_the_layout_widths(self):
+        """A slot that survives serving is a page that silently falls back to
+        whatever the client guessed -- which is the whole bug, restored, and
+        invisible until someone opens it on a phone."""
+        from autotmux import config
+        _head, body = self.get('/')
+        page = body.decode('utf-8')
+        self.assertNotIn(web._LAYOUT_SLOT, page)
+        widths = re.search(r'name="atmux-layout" content="([^"]*)"', page)
+        self.assertIsNotNone(widths, 'layout widths missing from served page')
+        self.assertEqual([int(n) for n in widths.group(1).split(',')],
+                         list(config.LAYOUT_WIDTHS))
+
     def test_every_asset_the_page_needs_is_served(self):
-        for path in ('/xterm.js', '/xterm.css', '/addon-fit.js',
-                     '/manifest.json'):
-            with self.subTest(path=path):
-                head, body = self.get(path)
+        """Read the asset list off the page rather than restating it here: a
+        hand-kept list agrees with the page right up until one of them
+        changes, and then it is a test that passes while the page 404s."""
+        _head, body = self.get('/')
+        page = body.decode('utf-8')
+        wanted = (re.findall(r'<script src="([^"]+)"', page) +
+                  re.findall(r'<link[^>]+href="([^"]+)"', page))
+        self.assertGreaterEqual(len(wanted), 3, f'no assets found: {wanted}')
+        for name in wanted:
+            with self.subTest(path=name):
+                head, asset = self.get('/' + name)
                 self.assertIn('200', head)
-                self.assertGreater(len(body), 0)
+                self.assertGreater(len(asset), 0)
 
     def test_the_terminal_is_vendored_not_fetched(self):
         """A device on a private network may have no route to a CDN, and the
@@ -835,35 +886,52 @@ class SafeAreaTests(unittest.TestCase):
         self.assertIn('box-sizing: border-box', app.group(1))
 
     def test_the_terminal_spends_no_width_on_padding(self):
-        """FitAddon floors the column count, so the terminal is already
-        narrower than its box by up to one character; horizontal padding
-        widens that remainder for nothing."""
+        """A grid of whole cells never divides its box exactly, so something
+        is always left over; padding adds to that leftover and buys nothing
+        with it."""
         term = re.search(r'#term \{(.*?)\}', self.html, re.S)
         self.assertIsNotNone(term)
-        padding = re.search(r'padding: ([^;]+);', term.group(1))
-        self.assertIsNotNone(padding)
-        parts = padding.group(1).split()
-        # top right bottom left -- right must be 0, and left at most a hair.
-        right = parts[1] if len(parts) > 1 else parts[0]
-        self.assertEqual(right, '0', f'terminal padding: {padding.group(1)}')
+        self.assertNotIn('padding:', term.group(1))
 
-    def test_the_remainder_matches_the_terminal_background(self):
-        """Whatever the flooring leaves over is visible; it should read as
-        part of the terminal rather than as a border around it. The colour is
-        checked against BackgroundColourTests, which pins it to what Textual
-        actually paints."""
+    def test_the_remainder_is_centred_rather_than_pushed_to_one_edge(self):
+        """The sub-cell remainder is unavoidable. Split across both sides it
+        is a hairline; handed to one side it is a band, which is how four
+        characters of stolen scrollbar gutter presented itself."""
+        term = re.search(r'#term \{(.*?)\}', self.html, re.S)
+        self.assertIsNotNone(term)
+        self.assertIn('justify-content: center', term.group(1))
+        self.assertIn('align-items: center', term.group(1))
+
+    def test_the_terminal_background_matches_what_the_app_paints(self):
+        """Not the mechanism that keeps the edges clean -- the app draws its
+        rows lighter than its own background, so no single colour can hide a
+        strip outside the canvas -- but a mismatch is still visible while the
+        dashboard is still starting up."""
         term = re.search(r'#term \{(.*?)\}', self.html, re.S)
         self.assertIn('#121212', term.group(1))
+
+    def test_the_vendored_scrollbar_cannot_paint_over_the_edge(self):
+        """xterm's own stylesheet paints .xterm-viewport #000 and reserves a
+        scrollbar on it. Both land outside the canvas, beside the dashboard
+        and nowhere else."""
+        viewport = re.search(r'\.xterm \.xterm-viewport \{(.*?)\}',
+                             self.html, re.S)
+        self.assertIsNotNone(viewport, 'xterm viewport background not overridden')
+        self.assertIn('transparent', viewport.group(1))
+        # Hidden chrome, not hidden overflow: wheel scrollback still works.
+        self.assertNotIn('overflow-y: hidden', viewport.group(1))
+        self.assertIn('::-webkit-scrollbar', self.html)
 
 
 class BackgroundColourTests(unittest.TestCase):
     """The page and the app have to agree on one colour.
 
-    FitAddon floors the column count, so a few pixels of terminal background
-    are always left over on the right. If that colour differs from the one the
-    TUI paints, those pixels stop being a rounding remainder and become a band
-    down the side of the dashboard -- visible beside the terminal and nowhere
-    else, which is exactly how it was reported.
+    This was once believed to be the fix for the band down the right-hand
+    side, and it is not: the strip sat outside the canvas, and the dashboard
+    paints its table rows lighter than its own background, so there is no
+    colour that could have hidden it. Not leaving a strip is the fix -- see
+    LayoutContractTests. What this class still buys is the moment before the
+    dashboard has drawn anything, and the frame after a rotation.
     """
 
     @classmethod
@@ -892,3 +960,200 @@ class BackgroundColourTests(unittest.TestCase):
         manifest = json.loads(self.manifest)
         self.assertEqual(manifest['background_color'].lower(), '#121212')
         self.assertEqual(manifest['theme_color'].lower(), '#121212')
+
+
+class LayoutContractTests(unittest.TestCase):
+    """One side must not guess what width the other side needs.
+
+    The band down the right of a phone was never a rounding error. Measured
+    at nine font sizes on a 390px screen the leftover was a flat 17px --
+    four characters at the font in use, and it did not shrink as the font
+    shrank, which a rounding remainder must. It was FitAddon reserving a
+    hard-coded 14px for a scrollbar a full-screen TUI can never show, plus
+    2px of padding of our own.
+
+    Underneath that was the real fault: nobody decided the layout. The font
+    size was an input hard-coded per device type and the column count was
+    whatever fell out of it -- 56 on a phone, which is too few for either of
+    the dashboard's layouts, so the table truncated STATUS away and grew a
+    horizontal scrollbar inside a full-screen app. The fix is to make the
+    screen decide the grid and the grid decide the font, off one set of
+    widths that both sides read.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        for name in ('index.html', 'app.js'):
+            with open(os.path.join(web.ASSETS, name), encoding='utf-8') as f:
+                setattr(cls, name.split('.')[0], f.read())
+
+    # ── the contract itself ──────────────────────────────────────────────
+
+    def test_the_widths_are_ordered_widest_first(self):
+        """The client walks them in order and takes the first it can afford;
+        out of order it would settle for the narrow layout on a big screen."""
+        from autotmux import config
+        self.assertEqual(list(config.LAYOUT_WIDTHS),
+                         sorted(config.LAYOUT_WIDTHS, reverse=True))
+        self.assertGreater(config.LAYOUT_SPLIT_WIDTH, config.LAYOUT_TABLE_WIDTH)
+
+    def test_the_tui_reflows_on_the_published_width(self):
+        """If the TUI kept its own copy of the number, the client would size
+        its font to land on a breakpoint the TUI does not have."""
+        from autotmux import cli, config
+        self.assertEqual(cli._MIN_SPLIT_WIDTH, config.LAYOUT_SPLIT_WIDTH)
+
+    def test_the_page_is_told_the_widths(self):
+        from autotmux import config
+        meta = web._layout_meta()
+        self.assertIn('name="atmux-layout"', meta)
+        published = re.search(r'content="([^"]*)"', meta).group(1)
+        self.assertEqual([int(n) for n in published.split(',')],
+                         list(config.LAYOUT_WIDTHS))
+
+    def test_the_page_on_disk_has_somewhere_to_put_them(self):
+        """Whether the *server* fills it is checked against a live request in
+        AssetTests -- asserting on a replace() performed by the test would
+        only prove the test can call replace()."""
+        self.assertIn(web._LAYOUT_SLOT, self.index)
+
+    def test_the_client_reads_the_widths_rather_than_restating_them(self):
+        from autotmux import config
+        self.assertIn('atmux-layout', self.app)
+        # A fallback is fine -- the page could be opened from disk -- but it
+        # has to agree, or the two disagree exactly when the meta is missing.
+        fallback = re.search(r'return out\.length \? out : \[([^\]]*)\]',
+                             self.app)
+        self.assertIsNotNone(fallback, 'no fallback widths found')
+        self.assertEqual([int(n) for n in fallback.group(1).split(',')],
+                         list(config.LAYOUT_WIDTHS))
+
+    # ── the arithmetic that stole the width ──────────────────────────────
+
+    def test_nothing_reserves_width_for_a_scrollbar(self):
+        """FitAddon's flat 14px is the whole reason this file computes its own
+        grid. Loading it again would bring the band back. Naming it in a
+        comment is fine -- calling it is not."""
+        for call in ('new FitAddon', 'FitAddon.FitAddon', 'loadAddon'):
+            with self.subTest(call=call):
+                self.assertNotIn(call, self.app)
+        self.assertNotIn('addon-fit.js', self.index)
+        self.assertIn('term.resize(', self.app)
+
+    def test_the_terminal_is_sized_to_its_own_grid(self):
+        """Without this there is nothing for the centring in #term to act on,
+        and the remainder goes back to one edge."""
+        grid = _extract(self.app, 'applyGrid')
+        self.assertRegex(grid, r'term\.element\.style\.width\s*=')
+        self.assertRegex(grid, r'term\.element\.style\.height\s*=')
+        self.assertIn('Math.floor(box.width / cell.w)', grid)
+
+    def test_the_font_size_is_not_chosen_by_device_type(self):
+        """`touch ? 11 : 13` is what produced 56 columns. The size has to come
+        out of the width, not out of a guess about the hardware."""
+        self.assertRegex(self.app, r'function autoFont\(')
+        relayout = re.search(r'function relayout\(\) \{(.*?)\n  \}',
+                             self.app, re.S)
+        self.assertIsNotNone(relayout)
+        self.assertIn('autoFont(', relayout.group(1))
+
+    def test_an_override_is_remembered_and_can_be_handed_back(self):
+        """Auto has to be the default and the thing you can return to, or the
+        first pinch pins the layout wrong forever."""
+        self.assertIn('atmux.fontSize', self.app)
+        self.assertIn('removeItem', self.app)
+        self.assertIn('id="fontauto"', self.index)
+        self.assertIn("getElementById('fontauto')", self.app)
+
+
+@unittest.skipUnless(_node(), 'needs node to evaluate the shipped function')
+class AutoFontTests(unittest.TestCase):
+    """Run the shipped arithmetic, not a restatement of it.
+
+    The rounding direction is the whole game: rounding the font size up lands
+    one column short of the target, which is the single place it must not
+    land.
+    """
+
+    # cell width per point of font size. Measured in a real browser across
+    # 7px to 16px, where it held to four decimals.
+    RATIO = 0.60229
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(web.ASSETS, 'app.js'), encoding='utf-8') as f:
+            cls.app = f.read()
+        cls.source = _extract(cls.app, 'autoFont')
+        cls.bounds = re.search(r'var MIN_AUTO = ([\d.]+), MAX_AUTO = ([\d.]+)',
+                               cls.app)
+
+    def font_for(self, width, widths=None):
+        from autotmux import config
+        widths = list(widths or config.LAYOUT_WIDTHS)
+        harness = f"""
+        var RATIO = {self.RATIO};
+        var term = {{ options: {{ fontSize: 13 }} }};
+        function cellSize() {{ return {{ w: 13 * RATIO, h: 13 * 1.2 }}; }}
+        function layoutWidths() {{ return {json.dumps(widths)}; }}
+        var MIN_AUTO = {self.bounds.group(1)}, MAX_AUTO = {self.bounds.group(2)};
+        {self.source}
+        console.log(JSON.stringify(autoFont({width})));
+        """
+        import subprocess
+        out = subprocess.run([_node(), '-e', harness], capture_output=True,
+                             text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def columns(self, width, font):
+        return int(width // (font * self.RATIO))
+
+    def test_a_phone_gets_every_column_of_the_table(self):
+        """390px is an iPhone in portrait. Before this it got 56 columns and
+        the header read LOAD with STATUS off the edge."""
+        from autotmux import config
+        font = self.font_for(390)
+        self.assertGreaterEqual(self.columns(390, font),
+                                config.LAYOUT_TABLE_WIDTH)
+
+    def test_a_tablet_gets_the_split_view(self):
+        """820px is an iPad in portrait -- the width where the preview pane
+        starts being worth its room."""
+        from autotmux import config
+        font = self.font_for(820)
+        self.assertGreaterEqual(self.columns(820, font),
+                                config.LAYOUT_SPLIT_WIDTH)
+
+    def test_it_never_lands_one_column_short(self):
+        """The rounding-direction test, over every real device width to hand.
+
+        Whatever target the size was solved for, the grid it produces has to
+        actually reach it. Rounding the font up instead of down misses by the
+        fraction it rounded away -- 117 columns where 118 was the point.
+        """
+        from autotmux import config
+        floor = float(self.bounds.group(1))
+        for width in (320, 375, 390, 414, 428, 744, 768, 820, 834, 1024,
+                      1133, 1180, 1280, 1440, 1680, 1920, 2560):
+            font = self.font_for(width)
+            cols = self.columns(width, font)
+            # The widest target this screen could have been solved for.
+            wanted = next((w for w in config.LAYOUT_WIDTHS
+                           if width / w / self.RATIO >= floor), None)
+            with self.subTest(width=width):
+                if wanted is not None:
+                    self.assertGreaterEqual(
+                        cols, wanted,
+                        f'{width}px at {font}px -> {cols} cols, wanted {wanted}')
+
+    def test_it_stays_legible_and_stops_growing(self):
+        """A screen too small for any layout should get the smallest legible
+        size rather than an illegible one that happens to fit; a huge screen
+        should spend the room on columns, not on letter height."""
+        low, high = float(self.bounds.group(1)), float(self.bounds.group(2))
+        self.assertEqual(self.font_for(280), low)
+        self.assertEqual(self.font_for(3000), high)
+        for width in (320, 390, 428, 768, 820, 1024, 1180, 1680, 2560):
+            with self.subTest(width=width):
+                self.assertGreaterEqual(self.font_for(width), low)
+                self.assertLessEqual(self.font_for(width), high)
