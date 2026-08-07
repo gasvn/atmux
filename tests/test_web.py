@@ -512,6 +512,39 @@ class TouchKeypadTests(unittest.TestCase):
         self.assertIn("'none'", self.js)
         self.assertIn('id="kbd"', self.html)
 
+    def test_raising_the_keyboard_does_not_go_through_term_focus(self):
+        """xterm's Terminal.focus() calls focus({preventScroll: true}), and
+        iOS ties presenting the software keyboard to the scroll-into-view that
+        focus() would otherwise perform. preventScroll suppresses the keyboard
+        with no error anywhere -- which is exactly how the ⌨ button shipped
+        doing nothing at all."""
+        body = re.search(r'function setKeyboard\(open\) \{(.*?)\n  \}',
+                         self.js, re.S)
+        self.assertIsNotNone(body, 'setKeyboard not found')
+        code = re.sub(r'//.*', '', body.group(1))       # comments are not code
+        self.assertIn('textarea.focus()', code,
+                      'the keyboard path must focus the textarea directly')
+        self.assertNotIn('preventScroll', code)
+
+    def test_the_element_is_bounced_so_ios_re_reads_the_input_mode(self):
+        """iOS picks the keyboard when an element takes focus and will not
+        re-evaluate one that is already focused."""
+        self.assertIn('textarea.blur()', self.js)
+
+    def test_the_pad_buttons_never_steal_focus_from_the_terminal(self):
+        """A button that takes focus first leaves nothing to bounce, and the
+        keyboard then belongs to the button rather than the terminal."""
+        self.assertIn('function keepFocus', self.js)
+        for control in ('kbd', 'minus', 'plus', 'tab'):
+            with self.subTest(control=control):
+                self.assertRegex(self.js, r'keepFocus\(' + control + r'\)')
+
+    def test_there_is_more_than_one_way_to_raise_the_keyboard(self):
+        """One of them silently not working is how this broke the first
+        time."""
+        self.assertIn("getElementById('kbd')", self.js)
+        self.assertIn('changedTouches.length === 2', self.js)
+
     def test_pinch_zooms_the_font_and_not_the_page(self):
         """A zoomed viewport leaves you panning a grid that no longer fits,
         which is worse than the small text it was meant to fix."""

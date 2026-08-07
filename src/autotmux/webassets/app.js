@@ -127,15 +127,35 @@
   // stays down until it is asked for.
   var kbdOpen = false;
   function setKeyboard(open) {
+    if (!textarea) return;
     kbdOpen = open;
-    if (textarea) textarea.setAttribute('inputmode', open ? 'text' : 'none');
     var button = document.getElementById('kbd');
     if (button) button.classList.toggle('on', open);
     if (open) {
-      if (textarea) { textarea.blur(); term.focus(); }
+      textarea.removeAttribute('inputmode');
+    } else {
+      textarea.setAttribute('inputmode', 'none');
+    }
+    // iOS decides which keyboard to present when the element takes focus and
+    // will not re-evaluate one that is already focused, so bounce it.
+    textarea.blur();
+    if (open) {
+      // Deliberately not term.focus(): that calls focus({preventScroll:true}),
+      // and iOS ties presenting the keyboard to the scroll-into-view that
+      // focus() would otherwise do. preventScroll suppresses the keyboard
+      // silently -- which is exactly why the ⌨ button did nothing at all.
+      textarea.focus();
     } else {
       term.focus();
     }
+  }
+
+  // A button that takes focus first leaves nothing to bounce, and on iOS the
+  // keyboard then belongs to the button rather than the terminal. Suppressing
+  // the default pointerdown keeps focus where it is for every control here.
+  function keepFocus(element) {
+    if (!element) return;
+    element.addEventListener('pointerdown', function (e) { e.preventDefault(); });
   }
 
   // ── the keypad ────────────────────────────────────────────────────────
@@ -228,10 +248,10 @@
 
   Array.prototype.forEach.call(
     document.querySelectorAll('#tabs [data-page]'), function (tab) {
+      keepFocus(tab);
       tab.addEventListener('click', function (event) {
         event.preventDefault();
         buildPage(tab.dataset.page);
-        term.focus();
       });
     });
 
@@ -246,6 +266,7 @@
   }
   var minus = document.getElementById('fontminus');
   var plus = document.getElementById('fontplus');
+  keepFocus(minus); keepFocus(plus);
   if (minus) minus.addEventListener('click', function (e) {
     e.preventDefault(); setFont(term.options.fontSize - 1);
   });
@@ -253,8 +274,24 @@
     e.preventDefault(); setFont(term.options.fontSize + 1);
   });
   var kbd = document.getElementById('kbd');
+  keepFocus(kbd);
   if (kbd) kbd.addEventListener('click', function (e) {
-    e.preventDefault(); setKeyboard(!kbdOpen);
+    e.preventDefault();
+    setKeyboard(!kbdOpen);
+    say(kbdOpen ? 'keyboard on' : 'keyboard off');
+  });
+
+  // Two ways in, because one of them not working is how this feature was
+  // broken: a two-finger tap on the terminal also raises the keyboard, and
+  // iOS sometimes dismisses it on its own, in which case tapping while it is
+  // meant to be up puts it back.
+  host.addEventListener('touchend', function (event) {
+    if (event.touches.length === 0 && event.changedTouches.length === 2) {
+      setKeyboard(true);
+      say('keyboard on');
+      return;
+    }
+    if (kbdOpen && document.activeElement !== textarea) setKeyboard(true);
   });
 
   // Pinch to zoom the font. The page itself must not zoom -- a zoomed viewport
