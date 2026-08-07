@@ -2029,3 +2029,72 @@ class NarrowScreenTests(unittest.TestCase):
         losing the tail -- the leading columns are the ones worth seeing."""
         self.assertIn('text-wrap: nowrap', autotmux.AutotmuxApp.CSS)
         self.assertIn('overflow-x: auto', autotmux.AutotmuxApp.CSS)
+
+
+class WebDashboardScreenTests(unittest.TestCase):
+    """`w` answers "where is it, and is it up" without anyone keeping four
+    commands across two machines in their head. A tool you have to look up is
+    a tool you stop reaching for."""
+
+    def test_the_key_is_bound_and_documented(self):
+        by_key = {b.key: b for b in autotmux.AutotmuxApp.BINDINGS}
+        self.assertIn('w', by_key)
+        documented = {row[0] for row in autotmux.AutotmuxApp.HELP_ROWS}
+        self.assertIn('w', documented)
+
+    def test_the_serve_url_is_read_from_config_not_from_prose(self):
+        """After a tailnet rename the human-readable output kept printing the
+        old hostname, and a URL that looks right and 404s is worse than
+        none."""
+        raw = ('{"TCP":{"443":{"HTTPS":true}},"Web":{'
+               '"zgx.shorthair-cat.ts.net:443":{"Handlers":{"/":'
+               '{"Proxy":"http://127.0.0.1:7681"}}}}}')
+        self.assertEqual(autotmux.webcontrol.parse_serve_url(raw),
+                         'https://zgx.shorthair-cat.ts.net/')
+
+    def test_a_non_default_port_survives_into_the_url(self):
+        raw = ('{"Web":{"mac.shorthair-cat.ts.net:8080":{"Handlers":{"/":'
+               '{"Proxy":"http://127.0.0.1:7681"}}}}}')
+        self.assertEqual(autotmux.webcontrol.parse_serve_url(raw),
+                         'http://mac.shorthair-cat.ts.net:8080/')
+
+    def test_a_rule_for_some_other_port_is_not_claimed(self):
+        raw = ('{"Web":{"h.ts.net:443":{"Handlers":{"/":'
+               '{"Proxy":"http://127.0.0.1:9999"}}}}}')
+        self.assertEqual(autotmux.webcontrol.parse_serve_url(raw, 7681), '')
+
+    def test_junk_from_either_command_is_survivable(self):
+        for raw in ('', 'not json', '{}', 'null', '{"Web":42}', '[]'):
+            with self.subTest(raw=raw):
+                self.assertEqual(autotmux.webcontrol.parse_serve_url(raw), '')
+                self.assertEqual(autotmux.webcontrol.parse_tailnet_host(raw), '')
+
+    def test_the_hostname_loses_its_trailing_dot(self):
+        """MagicDNS names are fully qualified; a URL with the dot works but
+        looks wrong enough that people retype it."""
+        raw = '{"Self":{"DNSName":"zgx.shorthair-cat.ts.net."}}'
+        self.assertEqual(autotmux.webcontrol.parse_tailnet_host(raw),
+                         'zgx.shorthair-cat.ts.net')
+
+    def test_the_summary_distinguishes_up_from_reachable(self):
+        """Running and reachable are different failures with different fixes,
+        and the second one is the confusing one."""
+        self.assertEqual(
+            autotmux.webcontrol.summary({'listening': False}), 'stopped')
+        self.assertIn('reachable', autotmux.webcontrol.summary(
+            {'listening': True, 'url': 'https://h/'}))
+        self.assertIn('local only', autotmux.webcontrol.summary(
+            {'listening': True, 'url': ''}))
+
+    def test_an_unknown_verb_is_refused(self):
+        ok, message = autotmux.webcontrol.control('destroy')
+        self.assertFalse(ok)
+        self.assertIn('destroy', message)
+
+    def test_the_shell_commands_are_shown_for_whichever_setup_exists(self):
+        with_unit = dict(autotmux.webcontrol.commands({'systemd': True}))
+        self.assertIn('start', with_unit)
+        self.assertIn('logs', with_unit)
+        without = dict(autotmux.webcontrol.commands(
+            {'systemd': False, 'port': 7681}))
+        self.assertIn('atmux-web', without['start'])

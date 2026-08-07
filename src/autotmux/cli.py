@@ -48,7 +48,7 @@ from autotmux import __version__
 
 from autotmux import (
     config, gateway as gateway_client, ipc, keepalive, lifecycle, notify,
-    paths, urlhandler, warm_registry,
+    paths, urlhandler, warm_registry, webcontrol,
 )
 
 STATE_FILE = paths.STATE_FILE
@@ -2914,6 +2914,130 @@ class HelpScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class WebDashboardScreen(ModalScreen[None]):
+    """Where the browser dashboard is, and whether it is up.
+
+    It exists because the alternative was remembering four commands across two
+    machines, and a tool you have to look up is a tool you stop reaching for.
+    Everything it shows is about *this* machine -- the one running this atmux,
+    which is also the machine serving the browser when you are looking at it
+    through one.
+    """
+
+    CSS = """
+    WebDashboardScreen {
+        align: center middle;
+        background: $surface 60%;
+    }
+    #web_dialog {
+        width: 78;
+        max-width: 94%;
+        height: auto;
+        max-height: 90%;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #web_title { text-style: bold; color: $accent; }
+    #web_body { height: auto; }
+    #web_status { height: 2; max-height: 2; overflow-y: auto; }
+    #web_buttons { height: 1; align-horizontal: right; }
+    #web_buttons Button { width: 22%; min-width: 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("w", "cancel", "Close"),
+        Binding("r", "reload", "Refresh"),
+    ]
+
+    def __init__(self, state: dict) -> None:
+        super().__init__()
+        self._state = dict(state)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="web_dialog"):
+            yield Label("Browser dashboard", id="web_title", markup=False)
+            yield Static(self._describe(), id="web_body", markup=False)
+            yield Label(webcontrol.summary(self._state), id="web_status",
+                        markup=False)
+            with Horizontal(id="web_buttons"):
+                yield Button("Start", id="web_start", compact=True)
+                yield Button("Stop", id="web_stop", compact=True)
+                yield Button("Restart", id="web_restart", compact=True)
+                yield Button("Close", id="web_close", variant="primary",
+                             compact=True)
+
+    def _describe(self) -> str:
+        state = self._state
+        lines = []
+        url = state.get('url')
+        if url:
+            lines.append('Open on your phone or tablet:')
+            lines.append(f'  {url}')
+        elif state.get('listening'):
+            lines.append('Running, but not reachable from your tailnet yet:')
+            lines.append(f'  tailscale serve --bg {state.get("port")}')
+        else:
+            lines.append('Not running. Start it below.')
+        lines.append('')
+        detail = ['listening   {}  (127.0.0.1:{})'.format(
+            'yes' if state.get('listening') else 'no', state.get('port'))]
+        if state.get('systemd'):
+            detail.append('unit        {} - {} at boot'.format(
+                state.get('unit') or '?', state.get('enabled') or '?'))
+        if state.get('tailnet'):
+            detail.append('this host   {}'.format(state.get('tailnet')))
+        lines.extend(detail)
+        lines.append('')
+        lines.append('If you prefer the shell:')
+        for what, command in webcontrol.commands(state):
+            lines.append('  {:<11} {}'.format(what, command))
+        return '\n'.join(lines)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    async def action_reload(self) -> None:
+        await self._refresh()
+
+    async def _refresh(self) -> None:
+        try:
+            self._state = await _offload_for(8.0, webcontrol.describe)
+        except Exception as error:
+            self.query_one("#web_status", Label).update(
+                'could not read status - {}'.format(error))
+            return
+        self.query_one("#web_body", Static).update(self._describe())
+        self.query_one("#web_status", Label).update(
+            webcontrol.summary(self._state))
+
+    async def _control(self, verb: str) -> None:
+        status = self.query_one("#web_status", Label)
+        status.update('{}ing...'.format(verb))
+        try:
+            ok, message = await _offload_for(12.0, webcontrol.control, verb)
+        except Exception as error:
+            status.update('{} failed - {}'.format(verb, error))
+            return
+        if not ok:
+            status.update(message)
+            return
+        await self._refresh()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button = event.button.id
+        if button == 'web_close':
+            self.action_cancel()
+        elif button == 'web_start':
+            await self._control('start')
+        elif button == 'web_stop':
+            await self._control('stop')
+        elif button == 'web_restart':
+            await self._control('restart')
+
+
 class ConnectionManager(ModalScreen[dict | None]):
     """TUI-owned SSH alias picker; no hand editing of TOML is required."""
 
@@ -3405,6 +3529,7 @@ class AutotmuxApp(App):
         # buys the footer the room for `z`, which has nowhere else to appear.
         Binding("j", "toggle_jobs_view", "Jobs panel", show=False),
         Binding("z", "cycle_layout", "Layout"),
+        Binding("w", "web_dashboard", "Web", show=False),
         Binding("g", "manage_connections", "Clusters"),
         Binding("e", "edit_note", "Note", show=False),
         Binding("n", "new_session", "New session", show=False),
@@ -3445,6 +3570,7 @@ class AutotmuxApp(App):
         ]),
         ("View", [
             ("z", "Cycle layout: split → wide → table → jobs", "remembered"),
+            ("w", "Browser dashboard: address, start, stop", "this machine"),
             ("e", "Label this session with what it is for", "shows in STATUS"),
             ("g", "Add clusters and pick their login nodes", "whole session"),
             ("r", "Refresh now (it also refreshes itself)", "whole table"),
@@ -4552,6 +4678,20 @@ class AutotmuxApp(App):
             self._apply_layout()
         except Exception:
             pass
+
+    async def action_web_dashboard(self) -> None:
+        """Show where the browser dashboard is, without anyone memorising it."""
+        try:
+            state = await _offload_for(8.0, webcontrol.describe)
+        except Exception as error:
+            self.notify(f'could not read the web dashboard state · {error}',
+                        severity='error', timeout=6, markup=False)
+            return
+        try:
+            await self.push_screen(WebDashboardScreen(state))
+        except Exception as error:
+            self.notify(f'could not open the web dashboard · {error}',
+                        severity='error', timeout=6, markup=False)
 
     async def action_cycle_layout(self) -> None:
         self.layout_mode = config.next_layout(self.layout_mode)

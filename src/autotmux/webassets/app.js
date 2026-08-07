@@ -180,8 +180,8 @@
     atmux: { rows: [
       [['ssh', 's'], ['window', 'o'], ['local', 't'], ['view', 'v']],
       [['note', 'e'], ['new', 'n'], ['kill', 'x'], ['renew', 'k']],
-      [['jobs', 'j'], ['layout', 'z'], ['clusters', 'g'],
-       ['refresh', 'r'], ['help', '?']]
+      [['jobs', 'j'], ['layout', 'z'], ['clusters', 'g'], ['web', 'w']],
+      [['refresh', 'r'], ['help', '?']]
     ] },
     // Once you attach, the keys that matter are tmux's, and detach is the one
     // nobody can guess -- it is the whole reason the handover banner exists.
