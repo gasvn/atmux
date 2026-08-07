@@ -1243,7 +1243,9 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)
             app = autotmux.AutotmuxApp()
-            async with app.run_test() as pilot:
+            # Wide enough for the split to be worth making; the narrow case is
+            # its own behaviour and has its own tests below.
+            async with app.run_test(size=(130, 40)) as pilot:
                 await pilot.pause()
                 for mode, (table, preview, jobs) in expected.items():
                     with self.subTest(mode=mode):
@@ -1267,14 +1269,14 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)
             app = autotmux.AutotmuxApp()
-            async with app.run_test(size=(100, 30)) as pilot:
+            async with app.run_test(size=(130, 30)) as pilot:
                 await pilot.pause()
                 split = app.query_one('#left_pane').region.width
                 await pilot.press('z')          # -> wide
                 await pilot.pause()
                 wide = app.query_one('#left_pane').region.width
                 self.assertGreater(wide, split)
-                self.assertGreaterEqual(wide, 99)
+                self.assertGreaterEqual(wide, 129)
 
     async def test_expanded_jobs_outgrow_the_fourteen_line_cap(self):
         """The cap protects the table. With the table gone it only wastes
@@ -1353,6 +1355,79 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
                     if calls:
                         break
                 self.assertTrue(calls, 'preview never resumed once shown again')
+
+    async def test_a_phone_gets_the_whole_width_for_the_table(self):
+        """Measured on an iPhone: 58 columns. The split view hands 44% of
+        those to a preview too narrow to read anything in, and the table is
+        left with 32 -- `tu_improve` renders as `tu_impr` and LEFT, LOAD and
+        STATUS disappear. That is the desktop layout on the wrong screen."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(58, 30)) as pilot:
+                await pilot.pause()
+                app.layout_mode = 'split'
+                app._apply_layout()
+                await pilot.pause()
+                self.assertFalse(app.query_one('#right_pane_scroll').display)
+                self.assertEqual(app.query_one('#left_pane').region.width, 58)
+
+    async def test_a_wide_terminal_still_gets_its_preview(self):
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(130, 30)) as pilot:
+                await pilot.pause()
+                app.layout_mode = 'split'
+                app._apply_layout()
+                await pilot.pause()
+                self.assertTrue(app.query_one('#right_pane_scroll').display)
+
+    async def test_the_threshold_leaves_the_table_the_columns_it_needs(self):
+        """The number is the one already in the CSS -- ~66 cells -- over the
+        56% the table gets. Below it STATUS is cut mid-word."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(
+                    size=(autotmux._MIN_SPLIT_WIDTH, 30)) as pilot:
+                await pilot.pause()
+                app.layout_mode = 'split'
+                app._apply_layout()
+                await pilot.pause()
+                self.assertTrue(app.query_one('#right_pane_scroll').display)
+                self.assertGreaterEqual(
+                    app.query_one('#left_pane').region.width, 66)
+
+    async def test_rotating_the_phone_brings_the_preview_back(self):
+        """Landscape is wide enough for a split that portrait is not, and a
+        phone changes shape without anyone pressing a key."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(58, 40)) as pilot:
+                await pilot.pause()
+                app.layout_mode = 'split'
+                app._apply_layout()
+                await pilot.pause()
+                self.assertFalse(app.query_one('#right_pane_scroll').display)
+                await pilot.resize_terminal(130, 24)
+                await pilot.pause()
+                self.assertTrue(app.query_one('#right_pane_scroll').display)
+
+    async def test_the_narrow_view_is_not_a_mode_and_is_not_remembered(self):
+        """A small screen is a property of the screen. Persisting it would
+        follow the user to a desktop and hide the preview there."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(58, 30)) as pilot:
+                await pilot.pause()
+                app.layout_mode = 'split'
+                app._apply_layout()
+                await pilot.pause()
+            self.assertIn(autotmux.config.load_layout(),
+                          ('split', autotmux.config.LAYOUT_DEFAULT))
 
     async def test_the_layout_is_remembered_for_the_next_run(self):
         """It is chosen to fit a terminal, and that is usually the same
@@ -1917,3 +1992,40 @@ class StatusSubtitleTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class NarrowScreenTests(unittest.TestCase):
+    """A phone is 58 columns. Everything sized for a desktop has to give."""
+
+    def test_squeue_loses_the_indent_every_line_shares(self):
+        """squeue right-aligns JOBID in a field wide enough for any of them,
+        so ~10 leading spaces arrive on every row -- a sixth of a phone
+        screen spent on nothing."""
+        raw = ('             JOBID PARTITION\n'
+               '          37442487 kempner_h\n'
+               '          37442463 kempner_h\n')
+        out = autotmux._dedent_block(raw).splitlines()
+        # The data rows carry the smallest indent, so they end up flush and
+        # the header keeps the three columns that align it over them.
+        self.assertEqual(out[1], '37442487 kempner_h')
+        self.assertEqual(out[0], '   JOBID PARTITION')
+
+    def test_columns_stay_aligned_with_each_other(self):
+        """Only whitespace common to every line goes; taking more would shear
+        the columns apart."""
+        self.assertEqual(autotmux._dedent_block('   a\n     b\n'), 'a\n  b')
+
+    def test_text_with_no_common_indent_is_untouched(self):
+        self.assertEqual(autotmux._dedent_block('a\n   b\n'), 'a\n   b\n')
+
+    def test_junk_does_not_raise(self):
+        for value in ('', None, 42, '\n\n'):
+            with self.subTest(value=value):
+                self.assertIsInstance(autotmux._dedent_block(value), str)
+
+    def test_the_jobs_panel_clips_rather_than_wraps(self):
+        """squeue prints ~95 columns. Wrapping them onto a phone interleaves
+        each row with its own continuation, which is harder to read than
+        losing the tail -- the leading columns are the ones worth seeing."""
+        self.assertIn('text-wrap: nowrap', autotmux.AutotmuxApp.CSS)
+        self.assertIn('overflow-x: auto', autotmux.AutotmuxApp.CSS)

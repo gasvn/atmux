@@ -1041,6 +1041,22 @@ are all in the standard library, and xterm.js is vendored in the package
 rather than fetched from a CDN, so the page works on a device with no route
 off the tailnet.
 
+### On a narrow screen
+
+A phone is about 58 columns. The split view hands 44% of them to a preview too
+narrow to read anything in and leaves the table 32, where `tu_improve` renders
+as `tu_impr` and LEFT, LOAD and STATUS disappear entirely — so below 118
+columns the preview is simply not drawn and the table takes the width. It is
+not a fifth layout mode and it is not remembered: a small screen is a property
+of the screen, and persisting it would follow you to a desktop. `z` still
+cycles the same four, and rotating a phone into landscape brings the preview
+back on its own.
+
+`squeue` prints ~95 columns and right-aligns JOBID in a field wide enough for
+any of them. The jobs panel clips rather than wraps — a wrapped row interleaves
+with its own continuation, which is harder to read than losing the tail — and
+the indent every line shares is removed, which is a sixth of a phone screen.
+
 ### Touch
 
 atmux is a table you steer with arrows and act on with single letters, so the

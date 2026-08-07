@@ -362,6 +362,29 @@ def _cluster_health_note(clusters) -> str:
     return f" · ⚠ cluster unreachable: {', '.join(sorted(down))}"
 
 
+def _dedent_block(text: str) -> str:
+    """Drop the indent every line shares.
+
+    ``squeue`` right-aligns JOBID in a field wide enough for any of them, so
+    its output arrives with about ten leading spaces on every row. On a desktop
+    that is invisible; on a 58-column phone it is a sixth of the screen spent
+    on nothing. Only whitespace common to *all* non-blank lines goes, so the
+    columns stay aligned with each other.
+    """
+    if not isinstance(text, str) or not text:
+        return ''
+    lines = text.splitlines()
+    indents = [len(line) - len(line.lstrip(' '))
+               for line in lines if line.strip()]
+    if not indents:
+        return text
+    common = min(indents)
+    if not common:
+        return text
+    return '\n'.join(line[common:] if line.strip() else line
+                      for line in lines)
+
+
 def _gateway_health_note(items) -> str:
     """What to say about the gateways we are *not* using, which is usually
     nothing.
@@ -3274,6 +3297,15 @@ _LAYOUT_SPECS = {
 }
 
 
+# Below this the table alone needs the whole width. The number comes from the
+# one already in the CSS -- the columns want ~66 cells -- divided by the 56%
+# the table gets in the split view. Measured below it: at 110 columns STATUS
+# reads "OFFLINE: co", and on a 58-column phone the table gets 32, so session
+# names truncate and LEFT, LOAD and STATUS vanish outright while the 25
+# columns handed to the preview are too few to read anything in.
+_MIN_SPLIT_WIDTH = 118
+
+
 def layout_spec(mode) -> dict:
     """The pane visibility for a layout mode, defaulting on anything odd."""
     spec = _LAYOUT_SPECS.get(mode)
@@ -3335,6 +3367,7 @@ class AutotmuxApp(App):
         max-height: 14;
         border-top: solid $primary;
         padding: 0 1;
+        overflow-x: auto;
     }
     /* Expanded: the 14-line cap exists so the queue cannot crowd out the
        table. With the table gone there is nothing to protect, and the cap
@@ -3345,8 +3378,14 @@ class AutotmuxApp(App):
         border-top: none;
     }
     #jobs_panel {
-        width: 100%;
+        width: auto;
         height: auto;
+        /* squeue prints ~95 columns. Wrapping them onto a 58-column phone
+           interleaves each row with its own continuation, which is harder to
+           read than losing the tail: the leading columns -- JOBID, PARTITION,
+           NAME, STATE -- are the ones worth seeing, and they stay aligned.
+           The scroller below can reach the rest. */
+        text-wrap: nowrap;
     }
     """
 
@@ -3837,6 +3876,15 @@ class AutotmuxApp(App):
 
     def _refresh_table(self, state=None) -> None:
         self._maybe_recover_daemon()
+        # Cheap and idempotent, and the backstop for the resize hook: whether
+        # there is room for the preview depends only on the width, so if that
+        # hook ever stops firing the view still corrects itself on the next
+        # tick rather than staying wrong until a keypress.
+        if getattr(self, 'table', None) is not None:
+            try:
+                self._apply_layout()
+            except Exception:
+                pass
         if state is None:
             state = read_state()
         if not isinstance(state, dict):
@@ -4414,6 +4462,7 @@ class AutotmuxApp(App):
         else:
             text = str(state.get('squeue_long', '') or '')
             title = '── ALL JOBS (squeue -l)  [j: switch view] ──'
+        text = _dedent_block(text)
         if not text.strip():
             text = '(no squeue data yet — daemon may still be starting)'
         updated = state.get('squeue_updated', '?')
@@ -4438,6 +4487,17 @@ class AutotmuxApp(App):
         """Whether the live pane is on screen under the current layout."""
         return bool(layout_spec(getattr(self, 'layout_mode', None))['preview'])
 
+    def _room_for_preview(self) -> bool:
+        """Whether the screen can afford the live pane beside the table.
+
+        Measured on a phone: at 58 columns the table gets 56% of them, which
+        is 32 -- so ``tu_improve`` renders as ``tu_impr`` and LEFT, LOAD and
+        STATUS vanish entirely, while the 25 columns spent on the preview are
+        too few to read anything in. The split view is a desktop layout, and
+        below this width it costs the table everything and buys nothing.
+        """
+        return self.size.width >= _MIN_SPLIT_WIDTH
+
     def _apply_layout(self) -> None:
         """Show the panes this mode calls for. Idempotent."""
         spec = layout_spec(self.layout_mode)
@@ -4446,13 +4506,17 @@ class AutotmuxApp(App):
         preview = self.query_one('#right_pane_scroll')
         jobs = self.query_one('#jobs_scroll')
         was_previewing = bool(preview.display)
+        # Not a mode of its own: `z` still cycles the same four, and split
+        # simply looks like wide until there is room. A narrow terminal is a
+        # property of the screen, not a choice to be remembered.
+        show_preview = spec['preview'] and self._room_for_preview()
 
         # #upper is 1fr high: leaving it displayed with both children hidden
         # would reserve the whole body to draw nothing in.
-        upper.display = spec['table'] or spec['preview']
+        upper.display = spec['table'] or show_preview
         table.display = spec['table']
-        preview.display = spec['preview']
-        table.set_class(not spec['preview'], '-full')
+        preview.display = show_preview
+        table.set_class(not show_preview, '-full')
         jobs.display = spec['jobs']
         jobs.set_class(spec['expand_jobs'], '-full')
 
@@ -4469,8 +4533,25 @@ class AutotmuxApp(App):
         # Coming back from a mode that suppressed live fetches, the pane still
         # holds whatever it last drew, with nothing to say how old that is.
         # The cached snapshot is stale too, but it says so.
-        if spec['preview'] and not was_previewing:
+        if show_preview and not was_previewing:
             self._show_cached_snapshot(self.selected_node, self.selected_session)
+
+    async def _on_resize(self, event) -> None:
+        """Re-apply the layout when the screen changes shape.
+
+        A phone rotating, or a software keyboard opening, changes what fits,
+        and landscape is wide enough for the preview that portrait is not.
+        Overriding the private handler because Textual's own calls
+        ``event.stop()`` before any public ``on_resize`` could see it; the
+        refresh tick re-applies the layout too, so if this ever stops being
+        called the view corrects itself within one tick rather than not at
+        all.
+        """
+        await super()._on_resize(event)
+        try:
+            self._apply_layout()
+        except Exception:
+            pass
 
     async def action_cycle_layout(self) -> None:
         self.layout_mode = config.next_layout(self.layout_mode)
@@ -4478,8 +4559,10 @@ class AutotmuxApp(App):
         # Remembering it is the point: the mode is chosen to fit a terminal,
         # and that terminal is usually the same one tomorrow.
         config.save_layout(self.layout_mode)
-        self.notify(f'Layout: {layout_spec(self.layout_mode)["label"]}',
-                    timeout=2, markup=False)
+        label = layout_spec(self.layout_mode)['label']
+        if layout_spec(self.layout_mode)['preview'] and not self._room_for_preview():
+            label += ' · too narrow for the preview'
+        self.notify(f'Layout: {label}', timeout=2, markup=False)
 
     # ── persistent snapshot cache ────────────────────────────────────────────
 
