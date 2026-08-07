@@ -1051,8 +1051,8 @@ and unassigned), and without this there is no way to send an arrow, `Esc` or
 
 ```
   ↑     ↓     ⏎ attach     ←     →     esc    q
- ──────────────────────────────────────────────────────
-  nav  atmux  tmux  abc                    A−  A+  ⌨
+ ────────────────────────────────────────────────
+  nav  atmux  tmux                    A−  A+  ⌨
 ```
 
 - **nav** is the default: arrows repeat when held, so a long table is one
@@ -1065,17 +1065,21 @@ and unassigned), and without this there is no way to send an arrow, `Esc` or
 - **A− / A+** and pinch-to-zoom change the font size, and it is remembered.
   Pinch deliberately zooms the *font* and not the page: a zoomed viewport
   leaves you panning a grid that no longer fits.
-- **abc** is a full keyboard built into the page. iOS would not reliably
-  raise its own by any route: it presents the keyboard only as a side effect
+- **⌨** raises the platform keyboard, which is otherwise kept down: atmux
+  needs it only to name a session, and it costs half the screen. The terminal
+  keeps focus either way (`inputmode="none"`), so an iPad with a hardware
+  keyboard behaves like a desktop.
+
+  Raising it takes some care. iOS presents the keyboard only as a side effect
   of the scroll-into-view that `focus()` performs, and xterm calls
-  `focus({preventScroll: true})`, which suppresses it silently. Keys that are
-  just bytes on the websocket cannot fail that way. Shift is one-shot, `123`
-  reaches the symbols, and a test checks that every character
-  `NEW_SESSION_RE` accepts can actually be typed.
-- **⌨** still asks the OS for its keyboard, for anyone whose platform obliges.
-  The terminal keeps focus either way (`inputmode="none"`), so an iPad with a
-  hardware keyboard behaves like a desktop and never loses half its screen to
-  a keyboard it does not need.
+  `focus({preventScroll: true})` — which suppresses it with no error anywhere
+  — so this focuses the textarea directly. Controls on the pad also suppress
+  their default `pointerdown`, because a button that takes focus first leaves
+  the keyboard belonging to the button rather than to the terminal.
+
+  When it appears, the page resizes to `visualViewport` rather than to the
+  layout viewport, which does not shrink for it. Without that the last rows —
+  the ones with the cursor in them — sit behind the keyboard.
 
 Safari on iPadOS reports `Ctrl-C` from a hardware keyboard as keyCode 13
 (Enter). xterm.js fixed this in

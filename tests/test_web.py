@@ -558,36 +558,9 @@ class TouchKeypadTests(unittest.TestCase):
         self.assertIn("getElementById('kbd')", self.js)
         self.assertIn('changedTouches.length === 2', self.js)
 
-    def test_the_page_carries_its_own_alphabet(self):
-        """iOS would not raise its own keyboard by any route we could find --
-        focus() presents one only as a side effect of scrolling the element
-        into view, and every path into that was either suppressed by xterm or
-        lost to whichever control was touched. Keys that are just bytes on the
-        websocket cannot fail that way, so the page brings its own."""
-        letters = set(re.findall(r"\['([a-z])','\1'\]", self.js))
-        missing = set('abcdefghijklmnopqrstuvwxyz') - letters
-        self.assertEqual(missing, set(), f'no key for: {sorted(missing)}')
-
-    def test_a_session_name_can_be_typed_without_the_os_keyboard(self):
-        """`n` accepts config.NEW_SESSION_RE, so a name made only of the
-        characters it allows has to be typeable on the pad."""
-        from autotmux import config
-        on_pad = set(self._page('abc')) | set(self._page('num'))
-        on_pad |= {c.upper() for c in on_pad if len(c) == 1}   # via shift
-        for name in ('train2', 'sweep_A', 'tu-debug', 'run@gpu', 'a+b'):
-            with self.subTest(name=name):
-                self.assertRegex(name, config.NEW_SESSION_RE)
-                unreachable = [c for c in name if c not in on_pad]
-                self.assertEqual(unreachable, [],
-                                 f'cannot type {unreachable} in {name!r}')
-
-    def test_shift_reaches_uppercase(self):
-        self.assertIn("'shift'", self.js)
-        self.assertIn('toUpperCase()', self.js)
-
     def test_switching_page_retells_the_terminal_its_size(self):
-        """The keyboard is four rows and nav is one. Without a refit the
-        terminal keeps drawing rows that are now behind the keys."""
+        """The pad's height changes with the page, and without a refit tmux
+        keeps drawing rows that are now behind the keys."""
         body = re.search(r'function buildPage\(name\) \{(.*?)\n  \}',
                          self.js, re.S)
         self.assertIsNotNone(body)
@@ -615,6 +588,53 @@ class TouchKeypadTests(unittest.TestCase):
         """On a laptop it would be clutter that steals rows from the table."""
         self.assertIn('#pad { display: none; }', self.html)
         self.assertIn('body.touch #pad', self.html)
+
+
+class SoftwareKeyboardLayoutTests(unittest.TestCase):
+    """The terminal has to give the platform keyboard its space.
+
+    The software keyboard shrinks the *visual* viewport and leaves the layout
+    viewport alone, so a page sized in vh/dvh keeps its full height and draws
+    its last rows -- the ones with the cursor in them -- behind the keyboard.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(web.ASSETS, 'app.js'), encoding='utf-8') as f:
+            cls.js = f.read()
+        with open(os.path.join(web.ASSETS, 'index.html'), encoding='utf-8') as f:
+            cls.html = f.read()
+
+    def test_the_app_is_sized_to_the_visual_viewport(self):
+        self.assertIn('visualViewport', self.js)
+        self.assertRegex(self.js, r'app\.style\.height\s*=\s*vv\.height')
+
+    def test_it_follows_the_viewport_being_scrolled_as_well_as_resized(self):
+        """iOS scrolls the layout viewport to bring the focused element into
+        view, which slides the top of the terminal off screen. Resize alone
+        does not fire for that."""
+        self.assertIn("vv.addEventListener('resize'", self.js)
+        self.assertIn("vv.addEventListener('scroll'", self.js)
+        self.assertIn('offsetTop', self.js)
+
+    def test_the_terminal_is_re_measured_after_the_viewport_moves(self):
+        """Sizing the box is only half of it: tmux still believes the old row
+        count until the pty is told."""
+        body = re.search(r'function syncViewport\(\) \{(.*?)\n  \}',
+                         self.js, re.S)
+        self.assertIsNotNone(body, 'syncViewport not found')
+        self.assertIn('refit()', body.group(1))
+
+    def test_the_container_can_actually_be_resized(self):
+        """A statically positioned box sized in dvh ignores the height we set
+        on it, so the fix would apply and do nothing."""
+        self.assertRegex(self.html, r'#app \{[^}]*position: fixed')
+
+    def test_the_page_does_not_bring_its_own_keyboard(self):
+        """The platform's works. A worse copy of it beside the real one is
+        clutter, and two keyboards is a choice nobody wants to make."""
+        self.assertNotIn('data-page="abc"', self.html)
+        self.assertNotIn("['q','q']", self.js)
 
 
 class EntryPointTests(unittest.TestCase):

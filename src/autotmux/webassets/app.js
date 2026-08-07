@@ -185,36 +185,7 @@
       ['^C', '\x03'], ['^D', '\x04'], ['^Z', '\x1a'],
       ['^B', '\x02'], ['tab', '\t'],
       ['PgUp', ESC + '[5~', 'rep'], ['PgDn', ESC + '[6~', 'rep']
-    ]] },
-    // Our own keyboard, because iOS will not reliably raise its own: focus()
-    // presents the keyboard only as a side effect of scrolling the element
-    // into view, and every route into that behaviour is either suppressed by
-    // xterm (preventScroll) or lost to whichever control was touched. These
-    // keys are just bytes on the websocket, so they cannot fail that way.
-    //
-    // Typing here is rare and short -- naming a session, a note, a cluster --
-    // so the layout optimises for finding a key once, not for touch-typing.
-    abc: { rows: [
-      [['q','q'],['w','w'],['e','e'],['r','r'],['t','t'],
-       ['y','y'],['u','u'],['i','i'],['o','o'],['p','p']],
-      [['a','a'],['s','s'],['d','d'],['f','f'],['g','g'],
-       ['h','h'],['j','j'],['k','k'],['l','l']],
-      [['⇧', null, 'shift'],['z','z'],['x','x'],['c','c'],['v','v'],
-       ['b','b'],['n','n'],['m','m'],['⌫', BS, 'rep']],
-      [['123', null, 'layer:num'],['-','-'],['_','_'],
-       ['space', ' ', 'wide'],['.','.'],['/','/'],['⏎', '\r']]
-    ] },
-    num: { rows: [
-      [['1','1'],['2','2'],['3','3'],['4','4'],['5','5'],
-       ['6','6'],['7','7'],['8','8'],['9','9'],['0','0']],
-      [['-','-'],['_','_'],['=','='],['+','+'],['[','['],
-       [']',']'],['{','{'],['}','}'],['|','|'],['\\','\\']],
-      [[':',':'],[';',';'],["'","'"],['"','"'],[',',','],
-       ['.','.'],['?','?'],['~','~'],['⌫', BS, 'rep']],
-      [['abc', null, 'layer:abc'],['!','!'],['@','@'],['#','#'],
-       ['$','$'],['%','%'],['&','&'],['*','*'],
-       ['space', ' ', 'wide'],['⏎', '\r']]
-    ] }
+    ]] }
   };
 
   var keys = document.getElementById('keys');
@@ -231,22 +202,6 @@
     haptic();
   }
 
-  // One-shot, like a phone keyboard: it releases after the next letter rather
-  // than latching, because the thing being typed is a name, not a sentence.
-  var shift = false;
-  function setShift(on) {
-    shift = on;
-    Array.prototype.forEach.call(keys.querySelectorAll('.key'),
-      function (button) {
-        if (button.dataset.shift === 'y') {
-          button.classList.toggle('on', on);
-        } else if (button.dataset.letter) {
-          button.textContent = on ? button.dataset.letter.toUpperCase()
-                                  : button.dataset.letter;
-        }
-      });
-  }
-
   function buildPage(name) {
     page = name;
     keys.textContent = '';
@@ -258,11 +213,9 @@
       });
       keys.appendChild(line);
     });
-    shift = false;
     Array.prototype.forEach.call(
       document.querySelectorAll('#tabs [data-page]'), function (tab) {
-        tab.classList.toggle('on', tab.dataset.page === name
-                             || (name === 'num' && tab.dataset.page === 'abc'));
+        tab.classList.toggle('on', tab.dataset.page === name);
       });
     // The pad's height changes with the page -- the keyboard is four rows and
     // nav is one -- and the terminal has to be told, or tmux keeps drawing for
@@ -275,23 +228,8 @@
     button.className = 'key' + (flag === 'wide' ? ' wide' : '');
     button.textContent = label;
     button.setAttribute('aria-label', label);
-    if (flag === 'shift') button.dataset.shift = 'y';
-    if (/^[a-z]$/.test(seq || '')) button.dataset.letter = seq;
-
     var timer = null, interval = null;
-    function fire() {
-      if (flag === 'shift') { setShift(!shift); return; }
-      if (flag && flag.indexOf('layer:') === 0) {
-        buildPage(flag.slice(6));
-        return;
-      }
-      var out = seq;
-      if (shift && button.dataset.letter) {
-        out = seq.toUpperCase();
-        setShift(false);
-      }
-      press(out);
-    }
+    function fire() { press(seq); }
     // pointerdown, not click: a key should fire the moment it is touched,
     // and holding an arrow should repeat rather than needing ten taps.
     function down(event) {
@@ -401,15 +339,42 @@
       sendResize();
     }, 60);
   }
-  window.addEventListener('resize', refit);
-  window.addEventListener('orientationchange', function () {
-    setTimeout(refit, 300);
-  });
-  // The software keyboard resizes the visual viewport but not the layout
-  // viewport, so without this the bottom rows sit behind the keyboard.
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener('resize', refit);
+
+  // The software keyboard shrinks the *visual* viewport and leaves the layout
+  // viewport alone, so a page sized in vh/dvh keeps its full height and its
+  // last rows -- the ones with the cursor in them -- sit behind the keyboard.
+  // Sizing the app to visualViewport instead is the only way to see what you
+  // are typing.
+  //
+  // iOS also scrolls the layout viewport to bring the focused element into
+  // view, which slides the top of the terminal off screen; offsetTop is how
+  // much, and pinning the page back to 0 undoes it.
+  var app = document.getElementById('app');
+  var vv = window.visualViewport;
+  function syncViewport() {
+    if (!vv) return;
+    app.style.height = vv.height + 'px';
+    app.style.transform = vv.offsetTop
+      ? 'translateY(' + vv.offsetTop + 'px)' : '';
+    refit();
   }
+  if (vv) {
+    vv.addEventListener('resize', syncViewport);
+    vv.addEventListener('scroll', syncViewport);
+    syncViewport();
+  }
+  window.addEventListener('resize', function () {
+    syncViewport(); refit();
+  });
+  window.addEventListener('orientationchange', function () {
+    // The viewport metrics are wrong until the rotation animation finishes.
+    setTimeout(function () { syncViewport(); refit(); }, 300);
+  });
+  // Keep the layout viewport pinned: iOS scrolls it under the keyboard and
+  // nothing scrolls it back, leaving a permanent gap above the terminal.
+  window.addEventListener('scroll', function () {
+    if (vv && vv.offsetTop === 0 && window.scrollY !== 0) window.scrollTo(0, 0);
+  });
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden) { refit(); if (ws && ws.readyState > 1) connect(); }
   });

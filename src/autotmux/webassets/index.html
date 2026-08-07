@@ -21,10 +21,14 @@
     -webkit-text-size-adjust: 100%;     /* Safari must not reflow our monospace */
   }
   #app {
+    /* Fixed, so app.js can size it to visualViewport when the software
+       keyboard is up -- the layout viewport does not shrink, and a page
+       sized to it draws its last rows behind the keyboard. dvh is the
+       starting value and the fallback where visualViewport is missing. */
+    position: fixed; top: 0; left: 0; right: 0;
     display: flex; flex-direction: column;
-    height: 100dvh;                     /* dvh, not vh: iOS Safari's URL bar
-                                           shrinks the viewport and vh does not
-                                           notice, cutting off rows */
+    height: 100dvh;
+    transform-origin: top left;
   }
   #term {
     flex: 1 1 auto; min-height: 0; padding: 2px 4px;
@@ -100,7 +104,6 @@
       <button data-page="nav">nav</button>
       <button data-page="atmux">atmux</button>
       <button data-page="tmux">tmux</button>
-      <button data-page="abc">abc</button>
       <span class="spacer"></span>
       <button id="fontminus" aria-label="smaller">A−</button>
       <button id="fontplus" aria-label="larger">A+</button>
