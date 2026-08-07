@@ -696,3 +696,47 @@ class EntryPointTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BindAddressTests(unittest.TestCase):
+    """Where it is safe to listen.
+
+    Nothing here authenticates a caller, so the bind address *is* the security
+    boundary: whoever can open the socket owns a shell.
+    """
+
+    def test_loopback_is_private(self):
+        for host in ('127.0.0.1', 'localhost', '::1'):
+            with self.subTest(host=host):
+                self.assertTrue(web.is_private_bind(host))
+
+    def test_a_tailnet_address_is_private(self):
+        """Tailscale hands every node an address in the CGNAT range, and
+        nothing outside the tailnet can route to it -- the same peers reach it
+        as would reach `tailscale serve`, so it is the same posture and the
+        answer when serve itself is unavailable."""
+        for host in ('100.64.0.1', '100.64.69.42', '100.127.255.254',
+                     'fd7a:115c:a1e0::c63a:452a'):
+            with self.subTest(host=host):
+                self.assertTrue(web.is_private_bind(host))
+
+    def test_a_routable_address_is_not(self):
+        """0.0.0.0 is the one that matters: it is one flag away and it puts a
+        shell on every interface the machine has."""
+        for host in ('0.0.0.0', '8.8.8.8', '192.168.1.5', '10.0.0.1',
+                     '100.128.0.1', '2001:4860:4860::8888'):
+            with self.subTest(host=host):
+                self.assertFalse(web.is_private_bind(host))
+
+    def test_the_edges_of_the_tailnet_range_are_right(self):
+        """100.64.0.0/10 ends at 100.127.255.255; 100.128.0.0 is somebody
+        else's."""
+        self.assertTrue(web.is_private_bind('100.127.255.255'))
+        self.assertFalse(web.is_private_bind('100.128.0.0'))
+        self.assertFalse(web.is_private_bind('100.63.255.255'))
+
+    def test_junk_is_not_mistaken_for_private(self):
+        for host in ('', 'example.com', 'not an address', None):
+            with self.subTest(host=host):
+                self.assertFalse(web.is_private_bind(host) if isinstance(host, str)
+                                 else web.is_private_bind(str(host)))

@@ -23,6 +23,7 @@ import errno
 import fcntl
 import hashlib
 import http.server
+import ipaddress
 import json
 import os
 import pty
@@ -56,6 +57,28 @@ PTY_READ_BYTES = 65536
 
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 7681
+
+# Tailscale hands every node an address in the CGNAT range, and nothing
+# outside the tailnet can route to it. Binding there is the same security
+# posture as loopback behind `tailscale serve` -- the same peers reach it
+# either way -- and it is the answer when serve itself is unavailable, which
+# it is after a tailnet rename until tailscaled is restarted.
+_TAILNET_V4 = ipaddress.ip_network('100.64.0.0/10')
+
+
+def is_private_bind(host: str) -> bool:
+    """Whether binding here keeps the terminal off the public internet."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host in ('localhost',)
+    if address.is_loopback:
+        return True
+    if address.version == 4 and address in _TAILNET_V4:
+        return True
+    # Tailscale's IPv6 range, and ordinary link-local.
+    return address.is_link_local or (
+        address.version == 6 and address in ipaddress.ip_network('fd7a:115c:a1e0::/48'))
 
 
 # ── WebSocket framing ─────────────────────────────────────────────────────
@@ -416,6 +439,8 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     if host in ('127.0.0.1', 'localhost', '::1'):
         print('[atmux-web] loopback only — publish it with: '
               f'tailscale serve --bg {port}')
+    elif is_private_bind(host):
+        print(f'[atmux-web] reachable from your tailnet at {where}')
     else:
         print(f'[atmux-web] ⚠ bound to {host}: anything that can reach this '
               'port gets a shell. Prefer 127.0.0.1 + `tailscale serve`.')
