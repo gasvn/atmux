@@ -6,6 +6,7 @@ it never runs squeue or background SSH itself.  Interactive SSH/tmux commands
 run only after the user explicitly presses Enter, s, or o.
 """
 import asyncio
+from contextlib import contextmanager
 from dataclasses import dataclass
 import enum
 import errno
@@ -47,8 +48,8 @@ import rich.text
 from autotmux import __version__
 
 from autotmux import (
-    config, gateway as gateway_client, ipc, keepalive, lifecycle, notify,
-    paths, urlhandler, warm_registry, webcontrol,
+    config, gateway as gateway_client, ipc, keepalive, keypad, lifecycle,
+    notify, paths, urlhandler, warm_registry, webcontrol,
 )
 
 STATE_FILE = paths.STATE_FILE
@@ -3434,6 +3435,80 @@ def layout_spec(mode) -> dict:
     return spec if spec is not None else _LAYOUT_SPECS[config.LAYOUT_DEFAULT]
 
 
+class TouchBar(Vertical):
+    """The live bindings as buttons big enough to hit with a thumb.
+
+    For a touch client with no way to draw its own controls -- a phone ssh
+    app, where the only surface is the character grid. The browser client
+    gets the same list over OSC and draws real buttons outside the grid, so
+    the two are never on screen at once: exactly one surface owns the
+    controls, or the same action appears twice, differently labelled.
+
+    It is the footer, made hittable. Textual's Footer packs its keys onto one
+    line, which on a phone is a row of six-pixel targets and, past the fourth
+    binding, is simply off the edge.
+    """
+
+    DEFAULT_CSS = """
+    TouchBar { height: auto; dock: bottom; background: $panel; }
+    TouchBar > Horizontal { height: 3; }
+    TouchBar Button { width: 1fr; height: 3; min-width: 8; margin: 0 1 0 0; }
+    """
+
+    # Four across is what fits a phone at the width the layout aims for; three
+    # rows deep is where it starts eating the table it exists to act on.
+    PER_ROW = 4
+
+    def __init__(self, per_row: int = PER_ROW, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._per_row = max(1, int(per_row))
+        self._actions: dict = {}
+        self._signature: tuple = ()
+
+    async def rebuild(self, bindings) -> None:
+        """Redraw only when the set actually changed.
+
+        Called from the same poll that publishes to the browser, so it runs
+        four times a second; tearing down and remounting a dozen widgets at
+        that rate would be visible.
+        """
+        chosen = keypad.visible_bindings(bindings)
+        signature = tuple(
+            (e.binding.description, e.binding.action) for e in chosen)
+        if signature == self._signature:
+            return
+        self._signature = signature
+        self._actions.clear()
+        await self.remove_children()
+        rows: list[list] = []
+        for index, entry in enumerate(chosen):
+            if index % self._per_row == 0:
+                rows.append([])
+            name = f'tb{index}'
+            # The node, not just the action: Attach is bound on the table, and
+            # running it against the app looks for an action that is not there.
+            self._actions[name] = (entry.node, entry.binding.action)
+            button = Button(entry.binding.description, id=name)
+            # A button that takes focus takes it from the table -- and Attach
+            # is bound on the table, so it leaves the live set, so every
+            # button after it shifts up one. Measured: a tap aimed at Layout
+            # relabelled that same button Clusters before the press landed,
+            # and opened the cluster manager. The controls must never be what
+            # the controls are describing.
+            button.can_focus = False
+            rows[-1].append(button)
+        for row in rows:
+            await self.mount(Horizontal(*row))
+
+    async def on_button_pressed(self, event) -> None:
+        target = self._actions.get(event.button.id or '')
+        event.stop()
+        if target is None:
+            return
+        node, action = target
+        await (node or self.app).run_action(action)
+
+
 class AutotmuxApp(App):
     # Without this the header reads "AutotmuxApp", i.e. the class name.
     TITLE = 'atmux'
@@ -3642,7 +3717,16 @@ class AutotmuxApp(App):
         # queue the arrow keys; a bare Static scrolls by mouse only.
         with VerticalScroll(id="jobs_scroll"):
             yield Static("(loading squeue...)", id="jobs_panel", markup=False)
-        yield Footer()
+        # Whoever can draw the controls, draws them once. A browser client
+        # renders the same bindings as real buttons outside the grid, so the
+        # footer there is a second, smaller, less complete copy of what is
+        # already on screen -- and a phone ssh client has no surface but this
+        # one, so it gets buttons instead of a line of six-pixel targets.
+        mode = keypad.touch_mode()
+        if mode == 'local':
+            yield TouchBar(id="touchbar")
+        elif mode != 'web':
+            yield Footer()
 
     async def on_mount(self) -> None:
         self.table = self.query_one(DataTable)
@@ -3668,6 +3752,20 @@ class AutotmuxApp(App):
         self.query_one("#right_pane_scroll").can_focus = False
         self.table.focus()
         self._apply_layout()
+
+        # Polled rather than hooked to an event: bindings change when a modal
+        # opens, when focus moves and when the layout changes panes, and one
+        # cheap check that catches all three beats three hooks that between
+        # them still miss the fourth. 20us a call, four times a second.
+        self._touch_mode = keypad.touch_mode()
+        self._published_keys = None
+        if self._touch_mode == 'web':
+            self._publish_keys()
+            self.set_interval(0.25, self._publish_keys)
+        elif self._touch_mode == 'local':
+            self._touch_bar = self.query_one(TouchBar)
+            await self._touch_bar.rebuild(self.active_bindings)
+            self.set_interval(0.25, self._sync_touch_bar)
 
         self.all_sessions: list = []
         self.selected_node = ""
@@ -4621,6 +4719,69 @@ class AutotmuxApp(App):
         below this width it costs the table everything and buys nothing.
         """
         return self.size.width >= _MIN_SPLIT_WIDTH
+
+    # ── publishing what you can do (touch clients) ───────────────────────
+
+    def _publish_keys(self, mode: str = 'app') -> None:
+        """Hand a browser client the bindings that are live right now.
+
+        ``active_bindings`` already knows them per screen and per focus, so a
+        modal changes the buttons on the phone without anything here listing
+        what a modal offers. That is the whole point: the copy of this list
+        that used to live in javascript could only ever be right on the day
+        it was written.
+
+        Silent unless a client said it can draw them -- see keypad.touch_mode.
+        """
+        if getattr(self, '_touch_mode', '') != 'web':
+            return
+        keys = (keypad.EXTERNAL_KEYS if mode == 'external'
+                else keypad.keys_for(self.active_bindings))
+        payload = keypad.encode(mode, keys)
+        if payload == getattr(self, '_published_keys', None):
+            return
+        driver = getattr(self, '_driver', None)
+        if driver is None:
+            return
+        try:
+            driver.write(payload)
+            driver.flush()
+        except Exception:
+            # A dashboard that dies because a phone could not be told about a
+            # button is a worse outcome than a phone with stale buttons.
+            return
+        self._published_keys = payload
+
+    async def _sync_touch_bar(self) -> None:
+        """Same poll, same reason: bindings change and the bar has to follow."""
+        bar = getattr(self, '_touch_bar', None)
+        if bar is not None:
+            try:
+                await bar.rebuild(self.active_bindings)
+            except Exception:
+                # A dashboard that dies because a button could not be redrawn
+                # is worse than a bar showing the previous screen's buttons.
+                return
+
+    @contextmanager
+    def suspend(self):
+        """Hand the screen to a raw program, and say so.
+
+        Past this point the terminal belongs to tmux or a shell. Neither can
+        draw a button or answer a question about its own keys, so the client
+        gets the one static set that situation actually calls for -- and gets
+        the app's own back the moment the app is drawing again.
+        """
+        self._publish_keys('external')
+        try:
+            with super().suspend():
+                yield
+        finally:
+            # Force a re-send: the app's payload is very likely the one that
+            # was published before the handover, and unchanged payloads are
+            # suppressed.
+            self._published_keys = None
+            self._publish_keys()
 
     def _apply_layout(self) -> None:
         """Show the panes this mode calls for. Idempotent."""

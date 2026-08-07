@@ -38,6 +38,7 @@ import termios
 import threading
 
 from . import config
+from . import keypad
 from . import paths
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'webassets')
@@ -380,9 +381,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._pump()
 
+    def _client_env(self) -> dict:
+        """The environment this particular client's dashboard should see.
+
+        Who draws the controls is a property of the client, not of the
+        server: a phone and a laptop reach the same process, and a laptop
+        that had its footer hidden because a phone might connect would be
+        left with no controls at all. The page says which it is in the
+        socket URL, which is the only thing available before the pty exists.
+        """
+        env = dict(self.server.env)
+        query = self.path.split('?', 1)[1] if '?' in self.path else ''
+        if 'touch=1' in query.split('&'):
+            env[keypad.TOUCH_ENV] = 'web'
+        return env
+
     def _pump(self) -> None:
         conn = self.connection
-        terminal = Terminal(self.server.argv, env=self.server.env)
+        terminal = Terminal(self.server.argv, env=self._client_env())
         reader = FrameReader()
         conn.setblocking(False)
         try:

@@ -84,21 +84,26 @@
     resize: none; border: 0; padding: 0;
   }
   #keys { padding: 7px 7px 4px; }
-  /* Fixed rows, never wrapping: flex-wrap stretched whichever key landed
-     alone on the last line into a full-width button, which read as something
-     important rather than as the leftover it was. */
+  /* Fixed columns, never wrapping the row: flex-wrap stretched whichever key
+     landed alone on the last line into a full-width button, which read as
+     something important rather than as the leftover it was. A short last row
+     is padded with invisible keys instead. */
   .krow { display: flex; gap: 5px; margin-bottom: 5px; }
-  .krow .key { flex: 1 1 0; min-width: 0; padding: 0 2px; }
-  .krow .key.wide { flex: 2 1 0; }
+  .krow .key { flex: 1 1 0; min-width: 0; }
+  .key.gap { background: none; border-color: transparent; }
   .key {
     min-height: 44px;                   /* Apple's minimum touch target */
-    padding: 0 4px;
+    padding: 4px 5px;
     background: #26262c; color: #e2e2e6; border: 1px solid #383840;
     border-radius: 9px;
-    font: 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    /* The labels are the app's own descriptions -- "Auto-renew job", not a
+       bare `k` -- so they wrap rather than clip. A truncated label is a
+       button whose meaning you have to already know, which is the problem
+       these replaced. */
+    font: 11px/1.15 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: normal; overflow-wrap: anywhere; hyphens: auto;
     -webkit-tap-highlight-color: transparent;
     touch-action: none;                 /* a held key repeats; it never scrolls */
-    overflow: hidden; text-overflow: clip; white-space: nowrap;
   }
   .key.down { background: #4a4a58; border-color: #6f6f80; }
   .key.on { background: #3c5a8a; border-color: #5b82bd; color: #fff; }
@@ -134,15 +139,15 @@
 <body>
 <div id="app">
   <div id="term"></div>
-  <!-- Not a terminal keyboard: atmux is a table you steer with arrows and act
-       on with single letters, so these are its keys, grouped the way `?`
-       groups them. -->
+  <!-- Filled in from what the dashboard publishes, not from a list kept
+       here. Empty until it says something, because a keypad invented for a
+       program we cannot ask is a row of buttons that lie. -->
   <div id="pad">
     <div id="keys"></div>
     <div id="tabs">
-      <button data-page="nav">nav</button>
-      <button data-page="atmux">atmux</button>
-      <button data-page="tmux">tmux</button>
+      <!-- No pages. The keys come from the dashboard and change with its
+           screen; the only thing left to choose is how many rows to show. -->
+      <button id="more" aria-label="more keys">⌄</button>
       <span class="spacer"></span>
       <button id="fontminus" aria-label="smaller">A−</button>
       <!-- Lit while the layout is choosing the size, which is the normal

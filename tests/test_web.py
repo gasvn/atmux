@@ -18,7 +18,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from autotmux import web
+from autotmux import keypad, web
 
 
 def _node():
@@ -517,11 +517,15 @@ class WebsocketBridgeTests(_ServedFixture):
 
 
 class TouchKeypadTests(unittest.TestCase):
-    """The keypad is the phone's only way to press a key.
+    """The pad is the phone's only way to press a key.
 
     xterm.js has no touch gesture support (issue #5377, open and unassigned),
-    so on a touch screen there is no other way to send an arrow, Esc, or a
-    control character at all -- and atmux is steered almost entirely by those.
+    so on a touch screen there is no other way to send Esc or a control
+    character at all. What the pad offers is not written here any more: the
+    dashboard publishes its live bindings and this renders them, because a
+    copy kept in javascript is only correct on the day it is written -- and
+    the copy that was here had grown three pages, which is how the layout key
+    ended up two taps deep behind a tab nobody would open.
     """
 
     @classmethod
@@ -531,75 +535,45 @@ class TouchKeypadTests(unittest.TestCase):
         with open(os.path.join(web.ASSETS, 'index.html'), encoding='utf-8') as f:
             cls.html = f.read()
 
-    def _page(self, name):
-        """Every key label on one keypad page.
-
-        Brace-matched rather than pattern-matched: the pages nest, and a
-        non-greedy regex quietly returned a different page's keys -- which is
-        worse than failing, because the assertion still passes.
-        """
-        start = re.search(r'^    ' + name + r': \{', self.js, re.M)
-        self.assertIsNotNone(start, f'no {name} page in the keypad')
-        index, depth = start.end() - 1, 0
-        while index < len(self.js):
-            if self.js[index] == '{':
-                depth += 1
-            elif self.js[index] == '}':
-                depth -= 1
-                if depth == 0:
-                    break
-            index += 1
-        return re.findall(r"\['((?:[^'\\]|\\.)*)'",
-                          self.js[start.end():index])
-
-    def _sent(self, name):
-        """The key each button on a page actually sends."""
-        start = re.search(r'^    ' + name + r': \{', self.js, re.M)
-        self.assertIsNotNone(start, f'no {name} page')
-        index, depth = start.end() - 1, 0
-        while index < len(self.js):
-            if self.js[index] == '{':
-                depth += 1
-            elif self.js[index] == '}':
-                depth -= 1
-                if depth == 0:
-                    break
-            index += 1
-        return re.findall(r"\['[^']*', '([^']*)'", self.js[start.end():index])
 
     def test_the_keypad_offers_every_key_atmux_binds(self):
-        """A bound key with no button is unreachable on a phone. This fails
-        the moment someone adds a binding without adding the button."""
-        from autotmux import cli
-        bound = {b.key for b in cli.AutotmuxApp.BINDINGS}
-        on_pad = set(self._sent('atmux')) | set(self._sent('nav'))
-        # `?` is bound under the name Textual gives the character; `q` quits
-        # the dashboard and is deliberately not a button anyone can hit by
-        # accident -- closing the tab does the same thing.
-        bound.discard('question_mark')
-        bound.discard('q')
-        bound.add('?')
-        missing = {k for k in bound if len(k) == 1 and k not in on_pad}
-        self.assertEqual(missing, set(),
-                         f'no button for bound key(s): {sorted(missing)}')
+        """Not by keeping a list in step -- by not having a second list. This
+        fails if the page ever goes back to naming keys of its own."""
+        for gone in ('PAGES', 'buildPage', 'data-page'):
+            with self.subTest(token=gone):
+                self.assertNotIn(gone, self.js)
+                self.assertNotIn(gone, self.html)
+        self.assertIn('registerOscHandler', self.js)
+        self.assertIn(str(keypad.OSC), self.js)
+
 
     def test_no_button_sends_a_key_atmux_does_not_bind(self):
-        """A dead button is worse than a missing one: it teaches that the
-        keypad does not work."""
-        from autotmux import cli
-        bound = {b.key for b in cli.AutotmuxApp.BINDINGS}
-        bound |= {b.key for b in cli.ClickToAttachDataTable.BINDINGS}
-        bound.add('?')
-        for key in self._sent('atmux'):
-            with self.subTest(key=key):
-                self.assertIn(key, bound)
+        """A dead button is worse than a missing one: it teaches that the pad
+        does not work. Every key comes from a binding that exists, so the
+        risk moved to the wire -- anything could be running on that pty."""
+        handler = _extract(self.js, 'buildKey')
+        self.assertIsNotNone(handler)
+        osc = self.js[self.js.index('registerOscHandler'):]
+        osc = osc[:osc.index('return true;\n  });')]
+        for guard in ("typeof entry.k === 'string'",
+                      "typeof entry.l === 'string'",
+                      'entry.k.length <=', 'entry.l.length <='):
+            with self.subTest(guard=guard):
+                self.assertIn(guard, osc)
+
 
     def test_every_key_says_what_it_does(self):
         """A row of bare letters is unreadable on a phone -- `x` kills a
-        session and `z` changes the layout, and nothing on screen said so."""
-        for label in self._page('atmux'):
-            with self.subTest(label=label):
-                self.assertGreater(len(label), 1, f'{label!r} is just a letter')
+        session and `z` changes the layout, and nothing said so. The labels
+        are now the app's own descriptions, so this checks the app."""
+        from autotmux import cli
+        for binding in cli.AutotmuxApp.BINDINGS:
+            if binding.key in ('q',) or not binding.description:
+                continue
+            with self.subTest(key=binding.key):
+                self.assertGreater(
+                    len(binding.description), 1,
+                    f'{binding.key}: {binding.description!r} is just a letter')
 
     def test_no_key_stretches_into_something_it_is_not(self):
         """flex-wrap stretched whichever key landed alone on the last line
@@ -612,12 +586,15 @@ class TouchKeypadTests(unittest.TestCase):
         self.assertNotIn('flex-wrap', css)
         self.assertRegex(css, r'\.krow \.key \{[^}]*flex: 1 1 0')
 
+
     def test_detach_is_offered_because_nobody_can_guess_it(self):
-        """Ctrl-B then d. It is unreachable without a keyboard, and getting
-        stuck inside an attached session is the failure this whole feature
-        would otherwise create."""
-        self.assertIn('\\x02d', self.js)
-        self.assertIn('detach', self._page('tmux'))
+        """Ctrl-B then d. Attaching hands the screen to tmux, which draws no
+        buttons and answers no questions, so this one set is static because
+        the situation is -- see keypad.EXTERNAL_KEYS."""
+        labels = {k['l'] for k in keypad.EXTERNAL_KEYS}
+        self.assertIn('detach', labels)
+        # And the page must not carry its own copy of it.
+        self.assertNotIn('x02d', self.js)
 
     def test_typing_puts_a_real_input_under_the_finger(self):
         """Two attempts at calling focus() from JavaScript failed silently.
@@ -629,13 +606,16 @@ class TouchKeypadTests(unittest.TestCase):
         self.assertRegex(self.html, r'atmux-typing \{[^}]*opacity: 0')
         self.assertRegex(self.html, r'atmux-typing \{[^}]*height: 100%')
 
-    def test_arrows_repeat_when_held(self):
-        """A table is navigated by arrow. Ten taps to move ten rows is the
-        difference between usable and not."""
-        self.assertIn("'rep'", self.js)
-        self.assertIn('setInterval', self.js)
-        for entry in re.findall(r"\['↑', [^\]]+\]", self.js):
-            self.assertIn('rep', entry)
+
+    def test_repeating_keys_are_recognised_rather_than_flagged(self):
+        """The keys worth repeating are the ones that move something a step
+        at a time, and those are exactly the CSI sequences. Deriving it means
+        nothing has to remember to mark a new one."""
+        body = _extract(self.js, 'buildKey')
+        # The literal /^\x1b\[/ -- a CSI prefix, not a hand-kept flag.
+        self.assertIn('/^\\x1b\\[/', body)
+        self.assertIn('setInterval', body)
+        self.assertNotIn("'rep'", self.js)
 
     def test_the_software_keyboard_is_off_until_asked_for(self):
         """It costs half the screen and atmux needs it only to name a new
@@ -668,7 +648,7 @@ class TouchKeypadTests(unittest.TestCase):
         """A button that takes focus first leaves nothing to bounce, and the
         keyboard then belongs to the button rather than the terminal."""
         self.assertIn('function keepFocus', self.js)
-        for control in ('kbd', 'minus', 'plus', 'tab'):
+        for control in ('kbd', 'minus', 'plus', 'expander'):
             with self.subTest(control=control):
                 self.assertRegex(self.js, r'keepFocus\(' + control + r'\)')
 
@@ -677,13 +657,11 @@ class TouchKeypadTests(unittest.TestCase):
         the taps that should be attaching to a session."""
         self.assertRegex(self.js, r"textarea\.addEventListener\('blur'")
 
-    def test_switching_page_retells_the_terminal_its_size(self):
-        """The pad's height changes with the page, and without a refit tmux
-        keeps drawing rows that are now behind the keys."""
-        body = re.search(r'function buildPage\(name\) \{(.*?)\n  \}',
-                         self.js, re.S)
-        self.assertIsNotNone(body)
-        self.assertIn('refit()', body.group(1))
+
+    def test_changing_the_keys_retells_the_terminal_its_size(self):
+        """The pad's height changes with how many keys there are, and without
+        a refit the app keeps drawing rows that are now behind them."""
+        self.assertIn('refit()', _extract(self.js, 'renderKeys'))
 
     def test_pinch_zooms_the_font_and_not_the_page(self):
         """A zoomed viewport leaves you panning a grid that no longer fits,
@@ -1157,3 +1135,105 @@ class AutoFontTests(unittest.TestCase):
             with self.subTest(width=width):
                 self.assertGreaterEqual(self.font_for(width), low)
                 self.assertLessEqual(self.font_for(width), high)
+
+
+class ControlSurfaceTests(_ServedFixture):
+    """Exactly one surface draws the controls.
+
+    A browser renders the published bindings as real buttons outside the
+    character grid; a phone ssh client has only the grid; a laptop has a
+    keyboard and wants neither. Which of those is on the far end is a
+    property of the *client*, and the same server process serves all three --
+    so a footer hidden because a phone might connect leaves a laptop with no
+    controls at all. The page says which it is in the socket URL, the only
+    channel that exists before the pty does.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with open(os.path.join(web.ASSETS, 'app.js'), encoding='utf-8') as f:
+            cls.js = f.read()
+
+    def test_a_touch_client_asks_for_buttons_in_its_socket_url(self):
+        url = _extract(self.js, 'socketURL')
+        self.assertIn('touch=1', url)
+        self.assertIn('touch ?', url, 'the flag must depend on the client')
+
+    def test_the_server_only_tells_the_app_when_the_client_said_so(self):
+        handler = web.Handler.__new__(web.Handler)
+        handler.server = self.server
+        for path, expected in (('/ws?touch=1', 'web'),
+                               ('/ws', ''),
+                               ('/ws?touch=0', ''),
+                               ('/ws?touched=1', ''),
+                               ('/ws?other=1&touch=1', 'web')):
+            handler.path = path
+            with self.subTest(path=path):
+                env = handler._client_env()
+                self.assertEqual(env.get(keypad.TOUCH_ENV, ''), expected)
+
+    def test_a_desktop_browser_keeps_the_apps_own_footer(self):
+        """The regression this guards: hiding the footer for everyone because
+        one of the clients draws its own buttons."""
+        handler = web.Handler.__new__(web.Handler)
+        handler.server = self.server
+        handler.path = '/ws'
+        self.assertEqual(keypad.touch_mode(handler._client_env()), '')
+
+
+@unittest.skipUnless(os.path.exists(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    '.venv', 'bin', 'atmux')), 'needs the installed entry point')
+class PublishedControlsEndToEndTests(unittest.TestCase):
+    """The dashboard really emits this, through a real pty.
+
+    Every other test here reads source. This one runs the program: an escape
+    sequence that is well-formed in a unit test and mangled by the renderer
+    would pass everything else and reach the phone as nothing at all.
+    """
+
+    ATMUX = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        '.venv', 'bin', 'atmux')
+
+    def _run(self, env, seconds=25):
+        term = web.Terminal([self.ATMUX], env=env, cols=68, rows=50)
+        raw = b''
+        deadline = time.time() + seconds
+        try:
+            while time.time() < deadline:
+                raw += term.read()
+                if b'\x1b]%d;' % keypad.OSC in raw:
+                    break
+                time.sleep(0.05)
+        finally:
+            term.close()
+        return raw.decode('utf-8', 'replace')
+
+    def test_the_bindings_arrive_and_carry_what_a_button_needs(self):
+        text = self._run({keypad.TOUCH_ENV: 'web'})
+        # Escaped rather than hand-written: the terminator is ESC backslash,
+        # and a pattern that trims one backslash too many fails on a payload
+        # that was perfectly good.
+        pattern = (re.escape(f'\x1b]{keypad.OSC};') + '.*?'
+                   + re.escape('\x1b\\'))
+        frames = re.findall(pattern, text)
+        self.assertTrue(frames, 'nothing was published')
+        data = keypad.decode(frames[0])
+        self.assertIsNotNone(data, f'unparseable: {frames[0]!r}')
+        self.assertEqual(data['mode'], 'app')
+        labels = {k['l']: k['k'] for k in data['keys']}
+        # The footer's own keys, which is the app's statement of what matters.
+        for label, sequence in (('Attach', '\r'), ('SSH to node', 's'),
+                                ('Layout', 'z'), ('Help', '?')):
+            with self.subTest(label=label):
+                self.assertEqual(labels.get(label), sequence)
+        # And nothing that would be a trap under a thumb.
+        self.assertNotIn('Quit', labels)
+
+    def test_a_keyboard_client_is_told_nothing(self):
+        """Publishing to a terminal that cannot use it is noise on the wire,
+        and on a slow link it is noise competing with the screen."""
+        text = self._run({}, seconds=8)
+        self.assertNotIn('\x1b]%d;' % keypad.OSC, text)

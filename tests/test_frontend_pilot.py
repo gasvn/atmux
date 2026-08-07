@@ -2098,3 +2098,161 @@ class WebDashboardScreenTests(unittest.TestCase):
         without = dict(autotmux.webcontrol.commands(
             {'systemd': False, 'port': 7681}))
         self.assertIn('atmux-web', without['start'])
+
+
+class TouchControlSurfaceTests(unittest.IsolatedAsyncioTestCase):
+    """Whoever can draw the controls draws them, and only one of them does.
+
+    Textual's Footer packs every binding onto one line. On a phone that is a
+    row of six-pixel targets, and past the fourth binding it is off the edge
+    entirely -- so a touch client with no other surface gets buttons in the
+    grid instead. A browser draws its own outside the grid and gets neither
+    footer nor bar, because two control surfaces is how one action ends up in
+    two places with two labels.
+    """
+
+    def setUp(self):
+        self._saved_launch = autotmux._launch_daemon
+        autotmux._launch_daemon = lambda: (True, '')
+        self._saved_prewarm = autotmux.AutotmuxApp._prewarm_interactive_async
+
+        async def no_prewarm(_app, _nodes, _source_pool):
+            return None
+
+        autotmux.AutotmuxApp._prewarm_interactive_async = no_prewarm
+        self._saved_env = os.environ.get(autotmux.keypad.TOUCH_ENV)
+
+    def tearDown(self):
+        autotmux._launch_daemon = self._saved_launch
+        autotmux.AutotmuxApp._prewarm_interactive_async = self._saved_prewarm
+        if self._saved_env is None:
+            os.environ.pop(autotmux.keypad.TOUCH_ENV, None)
+        else:
+            os.environ[autotmux.keypad.TOUCH_ENV] = self._saved_env
+
+    @asynccontextmanager
+    async def _app(self, mode, size=(68, 45)):
+        if mode:
+            os.environ[autotmux.keypad.TOUCH_ENV] = mode
+        else:
+            os.environ.pop(autotmux.keypad.TOUCH_ENV, None)
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=size) as pilot:
+                await pilot.pause()
+                # The bar follows the same poll that publishes to a browser;
+                # focus settles a beat after mount, and Attach is bound on
+                # the table rather than on the app.
+                await asyncio.sleep(0.6)
+                await pilot.pause()
+                yield app, pilot
+
+    async def test_a_keyboard_terminal_is_left_exactly_as_it_was(self):
+        async with self._app('') as (app, _pilot):
+            self.assertTrue(app.query(autotmux.Footer))
+            self.assertFalse(app.query(autotmux.TouchBar))
+
+    async def test_a_browser_client_gets_neither_because_it_draws_its_own(self):
+        async with self._app('web') as (app, _pilot):
+            self.assertFalse(app.query(autotmux.Footer))
+            self.assertFalse(app.query(autotmux.TouchBar))
+
+    async def test_a_touch_client_with_no_surface_gets_buttons_in_the_grid(self):
+        async with self._app('local') as (app, _pilot):
+            self.assertFalse(app.query(autotmux.Footer))
+            bar = app.query_one(autotmux.TouchBar)
+            labels = [str(b.label) for b in bar.query(autotmux.Button)]
+            self.assertIn('Attach', labels)
+            self.assertIn('Layout', labels)
+            # The keys that are traps or duplicates under a thumb.
+            self.assertNotIn('Quit', labels)
+            self.assertNotIn('Focus Next', labels)
+
+    async def test_the_buttons_are_hittable(self):
+        """44pt is Apple's minimum. One character is about 6x12 pixels at the
+        size the layout picks for a phone, so a button has to be several
+        cells in both directions to be a target at all."""
+        async with self._app('local') as (app, _pilot):
+            bar = app.query_one(autotmux.TouchBar)
+            for button in bar.query(autotmux.Button):
+                with self.subTest(label=str(button.label)):
+                    self.assertGreaterEqual(button.outer_size.width, 8)
+                    self.assertGreaterEqual(button.outer_size.height, 3)
+
+    async def test_a_button_runs_the_action_its_label_names(self):
+        """The one that would silently fail: Attach is bound on the table, so
+        running it against the app looks for an action that is not there."""
+        async with self._app('local') as (app, pilot):
+            bar = app.query_one(autotmux.TouchBar)
+            before = app.layout_mode
+            await pilot.click(next(b for b in bar.query(autotmux.Button)
+                                   if str(b.label) == 'Layout'))
+            await pilot.pause()
+            self.assertNotEqual(app.layout_mode, before)
+
+    async def test_the_bar_follows_the_screen_it_is_on(self):
+        """A modal has its own bindings, and a bar still showing the
+        dashboard's is a row of buttons that do nothing."""
+        async with self._app('local') as (app, pilot):
+            bar = app.query_one(autotmux.TouchBar)
+            await pilot.press('question_mark')
+            await pilot.pause()
+            await asyncio.sleep(0.6)
+            await pilot.pause()
+            labels = [str(b.label) for b in bar.query(autotmux.Button)]
+            self.assertIn('Close', labels)
+            self.assertNotIn('Kill session', labels)
+            # And exactly one Close, though the help screen binds three keys
+            # to it.
+            self.assertEqual(labels.count('Close'), 1)
+
+    async def test_publishing_is_silent_where_nobody_asked(self):
+        """Bytes on the wire that no client can use are bytes competing with
+        the screen on a slow link."""
+        async with self._app('') as (app, _pilot):
+            written = []
+            app._publish_keys()
+            self.assertEqual(written, [])
+            self.assertIsNone(getattr(app, '_published_keys', None))
+
+    async def test_a_button_never_takes_focus_from_the_table(self):
+        """The bug this exists for, which only a real press could find.
+
+        Buttons are focusable by default. Focus leaving the table takes
+        Attach -- bound on the table -- out of the live set, so every control
+        after it shifts up one position while the finger is on its way down.
+        A tap aimed at Layout relabelled that button Clusters mid-press and
+        opened the cluster manager instead.
+        """
+        async with self._app('local') as (app, pilot):
+            bar = app.query_one(autotmux.TouchBar)
+            focused = app.focused
+            self.assertIsNotNone(focused)
+            for button in bar.query(autotmux.Button):
+                with self.subTest(label=str(button.label)):
+                    self.assertFalse(button.can_focus)
+            target = next(b for b in bar.query(autotmux.Button)
+                          if str(b.label) == 'Refresh now')
+            await pilot.click(target, offset=(target.region.width // 2, 1))
+            await pilot.pause()
+            # Not "focus is unchanged": an action may legitimately move it,
+            # as cycling to the queue-only layout does. What must never
+            # happen is focus landing on the control that was pressed.
+            self.assertNotIn(app.focused, list(bar.query(autotmux.Button)))
+            self.assertIs(app.focused, focused)
+
+    async def test_the_control_set_survives_pressing_one_of_it(self):
+        """A control bar that renumbers itself when you touch it is a bar
+        where the second tap is a lottery."""
+        async with self._app('local') as (app, pilot):
+            bar = app.query_one(autotmux.TouchBar)
+            before = [str(b.label) for b in bar.query(autotmux.Button)]
+            target = next(b for b in bar.query(autotmux.Button)
+                          if str(b.label) == 'Refresh now')
+            await pilot.click(target, offset=(target.region.width // 2, 1))
+            await pilot.pause()
+            await asyncio.sleep(0.4)
+            await pilot.pause()
+            self.assertEqual([str(b.label) for b in bar.query(autotmux.Button)],
+                             before)

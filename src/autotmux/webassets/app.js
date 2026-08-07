@@ -75,7 +75,12 @@
   function socketURL() {
     var scheme = location.protocol === 'https:' ? 'wss' : 'ws';
     var base = location.pathname.replace(/[^/]*$/, '');
-    return scheme + '://' + location.host + base + 'ws';
+    // Say whether this client draws its own controls. It is a property of
+    // the client, not of the server -- a phone and a laptop reach the same
+    // process -- and the socket URL is the only place to say it before the
+    // dashboard exists to be told.
+    return scheme + '://' + location.host + base + 'ws' +
+           (touch ? '?touch=1' : '');
   }
 
   function connect() {
@@ -144,7 +149,7 @@
   // over the terminal, transparent: the next tap lands on a real text input
   // and the platform does what it always does. Tap-to-attach is off while it
   // is on, which is the right trade -- you are typing, not navigating, and the
-  // keypad still has arrows and ⏎.
+  // published keys still cover every action on the screen.
   var kbdOpen = false;
   function setKeyboard(open) {
     if (!textarea) return;
@@ -173,41 +178,27 @@
   }
 
   // ── the keypad ────────────────────────────────────────────────────────
-  // Not a terminal keyboard. These are the keys atmux actually uses, and a
-  // generic Ctrl/Esc/Tab row was the wrong tool: on this screen you navigate
-  // and you act, and both are single keys.
-  var ESC = '\x1b', BS = '\x7f';
-  // Labelled, not lettered. A row of bare letters is unreadable on a phone --
-  // you cannot tell `x` (kill a session) from `z` (change the layout) without
-  // opening the help -- and flex-wrap stretched whichever key landed alone on
-  // the last line into a full-width button with no clue what it did. Fixed
-  // rows, and every key says what it does.
-  var PAGES = {
-    nav: { rows: [
-      [['↑', ESC + '[A', 'rep'], ['↓', ESC + '[B', 'rep'],
-       ['⏎ attach', '\r', 'wide'], ['esc', ESC]],
-      [['←', ESC + '[D', 'rep'], ['→', ESC + '[C', 'rep'],
-       ['⌫', BS, 'rep'], ['tab', '\t']]
-    ] },
-    // Grouped the way the help screen groups them: connect, then session
-    // lifecycle, then view.
-    atmux: { rows: [
-      [['ssh', 's'], ['window', 'o'], ['local', 't'], ['view', 'v']],
-      [['note', 'e'], ['new', 'n'], ['kill', 'x'], ['renew', 'k']],
-      [['jobs', 'j'], ['layout', 'z'], ['clusters', 'g'], ['web', 'w']],
-      [['refresh', 'r'], ['help', '?']]
-    ] },
-    // Once you attach, the keys that matter are tmux's, and detach is the one
-    // nobody can guess -- it is the whole reason the handover banner exists.
-    tmux: { rows: [
-      [['detach', '\x02d', 'wide'], ['^C', '\x03'], ['^D', '\x04']],
-      [['prefix', '\x02'], ['^Z', '\x1a'],
-       ['PgUp', ESC + '[5~', 'rep'], ['PgDn', ESC + '[6~', 'rep']]
-    ] }
-  };
+  // Not written here. The dashboard publishes the bindings that are live on
+  // its current screen (keypad.py, OSC 7710) and this renders them.
+  //
+  // The list used to live in this file, copied by hand from the python. It
+  // did not fit one screen, so it grew three pages, so the layout key ended
+  // up two taps deep behind a tab nobody would think to open -- and a copy
+  // is only correct on the day it is written. Now there is one list, it is
+  // the app's own, and it changes when a modal opens because the app's
+  // bindings do.
+  //
+  // Nothing is hard-coded as a fallback on purpose: if no bindings arrive,
+  // whatever is running is not this dashboard, and inventing keys for it
+  // would be guessing. The pad then offers only the keyboard.
+  var KEYS_OSC = 7710;
 
   var keys = document.getElementById('keys');
-  var page = 'nav';
+  var expander = document.getElementById('more');
+  // Two rows fit under a phone's thumb without eating the dashboard. The
+  // rest are one tap away rather than one page away.
+  var PER_ROW = 4, ROWS_COLLAPSED = 2;
+  var current = [], expanded = false;
 
   function haptic() {
     // Android only; iOS Safari ignores it. Cheap when it works, harmless when
@@ -220,41 +211,68 @@
     haptic();
   }
 
-  function buildPage(name) {
-    page = name;
+  function renderKeys() {
     keys.textContent = '';
-    PAGES[name].rows.forEach(function (row) {
+    var rows = Math.ceil(current.length / PER_ROW);
+    var limit = expanded ? rows : Math.min(rows, ROWS_COLLAPSED);
+    for (var r = 0; r < limit; r++) {
       var line = document.createElement('div');
       line.className = 'krow';
-      row.forEach(function (entry) {
-        line.appendChild(buildKey(entry[0], entry[1], entry[2]));
+      var slice = current.slice(r * PER_ROW, (r + 1) * PER_ROW);
+      slice.forEach(function (entry) {
+        line.appendChild(buildKey(entry.l, entry.k));
       });
+      // A short last row would stretch its keys to full width and read as
+      // something important rather than as the leftover it is.
+      for (var pad_i = slice.length; pad_i < PER_ROW; pad_i++) {
+        var gap = document.createElement('span');
+        gap.className = 'key gap';
+        line.appendChild(gap);
+      }
       keys.appendChild(line);
-    });
-    Array.prototype.forEach.call(
-      document.querySelectorAll('#tabs [data-page]'), function (tab) {
-        tab.classList.toggle('on', tab.dataset.page === name);
-      });
-    // The pad's height changes with the page -- the keyboard is four rows and
-    // nav is one -- and the terminal has to be told, or tmux keeps drawing for
-    // rows that are now behind the keys.
+    }
+    var hidden = current.length - limit * PER_ROW;
+    if (expander) {
+      expander.style.display = (rows > ROWS_COLLAPSED) ? '' : 'none';
+      expander.textContent = expanded ? '⌃' : '⌄ ' + Math.max(hidden, 0);
+      expander.setAttribute(
+        'aria-label', expanded ? 'fewer keys' : 'more keys');
+    }
+    // Only the keys go away when there are none. The font size and the
+    // keyboard belong to this client rather than to whatever it is showing,
+    // so their row stays whether or not anything published a binding.
+    keys.style.display = current.length ? '' : 'none';
+    // The pad's height just changed, and the terminal has to be told or the
+    // app keeps drawing rows that are now behind the keys.
     refit();
   }
 
-  function buildKey(label, seq, flag) {
+  function setKeys(list) {
+    var same = list.length === current.length && list.every(function (e, i) {
+      return e.k === current[i].k && e.l === current[i].l;
+    });
+    if (same) return;
+    current = list;
+    renderKeys();
+  }
+
+  function buildKey(label, seq) {
     var button = document.createElement('button');
-    button.className = 'key' + (flag === 'wide' ? ' wide' : '');
+    button.className = 'key';
     button.textContent = label;
     button.setAttribute('aria-label', label);
     var timer = null, interval = null;
+    // Derived, not flagged: the keys worth repeating are the ones that move
+    // something a step at a time, and those are exactly the CSI sequences
+    // (arrows, page up/down). Nothing has to remember to mark them.
+    var repeats = /^\x1b\[/.test(seq);
     function fire() { press(seq); }
-    // pointerdown, not click: a key should fire the moment it is touched,
-    // and holding an arrow should repeat rather than needing ten taps.
+    // pointerdown, not click: a key should fire the moment it is touched.
     function down(event) {
       event.preventDefault();
       fire();
       button.classList.add('down');
-      if (flag === 'rep') {
+      if (repeats) {
         timer = setTimeout(function () {
           interval = setInterval(fire, 70);
         }, 400);
@@ -277,14 +295,29 @@
     return button;
   }
 
-  Array.prototype.forEach.call(
-    document.querySelectorAll('#tabs [data-page]'), function (tab) {
-      keepFocus(tab);
-      tab.addEventListener('click', function (event) {
-        event.preventDefault();
-        buildPage(tab.dataset.page);
-      });
-    });
+  keepFocus(expander);
+  if (expander) expander.addEventListener('click', function (event) {
+    event.preventDefault();
+    expanded = !expanded;
+    renderKeys();
+  });
+
+  // The dashboard's side of this is keypad.encode(). Everything is validated
+  // before it reaches a button: this arrives over the same pty as the screen
+  // contents, so a program that is not atmux could emit anything at all, and
+  // a button whose label does not match what it types is worse than no
+  // button. Returning true tells xterm the sequence was handled.
+  term.parser.registerOscHandler(KEYS_OSC, function (payload) {
+    var data;
+    try { data = JSON.parse(payload); } catch (e) { return true; }
+    if (!data || !Array.isArray(data.keys)) return true;
+    setKeys(data.keys.filter(function (entry) {
+      return entry && typeof entry.k === 'string' && entry.k
+          && typeof entry.l === 'string' && entry.l
+          && entry.k.length <= 8 && entry.l.length <= 24;
+    }).slice(0, 24));
+    return true;
+  });
 
   // ── font size ─────────────────────────────────────────────────────────
   // An override, not the mechanism. Auto is the default and the thing to
@@ -526,7 +559,10 @@
 
   if (touch) {
     document.body.classList.add('touch');
-    buildPage('nav');
+    // Empty until the dashboard says what its keys are. The controls row is
+    // there from the start because the keyboard and the font size belong to
+    // this client, not to whatever it is showing.
+    renderKeys();
     setKeyboard(false);
   }
 
