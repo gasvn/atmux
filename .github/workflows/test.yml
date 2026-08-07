@@ -5,6 +5,19 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # A push-only trigger leaves no way to run a commit whose workflow the
+  # Actions service never created -- and it does fail to create them: on
+  # 2026-08-06 four consecutive pushes got no run at all, and two more died
+  # in "Set up job" with "Failed to resolve action download info", having
+  # executed nothing. Re-running then meant an empty commit. This gives the
+  # Actions tab a "Run workflow" button, and `gh workflow run tests` a
+  # `--ref`, so any commit can be retried on its own.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to test (defaults to this branch)'
+        required: false
+        type: string
 
 jobs:
   unit:
@@ -13,7 +26,13 @@ jobs:
       matrix:
         python-version: ['3.10', '3.11', '3.12']
     steps:
+      # An empty `ref` keeps checkout's own default (the triggering commit),
+      # so push and pull_request runs behave exactly as before.
       - uses: actions/checkout@v4
+        with:
+          # github.event.inputs (not the `inputs` context) is defined for
+          # every event, so this expression is valid on push too.
+          ref: ${{ github.event.inputs.ref || '' }}
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
