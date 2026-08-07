@@ -42,10 +42,15 @@ atmux = "autotmux.cli:main"
 atd = "autotmux.daemon:main_entry"
 atmux-daemon = "autotmux.daemon:main_entry"
 atmux-agent = "autotmux.agent:main"
+atmux-web = "autotmux.web:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
 packages = ["autotmux"]
+# The browser terminal is vendored, not fetched: the page must keep working on
+# a device with no route to a CDN, and its Content-Security-Policy allows no
+# other origin anyway.
+package-data = { "autotmux" = ["webassets/*"] }
 
 [tool.setuptools.dynamic]
 version = { attr = "autotmux.__version__" }

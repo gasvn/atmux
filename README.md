@@ -1016,6 +1016,66 @@ ambiguous timeout or transport failure also starts the cooldown: this favors
 avoiding a duplicate Slurm job when `sbatch` may have accepted the request but
 its reply was lost.
 
+## From a phone or a tablet
+
+`atmux-web` serves the dashboard to a browser. Not a second dashboard — the
+real one: it runs `atmux` on a pseudo-terminal and streams that terminal to
+the page, so every key, every layout mode and `attach` itself all work, and
+anything added later arrives without touching this code.
+
+```sh
+atmux-web                       # binds 127.0.0.1:7681 only
+tailscale serve --bg 7681       # HTTPS, reachable only inside your tailnet
+```
+
+Then open `https://<your-machine>.tail-scale.ts.net/` and, on iOS, *Add to Home
+Screen* — it opens full-screen with its own icon. Nothing here authenticates a
+caller, so **never bind it to `0.0.0.0`**: anything that can open the port gets
+a shell. Loopback plus Tailscale is the whole security model. (If your tailnet
+has no HTTPS certificates, `tailscale serve --bg --http=8080
+http://127.0.0.1:7681` still works — the traffic is WireGuard-encrypted either
+way, but a PWA install wants HTTPS.)
+
+Dependencies: none. `pty`, `http.server` and a small WebSocket implementation
+are all in the standard library, and xterm.js is vendored in the package
+rather than fetched from a CDN, so the page works on a device with no route
+off the tailnet.
+
+### Touch
+
+atmux is a table you steer with arrows and act on with single letters, so the
+phone gets a keypad rather than a keyboard — xterm.js has no touch gesture
+support at all ([#5377](https://github.com/xtermjs/xterm.js/issues/5377), open
+and unassigned), and without this there is no way to send an arrow, `Esc` or
+`Ctrl-C` from a touch screen:
+
+```
+  ↑     ↓     ⏎ attach     ←     →     esc    q
+ ────────────────────────────────────────────────
+  nav  atmux  tmux                    A−  A+  ⌨
+```
+
+- **nav** is the default: arrows repeat when held, so a long table is one
+  press rather than twenty taps.
+- **atmux** carries every bound key (`s o t v e n x k j z g r ?`). A test
+  fails if a binding is ever added without a button, or a button added for a
+  key nothing binds.
+- **tmux** is for once you have attached — including `detach`, which is
+  `Ctrl-B d` and is otherwise unreachable without a keyboard.
+- **A− / A+** and pinch-to-zoom change the font size, and it is remembered.
+  Pinch deliberately zooms the *font* and not the page: a zoomed viewport
+  leaves you panning a grid that no longer fits.
+- **⌨** raises the software keyboard, which is otherwise kept down. The
+  terminal keeps focus either way (`inputmode="none"`), so an iPad with a
+  hardware keyboard behaves like a desktop and never loses half its screen to
+  a keyboard it does not need.
+
+Safari on iPadOS reports `Ctrl-C` from a hardware keyboard as keyCode 13
+(Enter). xterm.js fixed this in
+[PR #5742](https://github.com/xtermjs/xterm.js/pull/5742), merged to master
+for the 7.0.0 milestone, but no published build carries it — 6.0.0 is latest
+and even the beta has no such special case — so the page handles it itself.
+
 ## Requirements
 
 - Python 3.10+

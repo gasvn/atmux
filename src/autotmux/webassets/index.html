@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- user-scalable=no is deliberate. Pinch zooms the *font* instead (app.js):
+     zooming the viewport of a terminal leaves you panning a grid that no
+     longer fits, which is worse than the small text it was meant to fix. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="atmux">
+<meta name="theme-color" content="#0b0b0c">
+<meta name="format-detection" content="telephone=no">
+<title>atmux</title>
+<link rel="stylesheet" href="xterm.css">
+<link rel="manifest" href="manifest.json">
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: #0b0b0c;
+    overscroll-behavior: none;          /* no rubber-banding over the terminal */
+    -webkit-text-size-adjust: 100%;     /* Safari must not reflow our monospace */
+  }
+  #app {
+    display: flex; flex-direction: column;
+    height: 100dvh;                     /* dvh, not vh: iOS Safari's URL bar
+                                           shrinks the viewport and vh does not
+                                           notice, cutting off rows */
+  }
+  #term {
+    flex: 1 1 auto; min-height: 0; padding: 2px 4px;
+    touch-action: pan-y;                /* keep vertical scroll, drop the
+                                           double-tap-to-zoom delay */
+  }
+  /* The keypad exists only where there is no real keyboard. */
+  #pad { display: none; }
+  body.touch #pad {
+    flex: 0 0 auto; display: block;
+    background: #141418; border-top: 1px solid #2a2a30;
+    padding-bottom: env(safe-area-inset-bottom);
+    user-select: none; -webkit-user-select: none;
+  }
+  #keys {
+    display: flex; flex-wrap: wrap; gap: 6px; padding: 7px 7px 4px;
+  }
+  .key {
+    flex: 1 0 auto; min-width: 46px;    /* 44px is Apple's minimum target */
+    min-height: 44px; padding: 0 8px;
+    background: #26262c; color: #e2e2e6; border: 1px solid #383840;
+    border-radius: 9px;
+    font: 15px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;                 /* a held key repeats; it never scrolls */
+  }
+  .key.wide { flex: 3 0 auto; }
+  .key.down { background: #4a4a58; border-color: #6f6f80; }
+  #tabs {
+    display: flex; gap: 6px; padding: 0 7px 7px; align-items: center;
+  }
+  #tabs button {
+    min-height: 34px; min-width: 40px; padding: 0 10px;
+    background: transparent; color: #8b8b95;
+    border: 1px solid #2e2e36; border-radius: 8px;
+    font: 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #tabs button.on { background: #2f2f3a; color: #e2e2e6; border-color: #4d4d5c; }
+  #tabs .spacer { flex: 1 1 auto; }
+  #status {
+    position: fixed; left: 50%; top: 8px; transform: translateX(-50%);
+    padding: 6px 12px; border-radius: 6px; background: #2a2a30; color: #ddd;
+    font: 13px ui-monospace, Menlo, monospace; display: none; z-index: 10;
+    pointer-events: none;
+  }
+  #boot {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 10px;
+    background: #0b0b0c; color: #9a9aa2; z-index: 20; padding: 24px;
+    font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center;
+  }
+  #boot b { color: #d8d8dc; }
+  #booterr { color: #e07a7a; max-width: 40em; white-space: pre-wrap;
+             word-break: break-word; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="term"></div>
+  <!-- Not a terminal keyboard: atmux is a table you steer with arrows and act
+       on with single letters, so these are its keys, grouped the way `?`
+       groups them. -->
+  <div id="pad">
+    <div id="keys"></div>
+    <div id="tabs">
+      <button data-page="nav">nav</button>
+      <button data-page="atmux">atmux</button>
+      <button data-page="tmux">tmux</button>
+      <span class="spacer"></span>
+      <button id="fontminus" aria-label="smaller">A−</button>
+      <button id="fontplus" aria-label="larger">A+</button>
+      <button id="kbd" aria-label="keyboard">⌨</button>
+    </div>
+  </div>
+</div>
+<div id="status"></div>
+<!-- Shown until the terminal actually starts. A Content-Security-Policy that
+     blocked the script produced a page that was simply blank, with nothing on
+     screen and nothing in the server log to say why. Whatever fails next
+     should at least say so here. -->
+<div id="boot">
+  <b>atmux</b> — starting…
+  <div id="booterr"></div>
+</div>
+
+<script src="xterm.js"></script>
+<script src="addon-fit.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
