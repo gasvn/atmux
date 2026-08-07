@@ -740,3 +740,44 @@ class BindAddressTests(unittest.TestCase):
             with self.subTest(host=host):
                 self.assertFalse(web.is_private_bind(host) if isinstance(host, str)
                                  else web.is_private_bind(str(host)))
+
+
+class MountPathTests(unittest.TestCase):
+    """One tailnet hostname, several services.
+
+    `tailscale serve --set-path /term` mounts this page below the root and
+    strips the prefix before proxying. The page's asset references were
+    already relative; the websocket was not, so it reached for a socket at the
+    host root that was not there -- the page loaded and the terminal stayed
+    empty with nothing to say why.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(web.ASSETS, 'app.js'), encoding='utf-8') as f:
+            cls.js = f.read()
+        with open(os.path.join(web.ASSETS, 'index.html'), encoding='utf-8') as f:
+            cls.html = f.read()
+
+    def test_the_socket_is_addressed_relative_to_the_page(self):
+        self.assertNotIn("+ '/ws'", self.js)
+        self.assertIn('location.pathname', self.js)
+
+    def test_every_asset_the_page_loads_is_relative(self):
+        """An absolute /xterm.js would 404 under any mount point."""
+        for reference in re.findall(r'(?:src|href)="([^"]+)"', self.html):
+            with self.subTest(reference=reference):
+                self.assertFalse(reference.startswith('/'), reference)
+                self.assertNotRegex(reference, r'^[a-z]+://')
+
+    def test_the_derived_url_matches_the_page_it_was_served_from(self):
+        """The same rule the browser will apply, checked against the mount
+        points that actually occur."""
+        def derive(pathname):
+            base = re.sub(r'[^/]*$', '', pathname)
+            return base + 'ws'
+        self.assertEqual(derive('/'), '/ws')
+        self.assertEqual(derive('/index.html'), '/ws')
+        self.assertEqual(derive('/term/'), '/term/ws')
+        self.assertEqual(derive('/term/index.html'), '/term/ws')
+        self.assertEqual(derive('/a/b/'), '/a/b/ws')
