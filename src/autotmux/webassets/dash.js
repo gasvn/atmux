@@ -100,13 +100,20 @@
     // Land *on* the session, not on a second copy of this list. A tap that
     // opens the dashboard is a screen that costs a tap and answers nothing,
     // which is exactly what it did before the target rode along.
-    button.addEventListener('click', function () { go('attach', row); });
+    // A row with no session yet cannot be attached to -- there is nothing
+    // there. Starting one on that machine is what you actually want, and it
+    // is the same one tap.
+    button.addEventListener('click', function () {
+      go(row.kind === 'session' ? 'attach' : 'shell', row);
+    });
     item.appendChild(button);
 
     // The other verb. Everything the dashboard can do -- renew, kill, note,
     // view output, ssh, new window -- acts on the highlighted row, so opening
     // it *on* this row makes all of them reachable rather than adding a
     // button here for each and a flag over there for each.
+    // ⋯ only where there is a session to act on. A machine with none has
+    // exactly one thing you can do to it, and the row itself does that.
     if (row.kind === 'session') {
       var more = document.createElement('button');
       more.className = 'more';
@@ -124,8 +131,10 @@
 
   function go(verb, row) {
     var url = new URL('console/', location.href);
-    if (row.kind === 'session' && row.node && row.session) {
-      // The routing name, not the label: login:zgx is for reading.
+    // The routing name, not the label: login:zgx is for reading.
+    if (verb === 'shell') {
+      if (row.node) url.searchParams.set('shell', row.node);
+    } else if (row.kind === 'session' && row.node && row.session) {
       url.searchParams.set(verb, row.node + ':' + row.session);
     }
     location.href = url.toString();

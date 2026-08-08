@@ -430,6 +430,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # this socket can craft one.
     _ATTACH = re.compile(r'^(?![-])[A-Za-z0-9._@-]{1,120}'
                          r':(?![-])[A-Za-z0-9._@-]{1,120}$')
+    # A node on its own, for the row that has no session yet.
+    _NODE = re.compile(r'^(?![-])[A-Za-z0-9._@-]{1,120}$')
 
     def _query(self) -> dict:
         raw = self.path.split('?', 1)[1] if '?' in self.path else ''
@@ -450,7 +452,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # without a flag each.
     #
     # A whitelist, not a passthrough: this arrives in a URL.
-    _VERBS = {'attach': '--attach', 'select': '--select'}
+    #   attach  land in that session
+    #   select  land on that row, where every other action reaches it
+    #   shell   there is no session yet -- start one, on that machine
+    _VERBS = {'attach': ('--attach', _ATTACH),
+              'select': ('--select', _ATTACH),
+              'shell': ('--shell', _NODE)}
 
     def _client_argv(self) -> list:
         """What to run for this client: the dashboard, or one session.
@@ -463,9 +470,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         execvp, never through a shell, and never concatenated into anything.
         """
         query = self._query()
-        for verb, flag in self._VERBS.items():
+        for verb, (flag, pattern) in self._VERBS.items():
             target = query.get(verb, '')
-            if target and self._ATTACH.match(target):
+            if target and pattern.match(target):
                 return list(self.server.argv) + [f'{flag}={target}']
         return list(self.server.argv)
     def _client_env(self) -> dict:

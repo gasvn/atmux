@@ -1442,6 +1442,23 @@ class AttachTargetTests(_ServedFixture):
             self.argv_for('/ws?select=holygpu8a11104:newclaw'),
             list(self.COMMAND) + ['--select=holygpu8a11104:newclaw'])
 
+    def test_a_machine_with_no_session_can_be_given_one(self):
+        """A row with no session cannot be attached to -- there is nothing
+        there. Starting a shell on that machine is the only thing you can
+        want from it, and it is the row's own tap."""
+        self.assertEqual(self.argv_for('/ws?shell=holygpu8a15504'),
+                         list(self.COMMAND) + ['--shell=holygpu8a15504'])
+
+    def test_a_node_verb_will_not_take_a_session_target(self):
+        """Each verb checks the shape it actually means. --shell takes a
+        machine, and NODE:SESSION is not one."""
+        self.assertEqual(self.argv_for('/ws?shell=node:sess'),
+                         list(self.COMMAND))
+        for bad in ('--version', '-rf', '', 'a b'):
+            with self.subTest(value=bad):
+                path = '/ws?shell=' + urllib.parse.quote(bad, safe='')
+                self.assertEqual(self.argv_for(path), list(self.COMMAND))
+
     def test_only_the_verbs_on_the_list_are_accepted(self):
         """A whitelist, not a passthrough: this arrives in a URL."""
         for verb in ('run', 'exec', 'shell', 'open-url', 'cluster'):
@@ -1534,12 +1551,18 @@ class AttachLinkTests(unittest.TestCase):
             with open(os.path.join(web.ASSETS, name), encoding='utf-8') as f:
                 setattr(cls, name.split('.')[0], f.read())
 
-    def test_a_row_offers_both_verbs(self):
-        """Attaching is what you want nine times in ten; everything else
-        lives on the row the dashboard is standing on."""
-        self.assertIn("go('attach', row)", self.dash)
+    def test_a_row_offers_the_verb_that_fits_what_it_is(self):
+        """Attaching is what you want nine times in ten. A row with no
+        session has nothing to attach to and wants a shell instead, and
+        everything else lives on the row the dashboard is standing on."""
+        self.assertIn("'attach' : 'shell'", self.dash)
         self.assertIn("go('select', row)", self.dash)
         self.assertIn("stopPropagation", self.dash)
+
+    def test_a_row_with_no_session_offers_no_actions_menu(self):
+        """There is nothing for the other verbs to act on."""
+        body = _extract(self.dash, 'build')
+        self.assertIn("row.kind === 'session'", body)
 
     def test_the_list_puts_the_session_in_the_link(self):
         body = _extract(self.dash, 'go')
