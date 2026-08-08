@@ -1283,6 +1283,13 @@ def _get_squeue_text(args: list[str]) -> str:
         return _limit_squeue_text(text)
     except subprocess.TimeoutExpired:
         return f'(squeue {" ".join(args)} timed out)'
+    except FileNotFoundError:
+        # Not a broken install. A gateway-mode client runs this daemon on a
+        # machine that has no Slurm at all, and the queue arrives from the
+        # login node a moment later -- so for the few seconds before the
+        # gateway answers, the panel was reporting a missing file as an
+        # error. It reads as "atmux is broken" and it is not.
+        return '(no Slurm on this machine — waiting for a gateway)'
     except Exception as e:
         return f'(squeue error: {e})'
 

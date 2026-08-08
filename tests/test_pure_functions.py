@@ -1082,3 +1082,45 @@ class IdleRowTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class SqueueMessageTests(unittest.TestCase):
+    """What the jobs panel says when it cannot run squeue.
+
+    A gateway-mode client runs its daemon on a machine with no Slurm at all
+    -- the queue comes from the login node a moment later. Reporting the
+    missing binary as an error meant every cold open of the dashboard showed
+    "[Errno 2] No such file or directory: 'squeue'" for a few seconds, which
+    reads as a broken install and is not one.
+    """
+
+    def _with(self, error):
+        from autotmux import daemon
+        saved = daemon._hard_check_output
+
+        def boom(*_args, **_kwargs):
+            raise error
+
+        daemon._hard_check_output = boom
+        try:
+            return daemon._get_squeue_text(['-l'])
+        finally:
+            daemon._hard_check_output = saved
+
+    def test_no_slurm_here_says_what_it_means(self):
+        text = self._with(FileNotFoundError(2, 'No such file or directory',
+                                            'squeue'))
+        self.assertNotIn('Errno', text)
+        self.assertIn('no Slurm', text)
+        self.assertIn('gateway', text)
+
+    def test_a_real_failure_still_reports_itself(self):
+        """The quiet message is only for the binary being absent. Anything
+        else is a fault worth naming."""
+        self.assertIn('boom', self._with(OSError('boom')))
+        self.assertIn('error', self._with(OSError('boom')))
+
+    def test_a_timeout_is_still_a_timeout(self):
+        import subprocess
+        self.assertIn('timed out',
+                      self._with(subprocess.TimeoutExpired('squeue', 5)))
