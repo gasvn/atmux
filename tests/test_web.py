@@ -1339,13 +1339,24 @@ El.prototype.emit = function (type, event) {
 El.prototype.getBoundingClientRect = function () {
   return { width: this._width || 0, height: 0 };
 };
-var document = { createElement: function (t) { return new El(t); } };
+var document = { createElement: function (t) { return new El(t); },
+                 body: new El('body') };
 
 // What the pad needs around it, and nothing more. Every one of these is a
 // thing the browser owns, not a thing the keypad decides.
 var keys = new El('div'), nav = new El('div'), expander = new El('button');
+var pinRow = new El('div'), editButton = new El('button');
 var current = [], expanded = false;
 var sent = [];
+// Enough of localStorage to prove a choice is remembered, and to be thrown
+// garbage the way a hand-edited one would be.
+var store = {};
+var localStorage = {
+  getItem: function (k) { return k in store ? store[k] : null; },
+  setItem: function (k, v) { store[k] = String(v); },
+  removeItem: function (k) { delete store[k]; }
+};
+function say() {}
 function refit() {}
 function haptic() {}
 function sendText(text) { sent.push(text); }
@@ -1392,16 +1403,21 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
     FUNCTIONS = ('ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
+                 'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
-                 'renderRows', 'recolumn', 'renderNav', 'renderKeys')
+                 'renderRows', 'recolumn', 'renderNav', 'renderPins',
+                 'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
     SCALARS = ('var OFF =', 'var ROWS_COLLAPSED =', 'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
-               'var prefixSeq =')
+               'var prefixSeq =', 'var PINS =', 'var pins =',
+               'var PAD_STATE =')
 
     @classmethod
     def setUpClass(cls):
         with open(os.path.join(web.ASSETS, 'app.js'), encoding='utf-8') as f:
             cls.js = f.read()
+        with open(os.path.join(web.ASSETS, 'index.html'), encoding='utf-8') as f:
+            cls.html = f.read()
         parts = [_DOM_STUB]
         for head in cls.SCALARS:
             match = re.search(re.escape(head) + r'[^;]*;', cls.js)
@@ -1717,6 +1733,194 @@ class KeypadVocabularyTests(unittest.TestCase):
                 sent.every(function (s) { return s === '\\x1b[5~'; })]));
             }, 560);'''),
             [True, True, True])
+
+    # ── the keys you keep ─────────────────────────────────────────────────
+
+    def edit(self, script, stored=None):
+        """An open drawer in editing mode, with whatever was remembered."""
+        keep = '' if stored is None else (
+            f'store[PINS] = {json.dumps(json.dumps(stored))}; '
+            'pins = loadPins();')
+        return self.run_js(f'''
+            {keep}
+            keys._width = 390;
+            current = [{{k: 'x', l: 'Kill session'}}];
+            expanded = true; editing = true;
+            renderKeys();
+            sent = [];
+            {script}''')
+
+    def test_what_you_keep_is_remembered(self):
+        self.assertEqual(self.edit('''
+            var key = keyLabelled(keys, 'detach');
+            key.emit('pointerdown', {}); key.emit('pointerup', {});
+            console.log(JSON.stringify([pins, store[PINS], sent]));'''),
+            [['detach'], '["detach"]', []])
+
+    def test_keeping_it_twice_puts_it_back(self):
+        self.assertEqual(self.edit('''
+            var key = keyLabelled(keys, '^C');
+            key.emit('pointerdown', {}); key.emit('pointerup', {});
+            key = keyLabelled(keys, '^C');
+            key.emit('pointerdown', {}); key.emit('pointerup', {});
+            console.log(JSON.stringify([pins, store[PINS]]));''',
+            stored=['detach']),
+            [['detach'], '["detach"]'])
+
+    def test_a_kept_key_gets_a_fixed_row_of_its_own(self):
+        """Outside the drawer, because the drawer scrolls and the point of
+        keeping a key is that it stops moving."""
+        self.assertEqual(self.edit('''
+            console.log(JSON.stringify(
+              [drawn(pinRow, []), pinRow.style.display]));''',
+            stored=['detach', '|']),
+            [['detach', '|'], ''])
+
+    def test_no_kept_keys_means_no_row_at_all(self):
+        self.assertEqual(self.edit('''
+            console.log(JSON.stringify(
+              [drawn(pinRow, []), pinRow.style.display]));'''),
+            [[], 'none'])
+
+    def test_a_kept_key_follows_a_rebound_prefix(self):
+        """Which is why labels are stored and bytes are not. `detach` frozen
+        as \\x02d would keep sending C-b to somebody running C-a."""
+        self.assertEqual(self.run_js('''
+            store[PINS] = '["detach"]'; pins = loadPins();
+            prefixSeq = '\\x01';
+            console.log(JSON.stringify(pinnedKeys()[0].k));'''), '\x01d')
+
+    def test_a_label_that_no_longer_names_anything_just_stops_appearing(self):
+        """Rather than becoming a button that types nothing, or an exception
+        on the way to drawing the pad."""
+        self.assertEqual(self.run_js('''
+            store[PINS] = '["detach", "no such key"]'; pins = loadPins();
+            console.log(JSON.stringify(pinnedKeys().map(function (e) {
+              return e.l; })));'''), ['detach'])
+
+    def test_a_hand_edited_store_cannot_break_the_pad(self):
+        for raw in ('not json', '{}', '"detach"', '[1, 2]', '[null]',
+                    '["' + 'x' * 40 + '"]'):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.run_js(
+                    f'store[PINS] = {json.dumps(raw)};'
+                    'console.log(JSON.stringify(loadPins()));'), [])
+
+    def test_only_so_many_fit(self):
+        """The row is fixed and above the drawer, so an unbounded one would
+        eat the terminal it is meant to be helping you use."""
+        self.assertEqual(self.run_js('''
+            store[PINS] = JSON.stringify(
+              ['detach','^C','^D','^Z','^L','^R','^A','^E','^W','^K']);
+            pins = loadPins();
+            var before = pins.length;
+            togglePin('^U');
+            console.log(JSON.stringify([before, pins.length,
+                                        pins.indexOf('^U')]));'''),
+            [8, 8, -1])
+
+    # ── nothing fires while you are choosing ──────────────────────────────
+
+    def test_choosing_a_key_does_not_press_it(self):
+        self.assertEqual(self.edit('''
+            var key = keyLabelled(keys, '^C');
+            key.emit('pointerdown', {}); key.emit('pointerup', {});
+            console.log(JSON.stringify([sent, pins]));'''),
+            [[], ['^C']])
+
+    def test_an_app_key_is_inert_while_choosing_rather_than_merely_unkeepable(
+            self):
+        """The one that matters. The app's own keys share this drawer, they
+        cannot be kept, and one of them is `Kill session` -- a tap falling
+        through to it because it happened not to be pinnable would be the
+        worst bug in this file."""
+        self.assertEqual(self.edit('''
+            var key = keyLabelled(keys, 'Kill session');
+            key.emit('pointerdown', {}); key.emit('pointerup', {});
+            console.log(JSON.stringify(
+              [sent, pins, key._cls.locked === 1, !!key._cls.choose]));'''),
+            [[], [], True, False])
+
+    def test_a_held_key_does_not_keep_and_unkeep_itself(self):
+        """PgUp repeats. Ten pins a second is the obvious way to get this
+        wrong, so nothing repeats while choosing."""
+        self.assertEqual(self.edit('''
+            var key = keyLabelled(keys, 'PgUp');
+            key.emit('pointerdown', {});
+            setTimeout(function () {
+              key.emit('pointerup', {});
+              console.log(JSON.stringify([sent, pins]));
+            }, 560);'''),
+            [[], ['PgUp']])
+
+    def test_pressing_a_kept_key_normally_sends_it(self):
+        self.assertEqual(self.run_js('''
+            store[PINS] = '["detach"]'; pins = loadPins();
+            keys._width = 390; current = []; expanded = false; editing = false;
+            renderKeys(); sent = [];
+            var key = keyLabelled(pinRow, 'detach');
+            key.emit('pointerdown', {}); key.emit('pointerup', {});
+            console.log(JSON.stringify(sent));'''), ['\x02d'])
+
+    # ── getting out of the way ────────────────────────────────────────────
+
+    def test_hiding_the_pad_hides_all_of_it(self):
+        """Not a smaller pad and not a row of controls left behind. The pad is
+        two hundred pixels of a phone, and there are stretches -- reading a
+        log, watching a job -- where you want none of it."""
+        self.assertEqual(self.run_js('''
+            setPad(false);
+            console.log(JSON.stringify(
+              [!!document.body._cls.nopad, store[PAD_STATE]]));'''),
+            [True, 'hidden'])
+
+    def test_putting_the_pad_away_ends_editing_with_it(self):
+        """Coming back to a pad whose keys quietly keep instead of press,
+        because of something you did before you hid it, is exactly the trap
+        a mode has to avoid."""
+        self.assertEqual(self.run_js('''
+            keys._width = 390; current = []; editing = false;
+            setEditing(true);
+            setPad(false);
+            console.log(JSON.stringify([editing, expanded]));'''),
+            [False, True])
+
+    def test_closing_the_drawer_ends_editing_too(self):
+        """A lit star in the corner is not enough to explain why `detach`
+        just unkept itself instead of detaching."""
+        self.assertEqual(self.run_js('''
+            keys._width = 390; current = []; editing = false; expanded = false;
+            setEditing(true);
+            var opened = [editing, expanded];
+            toggleDrawer();
+            console.log(JSON.stringify([opened, [editing, expanded]]));'''),
+            [[True, True], [False, False]])
+
+    def test_the_choice_survives_a_reload(self):
+        self.assertEqual(self.run_js('''
+            setPad(false); setPad(true);
+            console.log(JSON.stringify(
+              [!!document.body._cls.nopad, store[PAD_STATE]]));'''),
+            [False, ''])
+
+    def test_hiding_it_leaves_exactly_one_way_back(self):
+        """A hidden pad with no way back is a terminal you have to reload to
+        type in. The grip is outside #pad, so hiding the pad cannot hide it."""
+        self.assertIn('id="grip"', self.html)
+        pad = self.html[self.html.index('<div id="pad">'):]
+        self.assertLess(pad.index('</div>'), pad.index('id="grip"'))
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        self.assertRegex(css, r'body\.touch\.nopad #pad \{[^}]*display: none')
+        self.assertRegex(css, r'body\.touch\.nopad #grip \{[^}]*display: block')
+
+    def test_the_controls_all_fit_across_a_phone(self):
+        """Seven buttons and a spacer in 390px. Measured in a browser at
+        7..383px, but the regression this catches is someone adding an
+        eighth without measuring."""
+        controls = re.findall(r'<button id="(\w+)"', self.html)
+        self.assertEqual(controls,
+                         ['more', 'edit', 'fontminus', 'fontauto', 'fontplus',
+                          'kbd', 'hide', 'grip'])
 
     def test_a_rotation_redraws_only_when_the_count_actually_changed(self):
         """Rebuilding the pad on every resize would drop a held key and clear

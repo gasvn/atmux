@@ -375,8 +375,49 @@
     { l: "'", k: "'" }, { l: '`', k: '`' }, { l: '^', k: '^' }
   ];
 
+  // ── the keys you keep ─────────────────────────────────────────────────
+  // Forty-two keys is the right number to *have* and the wrong number to
+  // look at. Which eight of them matter is a question only the person
+  // holding the phone can answer -- someone living in tmux windows wants
+  // `new win` and `win ▶`; someone debugging wants ^C and ^R -- so it is
+  // answered by them and remembered, rather than guessed at here.
+  //
+  // Stored as labels, not as bytes. A pinned `detach` has to follow a
+  // rebound prefix, and bytes frozen into localStorage would not.
+  //
+  // Only the client's own keys can be pinned. The app's are published, they
+  // change with its screen, and freezing one would produce exactly the thing
+  // this file keeps guarding against: a button whose label outlived what it
+  // does.
+  var PINS = 'atmux.pins', MAX_PINS = 8;
+  var pins = loadPins(), editing = false;
+
+  function loadPins() {
+    try {
+      var raw = JSON.parse(localStorage.getItem(PINS) || '[]');
+      if (!Array.isArray(raw)) return [];
+      return raw.filter(function (label) {
+        return typeof label === 'string' && label && label.length <= 24;
+      }).slice(0, MAX_PINS);
+    } catch (e) { return []; }
+  }
+
+  function savePins() {
+    try { localStorage.setItem(PINS, JSON.stringify(pins)); } catch (e) {}
+  }
+
+  function togglePin(label) {
+    var at = pins.indexOf(label);
+    if (at >= 0) pins.splice(at, 1);
+    else if (pins.length < MAX_PINS) pins.push(label);
+    else return say('that is as many as fit');
+    savePins();
+    renderKeys();
+  }
+
   var keys = document.getElementById('keys');
   var nav = document.getElementById('nav');
+  var pinRow = document.getElementById('pins');
   var expander = document.getElementById('more');
   // Two rows fit under a phone's thumb without eating the dashboard. The
   // rest are one tap away rather than one page away.
@@ -425,14 +466,39 @@
   // layout key ended up two taps deep behind one nobody would think to open --
   // and a second axis of navigation would be that mistake again. Opening the
   // drawer reveals everything, in one column, scrolled.
+  // Marked as ours, which is what makes a key pinnable: these mean the same
+  // thing on every screen, so keeping one is keeping a key rather than
+  // keeping a screenshot of one.
+  function own(list) {
+    return list.map(function (entry) {
+      return { l: entry.l, k: entry.k, own: true };
+    });
+  }
+
   function groups() {
     var out = [];
     if (current.length) out.push({ name: '', keys: current });
-    out.push({ name: 'tmux', keys: tmuxKeys() });
-    out.push({ name: 'ctrl', keys: CTRL_KEYS });
-    out.push({ name: 'move', keys: MOVE_KEYS });
-    out.push({ name: 'type', keys: TYPE_KEYS });
+    out.push({ name: 'tmux', keys: own(tmuxKeys()) });
+    out.push({ name: 'ctrl', keys: own(CTRL_KEYS) });
+    out.push({ name: 'move', keys: own(MOVE_KEYS) });
+    out.push({ name: 'type', keys: own(TYPE_KEYS) });
     return out;
+  }
+
+  // Resolved fresh every render rather than stored: a pinned tmux verb is
+  // rebuilt from whatever the prefix is now, and a label that no longer
+  // names anything simply stops appearing instead of becoming a dead button.
+  function pinnedKeys() {
+    var all = [];
+    groups().forEach(function (group) {
+      if (group.name) all = all.concat(group.keys);
+    });
+    return pins.map(function (label) {
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].l === label) return all[i];
+      }
+      return null;
+    }).filter(Boolean);
   }
 
   function renderRows(into, list, columns, limit) {
@@ -464,11 +530,24 @@
     }
   }
 
+  // Yours, and therefore fixed: the whole point of keeping a key is that it
+  // is in the same place every time, which a row inside the scrolling drawer
+  // would not be.
+  function renderPins(columns) {
+    if (!pinRow) return;
+    pinRow.textContent = '';
+    var list = pinnedKeys();
+    pinRow.style.display = list.length ? '' : 'none';
+    if (list.length) renderRows(pinRow, list, columns, 0);
+  }
+
   function renderKeys() {
     var columns = perRow(keys.getBoundingClientRect().width);
     columnsUsed = columns;
+    renderPins(columns);
     keys.textContent = '';
     keys.classList.toggle('open', expanded);
+    keys.classList.toggle('editing', editing);
     var hidden = 0;
     if (expanded) {
       groups().forEach(function (group) {
@@ -548,6 +627,19 @@
     // Derived rather than flagged, same as `repeats` below: a label that is a
     // single symbol is a glyph and wants the room a word does not.
     if (label.length === 1 && !/\w/.test(label)) button.classList.add('glyph');
+    // While editing, a key is a thing you are choosing rather than pressing,
+    // and it has to look like one -- a row that types when you meant to keep
+    // is worse than no editing at all.
+    //
+    // Nothing at all fires while editing, not just the keys you can keep. The
+    // app's own are in this drawer too, they are not keepable, and one of them
+    // is `Kill session`: a tap that fell through to it because it happened not
+    // to be pinnable would be the worst bug in this file.
+    var pinnable = entry.own === true;
+    if (editing) {
+      button.classList.add(pinnable ? 'choose' : 'locked');
+      if (pinnable && pins.indexOf(label) >= 0) button.classList.add('kept');
+    }
     button.textContent = label;
     button.setAttribute('aria-label', label);
     var timer = null, interval = null;
@@ -575,7 +667,10 @@
       originX = event.clientX; originY = event.clientY;
       lastY = event.clientY;
       button.classList.add('down');
-      if (repeats) {
+      // Nothing repeats while you are choosing. A held key that pinned and
+      // unpinned itself ten times a second is the obvious way to get this
+      // wrong.
+      if (repeats && !editing) {
         timer = setTimeout(function () {
           repeated = true;
           fire();
@@ -588,7 +683,10 @@
     // dragged through the drawer looking for a different key. A finger that
     // has not moved has still not scrolled anything, so a tap is a tap.
     function up() {
-      if (live && !repeated && !dragging) fire();
+      if (live && !repeated && !dragging) {
+        if (!editing) fire();
+        else if (pinnable) togglePin(label);
+      }
       stop();
     }
     // Past a few pixels this is a scroll, not a key. The drawer is nearly all
@@ -623,11 +721,67 @@
     return button;
   }
 
+  var editButton = document.getElementById('edit');
+
+  // Editing lives and dies with the open drawer. It is a mode in which keys
+  // do not do what they say, so it must not be possible to be in it while
+  // looking at a screen that gives no sign of it -- a lit star in the corner
+  // is not enough to explain why `detach` just unkept itself instead.
+  function setEditing(on) {
+    editing = !!on;
+    if (editing) expanded = true;
+    if (editButton) editButton.classList.toggle('on', editing);
+  }
+
+  function toggleDrawer() {
+    expanded = !expanded;
+    if (!expanded && editing) setEditing(false);
+    renderKeys();
+  }
+
   keepFocus(expander);
   if (expander) expander.addEventListener('click', function (event) {
     event.preventDefault();
-    expanded = !expanded;
+    toggleDrawer();
+  });
+
+  keepFocus(editButton);
+  if (editButton) editButton.addEventListener('click', function (event) {
+    event.preventDefault();
+    setEditing(!editing);
+    say(editing ? 'tap keys to keep them' : 'kept');
     renderKeys();
+  });
+
+  // ── getting out of the way ────────────────────────────────────────────
+  // The pad is two hundred pixels of a phone screen, and there are stretches
+  // -- reading a log, watching a job -- where you want none of it. Hidden
+  // means hidden: not a smaller pad, no row of controls left behind. What
+  // stays is a strip at the very bottom edge, which is a large target for a
+  // thumb however few pixels tall it is.
+  var PAD_STATE = 'atmux.pad';
+  var grip = document.getElementById('grip');
+  var hideButton = document.getElementById('hide');
+
+  function setPad(shown) {
+    document.body.classList.toggle('nopad', !shown);
+    // Putting the pad away ends editing with it. Coming back to a pad whose
+    // keys silently keep instead of press, because of something you did
+    // before you hid it, is the same trap the expander closes.
+    if (!shown && editing) { setEditing(false); renderKeys(); }
+    try {
+      localStorage.setItem(PAD_STATE, shown ? '' : 'hidden');
+    } catch (e) {}
+    refit();
+  }
+  keepFocus(hideButton); keepFocus(grip);
+  if (hideButton) hideButton.addEventListener('click', function (event) {
+    event.preventDefault();
+    setPad(false);
+  });
+  if (grip) grip.addEventListener('click', function (event) {
+    event.preventDefault();
+    setPad(true);
   });
 
   // The dashboard's side of this is keypad.encode(). Everything is validated
@@ -902,6 +1056,9 @@
     renderNav();
     renderKeys();
     setKeyboard(false);
+    var stored = '';
+    try { stored = localStorage.getItem(PAD_STATE) || ''; } catch (e) {}
+    if (stored === 'hidden') setPad(false);
   }
 
   if (boot) boot.style.display = 'none';
