@@ -515,6 +515,15 @@
     renderKeys();
   }
 
+  // Only the drawer scrolls, and only a key that lives in it may scroll it:
+  // the row above is fixed on purpose, and dragging a fixed key to move
+  // something else is a gesture nobody asked for.
+  function scrollDrawer(button, dy) {
+    if (!keys.classList.contains('open')) return;
+    if (!button.parentNode || button.parentNode.parentNode !== keys) return;
+    keys.scrollTop += dy;
+  }
+
   function buildModifier(entry) {
     var button = document.createElement('button');
     button.className = 'key mod';
@@ -542,31 +551,70 @@
     button.textContent = label;
     button.setAttribute('aria-label', label);
     var timer = null, interval = null;
+    var live = false, repeated = false, dragging = false;
+    var originX = 0, originY = 0, lastY = 0;
     // Derived, not flagged: the keys worth repeating are the ones that move or
     // remove something a step at a time -- the CSI sequences (arrows, page
     // up/down, delete) and backspace. Nothing has to remember to mark them.
     var repeats = /^\x1b\[/.test(seq) || seq === '\x7f';
+    var DRAG = 10;                        // px before a touch is a scroll
     function fire() { press(seq); }
-    // pointerdown, not click: a key should fire the moment it is touched.
-    function down(event) {
-      event.preventDefault();
-      fire();
-      button.classList.add('down');
-      if (repeats) {
-        timer = setTimeout(function () {
-          interval = setInterval(fire, 70);
-        }, 400);
-      }
-    }
-    function up() {
+    function stop() {
+      live = false;
       button.classList.remove('down');
       clearTimeout(timer); clearInterval(interval);
       timer = interval = null;
     }
+    function down(event) {
+      // The gesture stays ours -- this is what stops the button taking the
+      // terminal's focus, and focus is what the software keyboard is attached
+      // to. The cost is that the drawer will not pan by itself, which `moved`
+      // below pays.
+      event.preventDefault();
+      live = true; repeated = false; dragging = false;
+      originX = event.clientX; originY = event.clientY;
+      lastY = event.clientY;
+      button.classList.add('down');
+      if (repeats) {
+        timer = setTimeout(function () {
+          repeated = true;
+          fire();
+          interval = setInterval(fire, 70);
+        }, 400);
+      }
+    }
+    // On release rather than on touch. Firing on the way down is what a key
+    // should do -- and it is also what would type something every time you
+    // dragged through the drawer looking for a different key. A finger that
+    // has not moved has still not scrolled anything, so a tap is a tap.
+    function up() {
+      if (live && !repeated && !dragging) fire();
+      stop();
+    }
+    // Past a few pixels this is a scroll, not a key. The drawer is nearly all
+    // keys, so a finger dragging through it lands here rather than on any
+    // scrollable gap -- which is why nothing moved at all, and why the keys
+    // themselves have to do the scrolling.
+    function moved(event) {
+      if (!live) return;
+      if (!dragging
+          && (Math.abs(event.clientX - originX) > DRAG
+              || Math.abs(event.clientY - originY) > DRAG)) {
+        dragging = true;
+        button.classList.remove('down');
+        clearTimeout(timer); clearInterval(interval);
+        timer = interval = null;
+      }
+      if (dragging) {
+        scrollDrawer(button, lastY - event.clientY);
+        lastY = event.clientY;
+      }
+    }
     button.addEventListener('pointerdown', down);
+    button.addEventListener('pointermove', moved);
     button.addEventListener('pointerup', up);
-    button.addEventListener('pointercancel', up);
-    button.addEventListener('pointerleave', up);
+    button.addEventListener('pointercancel', stop);
+    button.addEventListener('pointerleave', stop);
     // Stop the browser turning a held key into a text selection or a context
     // menu.
     button.addEventListener('contextmenu', function (e) {

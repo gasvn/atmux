@@ -102,7 +102,12 @@
   /* Only the drawer scrolls. #nav and the row under it stay put so the keys
      you reach for without looking are always in the same place. */
   #keys { flex: 0 1 auto; min-height: 0; padding: 7px 7px 4px; }
-  #keys.open { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  /* contain, so reaching the end of the drawer stops there rather than
+     handing the rest of the swipe to the page behind it. */
+  #keys.open {
+    overflow-y: auto; -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+  }
   .ghead {
     color: #75757f; margin: 6px 2px 4px;
     font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -128,7 +133,11 @@
     font: 11px/1.15 ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: normal; overflow-wrap: anywhere; hyphens: auto;
     -webkit-tap-highlight-color: transparent;
-    touch-action: none;                 /* a held key repeats; it never scrolls */
+    /* Still none: the gesture stays ours, and app.js scrolls the drawer with
+       it. Handing it to the browser instead would scroll natively, but a
+       button that is allowed its default takes focus, and losing focus closes
+       the software keyboard -- right when you reached for the symbol row. */
+    touch-action: none;
   }
   .key.down { background: #4a4a58; border-color: #6f6f80; }
   .key.on { background: #3c5a8a; border-color: #5b82bd; color: #fff; }

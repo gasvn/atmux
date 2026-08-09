@@ -1292,7 +1292,8 @@ class ControlSurfaceTests(_ServedFixture):
 _DOM_STUB = r'''
 function El(tag) {
   this.tag = tag; this.children = []; this.attrs = {}; this.style = {};
-  this._text = ''; this._cls = {};
+  this._text = ''; this._cls = {}; this._on = {}; this.scrollTop = 0;
+  this.parentNode = null;
   var self = this;
   this.classList = {
     add: function (n) { self._cls[n] = 1; },
@@ -1317,9 +1318,22 @@ Object.defineProperty(El.prototype, 'textContent', {
 Object.defineProperty(El.prototype, 'childElementCount', {
   get: function () { return this.children.length; }
 });
-El.prototype.appendChild = function (c) { this.children.push(c); return c; };
+El.prototype.appendChild = function (c) {
+  this.children.push(c); c.parentNode = this; return c;
+};
 El.prototype.setAttribute = function (k, v) { this.attrs[k] = v; };
-El.prototype.addEventListener = function () {};
+El.prototype.addEventListener = function (type, fn) {
+  (this._on[type] = this._on[type] || []).push(fn);
+};
+// A gesture, delivered the way the browser delivers one. The pad decides
+// whether a touch was a tap or a scroll from these alone, so the tests have
+// to be able to send them.
+El.prototype.emit = function (type, event) {
+  var detail = Object.assign(
+    { preventDefault: function () {}, pointerType: 'touch',
+      clientX: 0, clientY: 0 }, event || {});
+  (this._on[type] || []).forEach(function (fn) { fn(detail); });
+};
 // Width is the one measurement the pad reads back out of the layout: it is
 // what decides how many keys go across.
 El.prototype.getBoundingClientRect = function () {
@@ -1331,9 +1345,20 @@ var document = { createElement: function (t) { return new El(t); } };
 // thing the browser owns, not a thing the keypad decides.
 var keys = new El('div'), nav = new El('div'), expander = new El('button');
 var current = [], expanded = false;
+var sent = [];
 function refit() {}
 function haptic() {}
-function sendText() {}
+function sendText(text) { sent.push(text); }
+
+function buttons(node, out) {
+  if (node._cls.key && !node._cls.gap) out.push(node);
+  node.children.forEach(function (child) { buttons(child, out); });
+  return out;
+}
+function keyAt(node, n) { return buttons(node, [])[n]; }
+function keyLabelled(node, label) {
+  return buttons(node, []).find(function (e) { return e.textContent === label; });
+}
 
 function drawn(node, out) {
   if (node._cls.key && !node._cls.gap) out.push(node.textContent);
@@ -1366,9 +1391,9 @@ class KeypadVocabularyTests(unittest.TestCase):
     """
 
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
-    FUNCTIONS = ('ctrlify', 'applyLatch', 'paintLatch', 'buildModifier',
-                 'buildKey', 'tmuxKeys', 'groups', 'perRow', 'renderRows',
-                 'recolumn', 'renderKeys')
+    FUNCTIONS = ('ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
+                 'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
+                 'renderRows', 'recolumn', 'renderNav', 'renderKeys')
     SCALARS = ('var OFF =', 'var ROWS_COLLAPSED =', 'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
                'var prefixSeq =')
@@ -1591,6 +1616,107 @@ class KeypadVocabularyTests(unittest.TestCase):
         wide = self.render(expanded=True, width=844)
         self.assertEqual(sorted(narrow['keys']), sorted(wide['keys']))
         self.assertLess(wide['rows'], narrow['rows'])
+
+    # ── tap versus scroll ─────────────────────────────────────────────────
+
+    def gesture(self, script):
+        """An open drawer, and a finger doing something to it."""
+        return self.run_js(f'''
+            keys._width = 390; current = []; expanded = true;
+            renderKeys();
+            sent = [];
+            {script}''')
+
+    def test_a_tap_sends_the_key_under_the_finger(self):
+        self.assertEqual(self.gesture('''
+            var key = keyAt(keys, 0);
+            key.emit('pointerdown', {clientX: 50, clientY: 100});
+            key.emit('pointerup', {clientX: 50, clientY: 100});
+            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            [['\x02d'], 0])
+
+    def test_a_drag_scrolls_the_drawer_and_types_nothing(self):
+        """The bug: the drawer is nearly all keys, and a key claimed the whole
+        gesture -- so a finger dragging through it to reach the rows below
+        moved nothing at all. Handing the gesture to the browser instead would
+        scroll natively and cost the terminal its focus, which is what the
+        software keyboard is attached to. So the keys scroll it themselves."""
+        self.assertEqual(self.gesture('''
+            var key = keyAt(keys, 0);
+            key.emit('pointerdown', {clientX: 50, clientY: 200});
+            [190, 170, 150, 130].forEach(function (y) {
+              key.emit('pointermove', {clientX: 50, clientY: y}); });
+            key.emit('pointerup', {clientX: 50, clientY: 130});
+            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            [[], 70])
+
+    def test_a_drag_back_the_other_way_returns(self):
+        self.assertEqual(self.gesture('''
+            var key = keyAt(keys, 0);
+            keys.scrollTop = 100;
+            key.emit('pointerdown', {clientX: 50, clientY: 100});
+            [130, 160].forEach(function (y) {
+              key.emit('pointermove', {clientX: 50, clientY: y}); });
+            key.emit('pointerup', {clientX: 50, clientY: 160});
+            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            [[], 40])
+
+    def test_a_small_wobble_is_still_a_tap(self):
+        """A thumb is not a stylus. Treating every pixel of movement as a
+        scroll would make the pad feel broken rather than careful."""
+        self.assertEqual(self.gesture('''
+            var key = keyAt(keys, 0);
+            key.emit('pointerdown', {clientX: 50, clientY: 100});
+            key.emit('pointermove', {clientX: 53, clientY: 104});
+            key.emit('pointerup', {clientX: 53, clientY: 104});
+            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            [['\x02d'], 0])
+
+    def test_a_cancelled_pointer_types_nothing(self):
+        self.assertEqual(self.gesture('''
+            var key = keyAt(keys, 0);
+            key.emit('pointerdown', {clientX: 50, clientY: 100});
+            key.emit('pointercancel', {});
+            console.log(JSON.stringify(sent));'''), [])
+
+    def test_the_fixed_row_does_not_scroll_the_drawer(self):
+        """It is fixed on purpose, and dragging a key that stays put to move
+        something that does not is a gesture nobody asked for."""
+        self.assertEqual(self.gesture('''
+            renderNav();
+            var key = keyAt(nav, 0);
+            key.emit('pointerdown', {clientX: 50, clientY: 200});
+            [170, 140].forEach(function (y) {
+              key.emit('pointermove', {clientX: 50, clientY: y}); });
+            key.emit('pointerup', {clientX: 50, clientY: 140});
+            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            [[], 0])
+
+    def test_a_closed_drawer_has_nothing_to_scroll(self):
+        self.assertEqual(self.run_js('''
+            keys._width = 390; current = []; expanded = false;
+            renderKeys(); sent = [];
+            var key = keyAt(keys, 0);
+            key.emit('pointerdown', {clientX: 50, clientY: 200});
+            key.emit('pointermove', {clientX: 50, clientY: 140});
+            key.emit('pointerup', {clientX: 50, clientY: 140});
+            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            [[], 0])
+
+    def test_a_held_key_repeats_and_does_not_fire_again_on_release(self):
+        """Firing on release is what makes a drag safe; it must not also add
+        a keystroke to the end of a hold that has already been repeating."""
+        self.assertEqual(self.gesture('''
+            var key = keyLabelled(keys, 'PgUp');
+            key.emit('pointerdown', {clientX: 0, clientY: 0});
+            setTimeout(function () {
+              var before = sent.length;
+              key.emit('pointerup', {clientX: 0, clientY: 0});
+              console.log(JSON.stringify([
+                before >= 2, sent.length === before,
+                sent.every(function (s) { return s === '\\x1b[5~'; })]));
+            }, 560);'''),
+            [True, True, True])
 
     def test_a_rotation_redraws_only_when_the_count_actually_changed(self):
         """Rebuilding the pad on every resize would drop a held key and clear
