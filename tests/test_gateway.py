@@ -1191,15 +1191,46 @@ class CliDeploymentModeTests(unittest.TestCase):
         return SimpleNamespace(**defaults)
 
     def test_auto_mode_stays_native_on_ssh_login(self):
+        """The compatibility contract, on the machine it is about.
+
+        What makes this a login node is that it has Slurm -- said out loud
+        now, because it is what the guard turns on. Ordinary SSH use there
+        must not change and must not touch a client config that may sit on a
+        wedged shared filesystem.
+        """
         with mock.patch.object(config, "load_client",
                                return_value=client_settings()) as load, \
              mock.patch.object(cli, "_is_remote_session", return_value=True), \
+             mock.patch.object(cli, "_has_local_slurm", return_value=True), \
              mock.patch.object(cli.gateway_client, "ClusterPool") as pool:
             error = cli._configure_gateway_mode(self.args())
         self.assertEqual(error, "")
         self.assertIsNone(cli._GATEWAY_POOL)
         load.assert_not_called()
         pool.assert_not_called()
+
+    def test_a_host_without_slurm_over_ssh_reads_its_own_config(self):
+        """Native mode on a machine with no Slurm can only ever show an empty
+        table, so returning before the config was read meant a saved
+        `mode = "gateway"` never got a say: sshing to such a host showed zero
+        sessions and an empty queue, while the same binary on the same host
+        reached every cluster when something other than SSH started it."""
+        for mode in ("gateway", "auto"):
+            with self.subTest(mode=mode):
+                cli._GATEWAY_POOL = None
+                sentinel = object()
+                with mock.patch.object(
+                        config, "load_client",
+                        return_value=client_settings(mode=mode)), \
+                     mock.patch.object(cli, "_is_remote_session",
+                                       return_value=True), \
+                     mock.patch.object(cli, "_has_local_slurm",
+                                       return_value=False), \
+                     mock.patch.object(cli.gateway_client, "ClusterPool",
+                                       return_value=sentinel):
+                    error = cli._configure_gateway_mode(self.args())
+                self.assertEqual(error, "")
+                self.assertIs(cli._GATEWAY_POOL, sentinel)
 
     def test_auto_mode_enables_local_pool_outside_ssh(self):
         sentinel = object()

@@ -2373,3 +2373,98 @@ class PreselectedRowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(autotmux._valid_select(value))
         self.assertEqual(autotmux._valid_select('gpu1:train'),
                          ('gpu1', 'train'))
+
+
+class RemoteSessionGatewayTests(unittest.TestCase):
+    """SSH is not evidence that this machine can answer for Slurm.
+
+    Native login-node mode is the compatibility contract: an ordinary SSH
+    session must not change behaviour, and must not touch a client config
+    that may live on a wedged shared filesystem. That guard returned before
+    the config was ever read -- so a saved `mode = "gateway"` never got a
+    say, and sshing to a workstation that reaches its cluster only through a
+    gateway showed zero sessions and an empty queue. The same binary on the
+    same host reached every cluster when something other than SSH started it.
+
+    The discriminator is whether the machine has Slurm at all. Where it does,
+    nothing changes. Where it does not, native mode could only ever show an
+    empty table.
+    """
+
+    def setUp(self):
+        self._saved = {name: os.environ.get(name) for name in (
+            'SSH_CONNECTION', 'SSH_TTY', 'SSH_CLIENT', 'MOSH_CONNECTION',
+            'MOSH_IP')}
+        for name in self._saved:
+            os.environ.pop(name, None)
+        # _configure_gateway_mode installs a module-global pool. Left behind,
+        # every later test that reads state goes through this one instead of
+        # the file -- which is how six unrelated modules started failing only
+        # when the whole suite ran.
+        self._saved_pool = autotmux._GATEWAY_POOL
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        autotmux._GATEWAY_POOL = self._saved_pool
+
+    def test_ssh_is_detected_from_any_of_the_usual_variables(self):
+        for name in ('SSH_CONNECTION', 'SSH_TTY', 'SSH_CLIENT',
+                     'MOSH_CONNECTION', 'MOSH_IP'):
+            with self.subTest(name=name):
+                os.environ[name] = 'x'
+                try:
+                    self.assertTrue(autotmux._is_remote_session())
+                finally:
+                    os.environ.pop(name, None)
+        self.assertFalse(autotmux._is_remote_session())
+
+    def test_slurm_is_what_makes_a_machine_a_login_node(self):
+        with mock.patch.object(autotmux.shutil, 'which',
+                               side_effect=lambda name: '/usr/bin/squeue'
+                               if name == 'squeue' else None):
+            self.assertTrue(autotmux._has_local_slurm())
+        with mock.patch.object(autotmux.shutil, 'which', return_value=None):
+            self.assertFalse(autotmux._has_local_slurm())
+
+    def _setup(self, *, ssh, slurm, gateways=('k6',), mode='gateway'):
+        os.environ['SSH_CONNECTION'] = 'x' if ssh else ''
+        if not ssh:
+            os.environ.pop('SSH_CONNECTION', None)
+        args = SimpleNamespace(
+            gateway=None, gateway_mode=False, cluster=None,
+            gateway_login=False, gateway_check=False, login_mode=False)
+        settings = dict(autotmux.config.CLIENT_DEFAULTS)
+        settings['mode'] = mode
+        settings['gateways'] = list(gateways)
+        with mock.patch.object(autotmux.shutil, 'which',
+                               side_effect=lambda n: '/usr/bin/squeue'
+                               if (n == 'squeue' and slurm) else None), \
+             mock.patch.object(autotmux, '_load_client_config_bounded',
+                               return_value=(True, settings)), \
+             mock.patch.object(autotmux.gateway_client, 'ClusterPool',
+                               return_value=object()) as pool:
+            autotmux._GATEWAY_POOL = None
+            autotmux._configure_gateway_mode(args)
+            return pool.called
+
+    def test_a_login_node_over_ssh_is_left_exactly_as_it_was(self):
+        """Where Slurm is, the local daemon is the source of truth."""
+        self.assertFalse(self._setup(ssh=True, slurm=True))
+
+    def test_a_gateway_client_over_ssh_now_honours_its_own_config(self):
+        """The bug: this returned before the config was read, so a machine
+        with no Slurm showed nothing at all."""
+        self.assertTrue(self._setup(ssh=True, slurm=False))
+
+    def test_nothing_changes_when_it_is_not_an_ssh_session(self):
+        self.assertTrue(self._setup(ssh=False, slurm=False))
+        self.assertTrue(self._setup(ssh=False, slurm=True))
+
+    def test_a_host_with_no_gateways_configured_stays_native(self):
+        """Falling through the guard must not invent a gateway for someone
+        who never configured one."""
+        self.assertFalse(self._setup(ssh=True, slurm=False, gateways=()))

@@ -20,6 +20,7 @@ import pty
 import queue
 import re
 import select
+import shutil
 import shlex
 import signal
 import stat
@@ -5823,6 +5824,17 @@ def parse_cluster_args(values) -> tuple[dict, str]:
     return clusters, ''
 
 
+def _has_local_slurm() -> bool:
+    """Whether this machine can answer for Slurm on its own.
+
+    The discriminator between a login node -- where the local daemon is the
+    source of truth and native mode is right -- and a workstation that only
+    ever reaches a cluster through a gateway, where native mode can only ever
+    show an empty table.
+    """
+    return shutil.which('squeue') is not None
+
+
 def _is_remote_session() -> bool:
     """True when we're on the far end of an SSH connection. Mouse tracking makes
     the terminal stream a burst of report bytes on every move/scroll, which over
@@ -5871,11 +5883,20 @@ def _configure_gateway_mode(args) -> str:
         or getattr(args, 'cluster', None)
         or getattr(args, 'gateway_login', False)
         or getattr(args, 'gateway_check', False))
-    if _is_remote_session() and not explicit_gateway:
-        # Native login-node mode is the compatibility contract.  Do not even
-        # touch an NFS-backed client config during ordinary SSH use; users who
-        # genuinely want a gateway client on a remote host can request it with
-        # --gateway-mode.
+    if (_is_remote_session() and not explicit_gateway
+            and _has_local_slurm()):
+        # Native login-node mode is the compatibility contract -- but only
+        # where there is a login node. The contract is that ordinary SSH use
+        # does not change, and does not touch an NFS-backed client config on
+        # a possibly wedged shared filesystem; on a machine that answers for
+        # Slurm itself, returning here honours both.
+        #
+        # A machine with no Slurm at all answers for nothing. Returning here
+        # meant a saved `mode = "gateway"` was never read, because the read
+        # is below this line -- so sshing to such a host and running atmux
+        # showed zero sessions and an empty queue, while the same binary on
+        # the same host reached every cluster when it was started by
+        # something that was not an SSH session.
         return ''
     config_ok, settings = _load_client_config_bounded()
     if not config_ok or not isinstance(settings, dict):
@@ -5912,9 +5933,13 @@ def _configure_gateway_mode(args) -> str:
         or getattr(args, 'gateway_login', False)
         or getattr(args, 'gateway_check', False))
     mode = settings.get('mode', 'auto')
+    # Same discriminator as the guard above, for the same reason: SSH implies
+    # "native" only where the machine can actually be native. On a host with
+    # no Slurm, refusing here leaves a configured gateway client showing an
+    # empty table over SSH and a full one over anything else.
     enabled = forced or mode == 'gateway' or (
         mode == 'auto' and bool(settings.get('gateways'))
-        and not _is_remote_session())
+        and not (_is_remote_session() and _has_local_slurm()))
     if not enabled:
         return ''
     if not settings.get('gateways'):
