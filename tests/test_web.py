@@ -53,6 +53,37 @@ def _extract(source: str, name: str) -> str:
     raise AssertionError(f'unbalanced braces in {name}')
 
 
+def _extract_list(source: str, name: str) -> str:
+    """One top-level `var NAME = [...]` out of app.js, by bracket depth.
+
+    Same reason as _extract: these are tables of bytes, and a test that
+    restated them here would be checking its own copy.
+
+    String-aware, unlike the brace scanner above, because these tables are
+    full of `'\\x1b[D'` -- counting the bracket inside that literal runs the
+    scanner off the end of the file and reports the table as unbalanced.
+    """
+    start = source.index(f'var {name} = [')
+    depth, i, quote = 0, source.index('[', start), ''
+    while i < len(source):
+        char = source[i]
+        if quote:
+            if char == '\\':
+                i += 1
+            elif char == quote:
+                quote = ''
+        elif char in '\'"':
+            quote = char
+        elif char == '[':
+            depth += 1
+        elif char == ']':
+            depth -= 1
+            if depth == 0:
+                return source[start:i + 1] + ';'
+        i += 1
+    raise AssertionError(f'unbalanced brackets in {name}')
+
+
 def client_frame(payload: bytes, opcode: int = 0x2, fin: bool = True,
                  mask: bytes = b'\x01\x02\x03\x04') -> bytes:
     """A frame shaped the way a browser sends one: always masked."""
@@ -639,14 +670,32 @@ class TouchKeypadTests(unittest.TestCase):
         self.assertRegex(css, r'\.krow \.key \{[^}]*flex: 1 1 0')
 
 
-    def test_detach_is_offered_because_nobody_can_guess_it(self):
-        """Ctrl-B then d. Attaching hands the screen to tmux, which draws no
-        buttons and answers no questions, so this one set is static because
-        the situation is -- see keypad.EXTERNAL_KEYS."""
-        labels = {k['l'] for k in keypad.EXTERNAL_KEYS}
-        self.assertIn('detach', labels)
-        # And the page must not carry its own copy of it.
+    def test_detach_moved_to_the_side_that_can_offer_it_all_the_time(self):
+        """Ctrl-B then d: the one key nobody can guess, and being stuck inside
+        a session is the failure this whole feature would otherwise create.
+
+        It used to be published from python, with ^C, ^D, ^Z, PgUp and PgDn.
+        Every one of those describes a *terminal* rather than atmux, and a
+        copy of the terminal's vocabulary kept on the app's side is exactly
+        what the published list exists to avoid. Worse, it only ever arrived
+        while atmux was suspending: in a bare shell nothing published, and
+        there was no detach at all. The client owns it now, which is also why
+        it is built from the prefix instead of being spelled out -- a rebound
+        prefix moves every chord at once. See KeypadVocabularyTests.
+        """
+        self.assertEqual(list(keypad.EXTERNAL_KEYS), [])
         self.assertNotIn('x02d', self.js)
+        self.assertIn("{ l: 'detach', s: 'd' }", self.js)
+
+    def test_what_the_app_cannot_be_asked_travels_instead(self):
+        """The prefix byte. A client cannot work it out and `set -g prefix
+        C-a` is a rebinding nothing on the wire announces, so twelve tmux
+        buttons would quietly mean something else."""
+        payload = keypad.decode(
+            keypad.encode('external', keypad.EXTERNAL_KEYS,
+                          keypad.tmux_prefix({})))
+        self.assertEqual(payload['prefix'], '\x02')
+        self.assertIn('data.prefix', self.js)
 
     def test_typing_puts_a_real_input_under_the_finger(self):
         """Two attempts at calling focus() from JavaScript failed silently.
@@ -660,12 +709,13 @@ class TouchKeypadTests(unittest.TestCase):
 
 
     def test_repeating_keys_are_recognised_rather_than_flagged(self):
-        """The keys worth repeating are the ones that move something a step
-        at a time, and those are exactly the CSI sequences. Deriving it means
-        nothing has to remember to mark a new one."""
+        """The keys worth repeating are the ones that move or remove
+        something a step at a time -- the CSI sequences and backspace.
+        Deriving it means nothing has to remember to mark a new one."""
         body = _extract(self.js, 'buildKey')
         # The literal /^\x1b\[/ -- a CSI prefix, not a hand-kept flag.
         self.assertIn('/^\\x1b\\[/', body)
+        self.assertIn("'\\x7f'", body)
         self.assertIn('setInterval', body)
         self.assertNotIn("'rep'", self.js)
 
@@ -1234,6 +1284,326 @@ class ControlSurfaceTests(_ServedFixture):
         handler.server = self.server
         handler.path = '/ws'
         self.assertEqual(keypad.touch_mode(handler._client_env()), '')
+
+
+# Enough of a DOM to run the pad's own rendering. Not a mock of what it does:
+# the real functions come out of app.js and build real trees in this, so a key
+# that stops being drawn stops being drawn here too.
+_DOM_STUB = r'''
+function El(tag) {
+  this.tag = tag; this.children = []; this.attrs = {}; this.style = {};
+  this._text = ''; this._cls = {};
+  var self = this;
+  this.classList = {
+    add: function (n) { self._cls[n] = 1; },
+    remove: function (n) { delete self._cls[n]; },
+    toggle: function (n, on) {
+      if (on) self._cls[n] = 1; else delete self._cls[n];
+    },
+    contains: function (n) { return !!self._cls[n]; }
+  };
+}
+Object.defineProperty(El.prototype, 'className', {
+  set: function (v) {
+    var self = this; this._cls = {};
+    String(v).split(/\s+/).forEach(function (n) { if (n) self._cls[n] = 1; });
+  },
+  get: function () { return Object.keys(this._cls).join(' '); }
+});
+Object.defineProperty(El.prototype, 'textContent', {
+  set: function (v) { this._text = String(v); this.children = []; },
+  get: function () { return this._text; }
+});
+Object.defineProperty(El.prototype, 'childElementCount', {
+  get: function () { return this.children.length; }
+});
+El.prototype.appendChild = function (c) { this.children.push(c); return c; };
+El.prototype.setAttribute = function (k, v) { this.attrs[k] = v; };
+El.prototype.addEventListener = function () {};
+// Width is the one measurement the pad reads back out of the layout: it is
+// what decides how many keys go across.
+El.prototype.getBoundingClientRect = function () {
+  return { width: this._width || 0, height: 0 };
+};
+var document = { createElement: function (t) { return new El(t); } };
+
+// What the pad needs around it, and nothing more. Every one of these is a
+// thing the browser owns, not a thing the keypad decides.
+var keys = new El('div'), nav = new El('div'), expander = new El('button');
+var current = [], expanded = false;
+function refit() {}
+function haptic() {}
+function sendText() {}
+
+function drawn(node, out) {
+  if (node._cls.key && !node._cls.gap) out.push(node.textContent);
+  node.children.forEach(function (child) { drawn(child, out); });
+  return out;
+}
+function headings(node, out) {
+  if (node._cls.ghead) out.push(node.textContent);
+  node.children.forEach(function (child) { headings(child, out); });
+  return out;
+}
+'''
+
+
+@unittest.skipUnless(_node(), 'needs a javascript runtime')
+class KeypadVocabularyTests(unittest.TestCase):
+    """The keys the *client* owns, run rather than restated.
+
+    The split is the design: what the app can do is published by the app and
+    never written in javascript, because a copy is only correct on the day it
+    is written. What a terminal can do is written in javascript and never
+    published, because it is true of every program and has to work when
+    nothing is publishing -- in a bare shell, during a reconnect, after the
+    handover to tmux.
+
+    The regression these exist for is the second half being neglected. It
+    once held three keys (↑ ↓ esc), which is a row chosen for one screen of
+    this dashboard: no tab, no ← →, no ctrl, and no way to reach a single
+    tmux binding from inside the session you had just attached to.
+    """
+
+    TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
+    FUNCTIONS = ('ctrlify', 'applyLatch', 'paintLatch', 'buildModifier',
+                 'buildKey', 'tmuxKeys', 'groups', 'perRow', 'renderRows',
+                 'recolumn', 'renderKeys')
+    SCALARS = ('var OFF =', 'var ROWS_COLLAPSED =', 'var KEY_TARGET =',
+               'var columnsUsed =', 'var latch =', 'var modButtons =',
+               'var prefixSeq =')
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(web.ASSETS, 'app.js'), encoding='utf-8') as f:
+            cls.js = f.read()
+        parts = [_DOM_STUB]
+        for head in cls.SCALARS:
+            match = re.search(re.escape(head) + r'[^;]*;', cls.js)
+            assert match, head
+            parts.append(match.group(0))
+        parts += [_extract_list(cls.js, name) for name in cls.TABLES]
+        parts += [_extract(cls.js, name) for name in cls.FUNCTIONS]
+        cls.harness = '\n'.join(parts)
+
+    def run_js(self, body):
+        import subprocess
+        out = subprocess.run([_node(), '-e', self.harness + '\n' + body],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def table(self, name):
+        return self.run_js(f'console.log(JSON.stringify({name}));')
+
+    # ── the persistent row ────────────────────────────────────────────────
+
+    def test_the_row_covers_what_a_terminal_needs_and_a_phone_lacks(self):
+        """Tab is completion, ← → is editing a command line, and Enter is how
+        you run the command you just recalled with ↑. None of the three was
+        reachable at all once the software keyboard was down."""
+        nav = self.table('NAV_KEYS')
+        bytes_for = {e['l']: e.get('k') for e in nav}
+        self.assertEqual(bytes_for.get('tab'), '\t')
+        self.assertEqual(bytes_for.get('⏎'), '\r')
+        self.assertEqual(bytes_for.get('esc'), '\x1b')
+        self.assertEqual([bytes_for.get(g) for g in ('←', '↓', '↑', '→')],
+                         ['\x1b[D', '\x1b[B', '\x1b[A', '\x1b[C'])
+
+    def test_a_modifier_is_a_latch_rather_than_a_byte(self):
+        """There is no byte for ctrl. A key that claimed to send one would
+        send nothing, look pressed, and be indistinguishable from broken."""
+        mods = {e['l']: e for e in self.table('NAV_KEYS') if 'm' in e}
+        self.assertEqual(sorted(mods), ['alt', 'ctrl'])
+        for entry in mods.values():
+            self.assertNotIn('k', entry)
+
+    def test_the_row_never_reflows(self):
+        """Nothing below it may change its length: a key that moves because
+        the far end published a different number of actions is a key you have
+        to look for every time."""
+        self.assertNotIn('NAV_KEYS.push', self.js)
+        self.assertNotIn('NAV_KEYS =', self.js.replace('var NAV_KEYS =', ''))
+
+    # ── the latch ─────────────────────────────────────────────────────────
+
+    def test_ctrl_folds_a_character_to_its_control_code(self):
+        pairs = {'a': '\x01', 'c': '\x03', 'z': '\x1a', 'A': '\x01',
+                 'r': '\x12', '@': '\x00', ' ': '\x00', '[': '\x1b',
+                 '\\': '\x1c', ']': '\x1d', '^': '\x1e', '_': '\x1f',
+                 '?': '\x7f'}
+        got = self.run_js(
+            'console.log(JSON.stringify(' +
+            json.dumps(list(pairs)) + '.map(ctrlify)));')
+        self.assertEqual(got, list(pairs.values()))
+
+    def test_a_character_with_no_control_code_is_left_alone(self):
+        """Rather than folded into whatever byte happens to be nearby."""
+        self.assertEqual(self.run_js(
+            'console.log(JSON.stringify(["1", "!", "é"].map(ctrlify)));'),
+            ['1', '!', 'é'])
+
+    def test_an_armed_modifier_applies_once_and_then_clears(self):
+        """One-shot is the whole point: a ctrl that stayed on would turn the
+        rest of what you typed into control codes, silently."""
+        self.assertEqual(self.run_js('''
+            latch.ctrl = ARMED;
+            var first = applyLatch('c'), second = applyLatch('c');
+            console.log(JSON.stringify([first, second, latch.ctrl]));'''),
+            ['\x03', 'c', 0])
+
+    def test_a_locked_modifier_keeps_applying_until_it_is_cleared(self):
+        self.assertEqual(self.run_js('''
+            latch.ctrl = LOCKED;
+            console.log(JSON.stringify(
+                [applyLatch('a'), applyLatch('b'), latch.ctrl]));'''),
+            ['\x01', '\x02', 2])
+
+    def test_a_modifier_never_mangles_a_sequence_that_is_already_one(self):
+        """An arrow is an escape sequence and a tmux chord is two bytes.
+        Folding either would send a byte nobody asked for -- the failure this
+        whole module is written to avoid. They pass through and clear the
+        latch, which is what a mis-tap deserves."""
+        self.assertEqual(self.run_js('''
+            latch.ctrl = ARMED;
+            var arrow = applyLatch('\\x1b[A');
+            latch.ctrl = ARMED;
+            var chord = applyLatch('\\x02d');
+            console.log(JSON.stringify([arrow, chord, latch.ctrl]));'''),
+            ['\x1b[A', '\x02d', 0])
+
+    def test_alt_sends_escape_then_the_key(self):
+        self.assertEqual(self.run_js('''
+            latch.alt = ARMED;
+            console.log(JSON.stringify(applyLatch('b')));'''), '\x1bb')
+
+    def test_the_two_modifiers_compose(self):
+        """M-C-b is a real chord and holding both is not a gesture a thumb
+        has, which is the reason these latch at all."""
+        self.assertEqual(self.run_js('''
+            latch.ctrl = ARMED; latch.alt = ARMED;
+            console.log(JSON.stringify(applyLatch('b')));'''), '\x1b\x02')
+
+    def test_nothing_armed_leaves_what_you_typed_exactly_as_it_was(self):
+        self.assertEqual(self.run_js(
+            'console.log(JSON.stringify(applyLatch("hello world")));'),
+            'hello world')
+
+    # ── tmux ──────────────────────────────────────────────────────────────
+
+    def test_every_tmux_button_is_the_prefix_and_one_key(self):
+        """`prefix` alone was already offered and was very nearly useless: it
+        sends C-b and then wants a letter, and a letter means raising the
+        software keyboard over the screen you were trying to act on."""
+        chords = self.run_js('console.log(JSON.stringify(tmuxKeys()));')
+        self.assertEqual(len(chords), len(self.table('TMUX_VERBS')))
+        for chord in chords:
+            self.assertTrue(chord['k'].startswith('\x02'), chord)
+            self.assertLessEqual(len(chord['k']), 2, chord)
+
+    def test_detach_is_the_first_of_them(self):
+        """It is the one key nobody can guess, and being stuck inside a
+        session is the failure this whole feature would otherwise create. It
+        has to survive into the two rows a closed drawer shows."""
+        self.assertEqual(self.table('TMUX_VERBS')[0],
+                         {'l': 'detach', 's': 'd'})
+
+    def test_the_chords_follow_a_rebound_prefix(self):
+        """`set -g prefix C-a` is a thing people do, and nothing on the wire
+        announces it -- so the app says so, and every chord moves at once."""
+        chords = self.run_js('''
+            prefixSeq = '\\x01';
+            console.log(JSON.stringify(tmuxKeys().map(function (c) {
+              return c.k; })));''')
+        self.assertTrue(all(c.startswith('\x01') for c in chords), chords)
+
+    # ── the drawer ────────────────────────────────────────────────────────
+
+    def render(self, published=(), expanded=False, width=390):
+        return self.run_js(f'''
+            current = {json.dumps(list(published))};
+            expanded = {json.dumps(expanded)};
+            keys._width = {width};
+            renderKeys();
+            console.log(JSON.stringify({{
+              keys: drawn(keys, []), heads: headings(keys, []),
+              rows: keys.children.filter(function (c) {{
+                return c._cls.krow; }}).length,
+              more: expander.textContent }}));''')
+
+    def test_a_closed_drawer_shows_the_apps_own_keys(self):
+        """What you can do on the screen in front of you, two rows of it --
+        which is what it has always shown and what it should keep showing."""
+        published = [{'k': 'z', 'l': 'Layout'}, {'k': 's', 'l': 'SSH'}]
+        self.assertEqual(self.render(published)['keys'], ['Layout', 'SSH'])
+
+    def test_a_closed_drawer_falls_back_to_tmux_when_nothing_is_published(self):
+        """Nothing published means the screen belongs to tmux or a shell.
+        Showing an empty drawer there is what put detach behind a tap."""
+        shown = self.render()['keys']
+        self.assertEqual(shown[0], 'detach')
+        self.assertEqual(len(shown), 8)          # two rows of four
+
+    def test_an_open_drawer_reaches_every_section(self):
+        published = [{'k': 'z', 'l': 'Layout'}]
+        page = self.render(published, expanded=True)
+        self.assertEqual(page['heads'], ['tmux', 'ctrl', 'move', 'type'])
+        for label in ('Layout', 'detach', '^C', 'PgUp', '|'):
+            self.assertIn(label, page['keys'])
+
+    def test_an_open_drawer_holds_no_key_twice(self):
+        """Two buttons that do the same thing is how a row starts reading as
+        broken, and the app's own list is deduplicated for the same reason."""
+        page = self.render([{'k': 'z', 'l': 'Layout'}], expanded=True)
+        self.assertEqual(len(page['keys']), len(set(page['keys'])))
+
+    def test_the_expander_is_offered_even_with_nothing_published(self):
+        """It used to hide itself when the published list fitted, which in a
+        bare shell -- where nothing is published at all -- left the pad at
+        three keys and no way to reach any others."""
+        self.assertTrue(self.render()['more'].startswith('⌄'))
+        self.assertNotEqual(self.render()['more'], '⌄ 0')
+
+    def test_the_count_on_the_expander_is_what_expanding_would_add(self):
+        published = [{'k': 'z', 'l': 'Layout'}]
+        closed = self.render(published)
+        opened = self.render(published, expanded=True)
+        self.assertEqual(int(closed['more'].split()[1]),
+                         len(opened['keys']) - len(closed['keys']))
+
+    # ── how many across ───────────────────────────────────────────────────
+
+    def test_the_key_width_stays_put_and_the_count_moves(self):
+        """Four across is right on a phone and wrong on everything else.
+        Measured in landscape at 844px, a fixed four made `|` a 204px button
+        and spread forty-two keys over eleven rows on a screen 390px tall."""
+        for width, expected in ((390, 4), (320, 4), (768, 8), (844, 9),
+                                (1400, 10), (0, 4)):
+            with self.subTest(width=width):
+                self.assertEqual(
+                    self.run_js(f'console.log(JSON.stringify(perRow({width})))'),
+                    expected)
+
+    def test_a_wider_screen_spends_fewer_rows_on_the_same_keys(self):
+        """Which is the point: the drawer is height taken from the terminal,
+        and on a landscape phone there is very little height to take."""
+        narrow = self.render(expanded=True, width=390)
+        wide = self.render(expanded=True, width=844)
+        self.assertEqual(sorted(narrow['keys']), sorted(wide['keys']))
+        self.assertLess(wide['rows'], narrow['rows'])
+
+    def test_a_rotation_redraws_only_when_the_count_actually_changed(self):
+        """Rebuilding the pad on every resize would drop a held key and clear
+        an armed modifier -- and the keyboard rising fires resize too."""
+        self.assertEqual(self.run_js('''
+            keys._width = 390; renderKeys();
+            var marker = keys.children[0];
+            recolumn();
+            var untouched = keys.children[0] === marker;
+            keys._width = 844; recolumn();
+            var rebuilt = keys.children[0] !== marker;
+            console.log(JSON.stringify([untouched, rebuilt, columnsUsed]));'''),
+            [True, True, 9])
 
 
 @unittest.skipUnless(os.path.exists(os.path.join(

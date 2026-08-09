@@ -4530,7 +4530,10 @@ class AutotmuxApp(App):
             return
         keys = (keypad.EXTERNAL_KEYS if mode == 'external'
                 else keypad.keys_for(self.active_bindings))
-        payload = keypad.encode(mode, keys)
+        # Sent in both modes, not only at the handover. The client builds its
+        # tmux chords from it, and building them right only once you have
+        # already attached is one frame too late.
+        payload = keypad.encode(mode, keys, keypad.tmux_prefix())
         if payload == getattr(self, '_published_keys', None):
             return
         driver = getattr(self, '_driver', None)

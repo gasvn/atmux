@@ -191,31 +191,90 @@ def keys_for(bindings) -> list[dict]:
     return out
 
 
-# What a raw terminal needs, for the stretch where there is no app to ask.
-# Attaching suspends the dashboard and hands the screen to tmux, which draws
-# no buttons and answers no questions -- so this set is static because the
-# situation genuinely is. Detach is first because it is the one key nobody
-# can guess, and the whole reason the handover banner exists.
-EXTERNAL_KEYS = (
-    {'k': '\x02d', 'l': 'detach'},
-    {'k': '\x03', 'l': '^C'},
-    {'k': '\x04', 'l': '^D'},
-    {'k': '\x02', 'l': 'prefix'},
-    {'k': '\x1a', 'l': '^Z'},
-    {'k': '\x1b[5~', 'l': 'PgUp'},
-    {'k': '\x1b[6~', 'l': 'PgDn'},
-)
+# Nothing, and that is the answer rather than an omission. Attaching suspends
+# the dashboard and hands the screen to tmux, which has no bindings to publish
+# and cannot be asked about the ones it has.
+#
+# This used to hold seven: detach, ^C, ^D, prefix, ^Z, PgUp, PgDn. Every one of
+# them is a property of *a terminal*, not of atmux -- and a copy of the
+# terminal's vocabulary kept on this side is exactly the thing the docstring
+# above warns about. The client has to own that vocabulary anyway, because it
+# is also what you are left with when the pty is running something that
+# publishes nothing at all. What a client genuinely cannot know is the prefix
+# byte, so that is what travels instead.
+EXTERNAL_KEYS: tuple = ()
 
 
-def encode(mode: str, keys) -> str:
+# ── the tmux prefix ─────────────────────────────────────────────────────────
+#
+# Every tmux control is a chord: the prefix, then one key. A touch client can
+# offer each chord as a single button -- which is the only way tmux is usable
+# by thumb, since holding one key while pressing another is not a gesture a
+# thumb has -- but it cannot work out the first byte for itself. ``set -g
+# prefix C-a`` is a common rebinding and nothing on the wire announces it.
+#
+# So it is stated rather than guessed, and stated once. C-b is tmux's own
+# default and is right unless the user has said otherwise, which they can here.
+TMUX_PREFIX_ENV = 'AUTOTMUX_TMUX_PREFIX'
+PREFIX_DEFAULT = '\x02'                                   # C-b
+
+# The control characters that are not a letter. C-@ and C-Space are both NUL,
+# which is what tmux means by either spelling -- and ``show-options -gv prefix``
+# prints the second one, so 'Space' is a name this has to know.
+_CTRL_EXTRA = {'@': '\x00', 'Space': '\x00', '[': '\x1b', '\\': '\x1c',
+               ']': '\x1d', '^': '\x1e', '_': '\x1f', '?': '\x7f'}
+
+
+def prefix_sequence(name) -> str | None:
+    """The byte tmux's ``prefix`` option names, or None if it names nothing.
+
+    Accepts the spelling tmux uses (``C-b``, ``M-x``) and the caret form
+    people write in notes (``^B``). None rather than a fallback, for the same
+    reason key_sequence returns None: a wrong first byte does not fail, it
+    quietly makes every tmux button mean something else.
+    """
+    if not isinstance(name, str):
+        return None
+    text = name.strip()
+    if not text:
+        return None
+    if len(text) == 2 and text[0] == '^':
+        text = 'C-' + text[1]
+    head, rest = text[:2].upper(), text[2:]
+    if head == 'C-':
+        if len(rest) == 1 and 'a' <= rest.lower() <= 'z':
+            return chr(ord(rest.lower()) - 96)
+        return _CTRL_EXTRA.get(rest)
+    if head == 'M-':
+        if rest == 'Space':
+            return '\x1b '
+        if len(rest) == 1 and rest.isprintable():
+            return '\x1b' + rest
+        return None
+    if len(text) == 1 and text.isprintable():
+        return text
+    return None
+
+
+def tmux_prefix(env: dict | None = None) -> str:
+    """The prefix byte to build chords from. C-b unless told otherwise."""
+    raw = (env if env is not None else os.environ).get(TMUX_PREFIX_ENV, '')
+    return prefix_sequence(raw) or PREFIX_DEFAULT
+
+
+def encode(mode: str, keys, prefix: str = '') -> str:
     """The escape sequence carrying one set of buttons.
 
     json.dumps escapes every control character, so the payload can never
     contain the terminator that ends the sequence.
     """
-    body = json.dumps({'mode': mode, 'keys': list(keys)},
-                      separators=(',', ':'), ensure_ascii=True)
-    return f'\x1b]{OSC};{body}{_ST}'
+    body: dict = {'mode': mode, 'keys': list(keys)}
+    # Omitted rather than sent empty: a client that hears nothing keeps its own
+    # default, and a client that hears '' would have to decide what that meant.
+    if prefix:
+        body['prefix'] = prefix
+    return (f'\x1b]{OSC};'
+            f'{json.dumps(body, separators=(",", ":"), ensure_ascii=True)}{_ST}')
 
 
 def decode(sequence: str) -> dict | None:

@@ -66,7 +66,11 @@
   /* The keypad exists only where there is no real keyboard. */
   #pad { display: none; }
   body.touch #pad {
-    flex: 0 0 auto; display: block;
+    /* Bounded as a share of #app, not in vh. #app is sized to visualViewport,
+       so when the software keyboard is up an open drawer shrinks with it --
+       a vh-based cap would keep its full-screen height and leave the terminal
+       no rows at all. */
+    flex: 0 1 auto; display: flex; flex-direction: column; max-height: 62%;
     background: #141418; border-top: 1px solid #2a2a30;
     padding-bottom: env(safe-area-inset-bottom);
     box-sizing: border-box;
@@ -86,9 +90,25 @@
   /* Movement sits closest to the thumb and stays put. Nothing below it may
      reflow it: a navigation key that moves because the app published a
      different number of actions is a key you have to look for every time. */
-  #nav { padding: 7px 7px 0; }
-  #nav .key { font-size: 15px; }
-  #keys { padding: 7px 7px 4px; }
+  #nav { flex: 0 0 auto; padding: 7px 7px 0; }
+  /* Nine keys across a 390px phone is ~37px each. The word `ctrl` has to fit
+     one line inside that -- a modifier that wraps mid-word reads as broken --
+     so this row runs smaller and tighter than the drawer below it. */
+  #nav .key { font-size: 11px; padding: 4px 1px; }
+  /* The arrows and Enter are glyphs, not words, and 11px makes them hard to
+     aim at. They have the room precisely because the words next to them do
+     not need it. */
+  #nav .key.glyph { font-size: 16px; }
+  /* Only the drawer scrolls. #nav and the row under it stay put so the keys
+     you reach for without looking are always in the same place. */
+  #keys { flex: 0 1 auto; min-height: 0; padding: 7px 7px 4px; }
+  #keys.open { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .ghead {
+    color: #75757f; margin: 6px 2px 4px;
+    font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .1em; text-transform: uppercase;
+  }
+  .ghead:first-child { margin-top: 0; }
   /* Fixed columns, never wrapping the row: flex-wrap stretched whichever key
      landed alone on the last line into a full-width button, which read as
      something important rather than as the leftover it was. A short last row
@@ -112,7 +132,16 @@
   }
   .key.down { background: #4a4a58; border-color: #6f6f80; }
   .key.on { background: #3c5a8a; border-color: #5b82bd; color: #fff; }
+  /* Armed for one keystroke vs locked until you clear it. Two states that
+     behave differently have to look different, or the row goes on typing
+     control characters after you thought it had stopped: outlined for the
+     one-shot, filled (.on) for the lock. */
+  .key.armed {
+    background: #26262c; border-color: #5b82bd; color: #9dc1f0;
+    box-shadow: inset 0 0 0 1px #5b82bd;
+  }
   #tabs {
+    flex: 0 0 auto;
     display: flex; gap: 6px; padding: 0 7px 7px; align-items: center;
   }
   #tabs button {
@@ -144,19 +173,26 @@
 <body>
 <div id="app">
   <div id="term"></div>
-  <!-- Filled in from what the dashboard publishes, not from a list kept
-       here. Empty until it says something, because a keypad invented for a
-       program we cannot ask is a row of buttons that lie. -->
+  <!-- Two sources, and the split is the design. What the *app* can do is
+       published by the app (keypad.py, OSC 7710) and never written here,
+       because a copy is only correct on the day it is written. What a
+       *terminal* can do is written here and never published, because it is
+       true of every program and has to work when nothing is publishing at
+       all -- in a bare shell, during a reconnect, after the handover to
+       tmux. -->
   <div id="pad">
-    <!-- Movement and escape. Not published by the app and not optional: they
-         are terminal primitives, they are the only way to move a cursor on a
-         screen with no keyboard, and they must survive anything the far end
-         does or stops doing. -->
+    <!-- esc, the two modifiers, tab and the arrows. Fixed, in this order, and
+         nothing below may reflow it: a key that moves because the far end
+         published a different number of actions is a key you have to look for
+         every time. -->
     <div id="nav"></div>
+    <!-- The drawer. Closed it shows this screen's own keys; open it shows
+         everything, in labelled sections down one column. -->
     <div id="keys"></div>
     <div id="tabs">
-      <!-- No pages. The keys come from the dashboard and change with its
-           screen; the only thing left to choose is how many rows to show. -->
+      <!-- No pages. Pages are what put the layout key two taps deep behind a
+           tab nobody would open; a second axis of navigation would be that
+           same mistake wearing a different name. This opens the one drawer. -->
       <button id="more" aria-label="more keys">⌄</button>
       <span class="spacer"></span>
       <button id="fontminus" aria-label="smaller">A−</button>

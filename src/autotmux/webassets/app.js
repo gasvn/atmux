@@ -129,7 +129,10 @@
     }
   }
 
-  term.onData(function (data) { sendText(data); });
+  // Through the latch, so an armed ctrl applies to what you type on the
+  // software keyboard and not only to what you tap on the pad. Anything else
+  // would be a modifier that works on some keys and silently not on others.
+  term.onData(function (data) { sendText(applyLatch(data)); });
   term.onBinary(function (data) {
     var bytes = new Uint8Array(data.length);
     for (var i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 255;
@@ -231,10 +234,145 @@
   // xterm.js has no touch support (issue #5377, open), and the table attaches
   // on a single click, so making taps reach it would turn a mis-tap into an
   // attach. These are the only way to move, and the phone had none.
+  //
+  // For a while this held three of them -- ↑ ↓ esc -- which is a row chosen
+  // for one screen of this dashboard rather than for a terminal. Once you
+  // attach, which is the entire point, that leaves no tab (so no completion),
+  // no ← → (so no editing a command line), no ctrl (so no ^C ^R ^A) and no way
+  // to reach a single tmux binding.
+  //
+  // The shape is Termux's accessory row, which is also Blink's and Termius'
+  // minus their platform keys: esc, the modifiers, tab, the arrows. Following
+  // it is deliberate -- it is the row a phone user already has muscle memory
+  // for -- but it is followed rather than copied, because those bars sit
+  // *above* a software keyboard that is always up, and this pad stands in
+  // place of one that is usually down. Enter is free for them and absent here,
+  // and ↑ then Enter to re-run the last command is the single most common
+  // thing anyone does on a phone terminal. So Enter earns a permanent key.
+  //
+  // Nine across a 390px screen is ~37px each. That is narrower than Apple's
+  // 44pt guidance and wider than the iOS keyboard's own letter keys, which are
+  // about 32px and which nobody has trouble hitting.
   var NAV_KEYS = [
-    { k: '\x1b[A', l: '↑' },
-    { k: '\x1b[B', l: '↓' },
-    { k: '\x1b', l: 'esc' }
+    { l: 'esc', k: '\x1b' },
+    { l: 'ctrl', m: 'ctrl' },
+    { l: 'alt', m: 'alt' },
+    { l: 'tab', k: '\t' },
+    { l: '⏎', k: '\r' },
+    { l: '←', k: '\x1b[D' },
+    { l: '↓', k: '\x1b[B' },
+    { l: '↑', k: '\x1b[A' },
+    { l: '→', k: '\x1b[C' }
+  ];
+
+  // ── modifiers, which latch ────────────────────────────────────────────
+  // A thumb cannot hold one key and press another, so ctrl and alt are taps:
+  // once arms them for the next keystroke, twice locks them, a third time
+  // clears. Termux, Blink and Termius all landed on this independently, which
+  // is about as strong as evidence for an interaction gets.
+  //
+  // It is also what keeps the pad finite. ^R, ^W, ^K, M-b and every other
+  // chord become reachable without a button each; enumerating them was the
+  // old strategy and it is why the pad once had three pages nobody opened.
+  var OFF = 0, ARMED = 1, LOCKED = 2;
+  var latch = { ctrl: OFF, alt: OFF };
+  var modButtons = {};
+
+  function paintLatch() {
+    Object.keys(modButtons).forEach(function (name) {
+      var button = modButtons[name];
+      button.classList.toggle('armed', latch[name] === ARMED);
+      button.classList.toggle('on', latch[name] === LOCKED);
+      button.setAttribute('aria-pressed', latch[name] === OFF ? 'false' : 'true');
+    });
+  }
+
+  // What ctrl does to a character, per the ASCII table the terminal is built
+  // on: the letters fold to 1..26 and the handful of symbols that also have
+  // control codes are named. Anything else comes back unchanged rather than
+  // being mangled into a neighbouring byte.
+  function ctrlify(text) {
+    var code = text.charCodeAt(0);
+    if (code >= 97 && code <= 122) return String.fromCharCode(code - 96);
+    if (code >= 65 && code <= 90) return String.fromCharCode(code - 64);
+    var extra = { '@': '\x00', ' ': '\x00', '[': '\x1b', '\\': '\x1c',
+                  ']': '\x1d', '^': '\x1e', '_': '\x1f', '?': '\x7f' };
+    return Object.prototype.hasOwnProperty.call(extra, text)
+      ? extra[text] : text;
+  }
+
+  // Only a single printable character can carry a modifier. An arrow is
+  // already an escape sequence and a tmux chord is already two bytes: folding
+  // either would produce a byte nobody asked for, so they pass through and
+  // clear the latch instead, which is what a mis-tap deserves.
+  function applyLatch(data) {
+    if (latch.ctrl === OFF && latch.alt === OFF) return data;
+    var out = data;
+    if (data.length === 1 && data.charCodeAt(0) >= 0x20) {
+      if (latch.ctrl !== OFF) out = ctrlify(out);
+      if (latch.alt !== OFF) out = '\x1b' + out;
+    }
+    if (latch.ctrl === ARMED) latch.ctrl = OFF;
+    if (latch.alt === ARMED) latch.alt = OFF;
+    paintLatch();
+    return out;
+  }
+
+  // ── tmux, as verbs rather than as a prefix ────────────────────────────
+  // `prefix` on its own was already offered and was very nearly useless: it
+  // sends C-b and then wants a letter, and a letter means opening the software
+  // keyboard, which covers the screen you were trying to act on. One button
+  // per chord is what every ssh client that bothers with tmux does, and it
+  // turns "detach" from four taps into one.
+  //
+  // C-b is tmux's default. The dashboard overrides it if it knows better --
+  // see the OSC handler -- because `set -g prefix C-a` is a thing people do
+  // and nothing on the wire announces it.
+  var prefixSeq = '\x02';
+  var TMUX_VERBS = [
+    { l: 'detach', s: 'd' },
+    { l: 'new win', s: 'c' },
+    { l: '◀ win', s: 'p' },
+    { l: 'win ▶', s: 'n' },
+    { l: 'zoom', s: 'z' },
+    { l: 'scroll', s: '[' },
+    { l: 'split ─', s: '"' },
+    { l: 'split │', s: '%' },
+    { l: 'windows', s: 'w' },
+    { l: 'pane ▶', s: 'o' },
+    { l: 'rename', s: ',' },
+    { l: 'prefix', s: '' }
+  ];
+  function tmuxKeys() {
+    return TMUX_VERBS.map(function (verb) {
+      return { l: verb.l, k: prefixSeq + verb.s };
+    });
+  }
+
+  // The chords common enough to deserve a button rather than an armed ctrl and
+  // a hunt for a letter. ^C above all: it is what you want when something is
+  // already going wrong, and that is the worst moment to ask for three taps.
+  var CTRL_KEYS = [
+    { l: '^C', k: '\x03' }, { l: '^D', k: '\x04' }, { l: '^Z', k: '\x1a' },
+    { l: '^L', k: '\x0c' }, { l: '^R', k: '\x12' }, { l: '^A', k: '\x01' },
+    { l: '^E', k: '\x05' }, { l: '^W', k: '\x17' }, { l: '^U', k: '\x15' },
+    { l: '^K', k: '\x0b' }
+  ];
+
+  var MOVE_KEYS = [
+    { l: 'home', k: '\x1b[H' }, { l: 'end', k: '\x1b[F' },
+    { l: 'PgUp', k: '\x1b[5~' }, { l: 'PgDn', k: '\x1b[6~' },
+    { l: '⌫', k: '\x7f' }, { l: 'del', k: '\x1b[3~' },
+    { l: 'space', k: ' ' }, { l: '⇧tab', k: '\x1b[Z' }
+  ];
+
+  // The characters a shell needs constantly and iOS buries two keyboard layers
+  // deep. `-` and `/` are in Termux's default row for exactly this reason.
+  var TYPE_KEYS = [
+    { l: '-', k: '-' }, { l: '_', k: '_' }, { l: '/', k: '/' },
+    { l: '\\', k: '\\' }, { l: '|', k: '|' }, { l: '~', k: '~' },
+    { l: '*', k: '*' }, { l: '$', k: '$' }, { l: '"', k: '"' },
+    { l: "'", k: "'" }, { l: '`', k: '`' }, { l: '^', k: '^' }
   ];
 
   var keys = document.getElementById('keys');
@@ -242,8 +380,20 @@
   var expander = document.getElementById('more');
   // Two rows fit under a phone's thumb without eating the dashboard. The
   // rest are one tap away rather than one page away.
-  var PER_ROW = 4, ROWS_COLLAPSED = 2;
+  var ROWS_COLLAPSED = 2;
   var current = [], expanded = false;
+
+  // How many across is the screen's decision, not a constant -- the same rule
+  // the font size follows, for the same reason. Four is right on a phone and
+  // wrong on everything else: measured in landscape at 844px it made `|` a
+  // 204px button and spread forty-two keys over eleven rows on a screen 390px
+  // tall. What should stay put is the size of a key, not the number of them.
+  var KEY_TARGET = 86, PER_ROW_MIN = 4, PER_ROW_MAX = 10;
+  function perRow(width) {
+    if (!(width > 0)) return PER_ROW_MIN;
+    return Math.max(PER_ROW_MIN,
+                    Math.min(PER_ROW_MAX, Math.floor(width / KEY_TARGET)));
+  }
 
   function haptic() {
     // Android only; iOS Safari ignores it. Cheap when it works, harmless when
@@ -252,7 +402,7 @@
   }
 
   function press(seq) {
-    sendText(seq);
+    sendText(applyLatch(seq));
     haptic();
   }
 
@@ -261,42 +411,96 @@
     var line = document.createElement('div');
     line.className = 'krow';
     NAV_KEYS.forEach(function (entry) {
-      line.appendChild(buildKey(entry.l, entry.k));
+      line.appendChild(buildKey(entry));
     });
     nav.appendChild(line);
+    paintLatch();
   }
 
-  function renderKeys() {
-    keys.textContent = '';
-    var rows = Math.ceil(current.length / PER_ROW);
-    var limit = expanded ? rows : Math.min(rows, ROWS_COLLAPSED);
-    for (var r = 0; r < limit; r++) {
+  // What the drawer holds when it is open. The app's own keys first and
+  // unlabelled, because they are what you can do on the screen in front of
+  // you; then the terminal's, which are true whatever is running.
+  //
+  // Sections, not tabs. Pages were tried and removed for a good reason -- the
+  // layout key ended up two taps deep behind one nobody would think to open --
+  // and a second axis of navigation would be that mistake again. Opening the
+  // drawer reveals everything, in one column, scrolled.
+  function groups() {
+    var out = [];
+    if (current.length) out.push({ name: '', keys: current });
+    out.push({ name: 'tmux', keys: tmuxKeys() });
+    out.push({ name: 'ctrl', keys: CTRL_KEYS });
+    out.push({ name: 'move', keys: MOVE_KEYS });
+    out.push({ name: 'type', keys: TYPE_KEYS });
+    return out;
+  }
+
+  function renderRows(into, list, columns, limit) {
+    var rows = Math.ceil(list.length / columns);
+    var take = limit ? Math.min(rows, limit) : rows;
+    for (var r = 0; r < take; r++) {
       var line = document.createElement('div');
       line.className = 'krow';
-      var slice = current.slice(r * PER_ROW, (r + 1) * PER_ROW);
-      slice.forEach(function (entry) {
-        line.appendChild(buildKey(entry.l, entry.k));
-      });
+      var slice = list.slice(r * columns, (r + 1) * columns);
+      slice.forEach(function (entry) { line.appendChild(buildKey(entry)); });
       // A short last row would stretch its keys to full width and read as
       // something important rather than as the leftover it is.
-      for (var pad_i = slice.length; pad_i < PER_ROW; pad_i++) {
+      for (var i = slice.length; i < columns; i++) {
         var gap = document.createElement('span');
         gap.className = 'key gap';
         line.appendChild(gap);
       }
-      keys.appendChild(line);
+      into.appendChild(line);
     }
-    var hidden = current.length - limit * PER_ROW;
+    return take * columns;                          // slots drawn, gaps and all
+  }
+
+  // What the last render decided, so a rotation can notice it has changed.
+  var columnsUsed = 0;
+
+  function recolumn() {
+    if (perRow(keys.getBoundingClientRect().width) !== columnsUsed) {
+      renderKeys();
+    }
+  }
+
+  function renderKeys() {
+    var columns = perRow(keys.getBoundingClientRect().width);
+    columnsUsed = columns;
+    keys.textContent = '';
+    keys.classList.toggle('open', expanded);
+    var hidden = 0;
+    if (expanded) {
+      groups().forEach(function (group) {
+        if (!group.keys.length) return;
+        if (group.name) {
+          var head = document.createElement('div');
+          head.className = 'ghead';
+          head.textContent = group.name;
+          keys.appendChild(head);
+        }
+        renderRows(keys, group.keys, columns, 0);
+      });
+    } else {
+      // Closed, the drawer shows what this screen can do. When nothing has
+      // published anything the screen belongs to tmux or a shell, and the
+      // useful answer is tmux's own verbs -- detach first. Showing nothing
+      // there would put the one key nobody can guess behind a tap.
+      var head = current.length ? current : tmuxKeys();
+      var drawn = Math.min(renderRows(keys, head, columns, ROWS_COLLAPSED),
+                           head.length);
+      hidden = groups().reduce(function (n, group) {
+        return n + group.keys.length;
+      }, 0) - drawn;
+    }
     if (expander) {
-      expander.style.display = (rows > ROWS_COLLAPSED) ? '' : 'none';
+      // Always offered. There is always more than fits: the terminal's own
+      // vocabulary does not depend on anything having been published, and a
+      // hidden expander is what left a bare shell with three keys.
       expander.textContent = expanded ? '⌃' : '⌄ ' + Math.max(hidden, 0);
       expander.setAttribute(
         'aria-label', expanded ? 'fewer keys' : 'more keys');
     }
-    // Only the keys go away when there are none. The font size and the
-    // keyboard belong to this client rather than to whatever it is showing,
-    // so their row stays whether or not anything published a binding.
-    keys.style.display = current.length ? '' : 'none';
     // The pad's height just changed, and the terminal has to be told or the
     // app keeps drawing rows that are now behind the keys.
     refit();
@@ -311,16 +515,37 @@
     renderKeys();
   }
 
-  function buildKey(label, seq) {
+  function buildModifier(entry) {
+    var button = document.createElement('button');
+    button.className = 'key mod';
+    button.textContent = entry.l;
+    button.setAttribute('aria-label', entry.l);
+    modButtons[entry.m] = button;
+    button.addEventListener('pointerdown', function (event) {
+      event.preventDefault();
+      latch[entry.m] = (latch[entry.m] + 1) % 3;
+      paintLatch();
+      haptic();
+    });
+    button.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    return button;
+  }
+
+  function buildKey(entry) {
+    if (entry.m) return buildModifier(entry);
+    var label = entry.l, seq = entry.k;
     var button = document.createElement('button');
     button.className = 'key';
+    // Derived rather than flagged, same as `repeats` below: a label that is a
+    // single symbol is a glyph and wants the room a word does not.
+    if (label.length === 1 && !/\w/.test(label)) button.classList.add('glyph');
     button.textContent = label;
     button.setAttribute('aria-label', label);
     var timer = null, interval = null;
-    // Derived, not flagged: the keys worth repeating are the ones that move
-    // something a step at a time, and those are exactly the CSI sequences
-    // (arrows, page up/down). Nothing has to remember to mark them.
-    var repeats = /^\x1b\[/.test(seq);
+    // Derived, not flagged: the keys worth repeating are the ones that move or
+    // remove something a step at a time -- the CSI sequences (arrows, page
+    // up/down, delete) and backspace. Nothing has to remember to mark them.
+    var repeats = /^\x1b\[/.test(seq) || seq === '\x7f';
     function fire() { press(seq); }
     // pointerdown, not click: a key should fire the moment it is touched.
     function down(event) {
@@ -366,6 +591,15 @@
     var data;
     try { data = JSON.parse(payload); } catch (e) { return true; }
     if (!data || !Array.isArray(data.keys)) return true;
+    // The prefix byte, when the app has an opinion about it. Validated like
+    // everything else here, and bounded to what a prefix can be: one byte, or
+    // two for an M- binding. A long string here would build twelve buttons
+    // that each type a sentence.
+    if (typeof data.prefix === 'string' && data.prefix.length >= 1
+        && data.prefix.length <= 2 && data.prefix !== prefixSeq) {
+      prefixSeq = data.prefix;
+      renderKeys();
+    }
     setKeys(data.keys.filter(function (entry) {
       return entry && typeof entry.k === 'string' && entry.k
           && typeof entry.l === 'string' && entry.l
@@ -596,11 +830,11 @@
     syncViewport();
   }
   window.addEventListener('resize', function () {
-    syncViewport(); refit();
+    syncViewport(); recolumn(); refit();
   });
   window.addEventListener('orientationchange', function () {
     // The viewport metrics are wrong until the rotation animation finishes.
-    setTimeout(function () { syncViewport(); refit(); }, 300);
+    setTimeout(function () { syncViewport(); recolumn(); refit(); }, 300);
   });
   // Keep the layout viewport pinned: iOS scrolls it under the keyboard and
   // nothing scrolls it back, leaving a permanent gap above the terminal.

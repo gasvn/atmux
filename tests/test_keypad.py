@@ -163,13 +163,89 @@ class PayloadTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertIsNone(keypad.decode(raw))
 
-    def test_detach_is_offered_where_no_app_can_be_asked(self):
-        """Attaching hands the screen to tmux, which draws no buttons. Ctrl-B
-        then d is unreachable without a keyboard, and being stuck inside a
-        session is the failure this whole feature would otherwise create."""
-        labels = {k['l']: k['k'] for k in keypad.EXTERNAL_KEYS}
-        self.assertEqual(labels.get('detach'), '\x02d')
-        self.assertEqual(labels.get('^C'), '\x03')
+    def test_a_suspended_app_publishes_no_keys_of_its_own(self):
+        """Attaching hands the screen to tmux, which has no bindings to
+        publish. This used to send seven -- detach, ^C, ^D, prefix, ^Z, PgUp,
+        PgDn -- every one of which describes a *terminal* rather than atmux.
+        The client owns those now, and has to: it is also what you are left
+        with when the pty is running something that publishes nothing."""
+        self.assertEqual(list(keypad.EXTERNAL_KEYS), [])
+
+    def test_the_handover_still_carries_the_one_thing_a_client_cannot_know(self):
+        """Which is the prefix byte. Twelve tmux buttons are built from it."""
+        decoded = keypad.decode(
+            keypad.encode('external', keypad.EXTERNAL_KEYS, '\x01'))
+        self.assertEqual(decoded, {'mode': 'external', 'keys': [],
+                                   'prefix': '\x01'})
+
+    def test_no_prefix_is_absent_rather_than_empty(self):
+        """A client that hears nothing keeps its own default. One that heard
+        '' would have to decide what that meant, and would decide alone."""
+        self.assertNotIn('prefix', keypad.decode(keypad.encode('app', [])))
+
+
+class TmuxPrefixTests(unittest.TestCase):
+    """Every tmux control is a chord, and the first byte is not guessable.
+
+    ``set -g prefix C-a`` is a common rebinding and nothing on the wire
+    announces it. Getting this wrong does not fail loudly -- it makes twelve
+    buttons quietly mean something else.
+    """
+
+    def test_the_spellings_tmux_itself_uses(self):
+        for name, expected in (('C-b', '\x02'), ('C-a', '\x01'),
+                               ('C-A', '\x01'), ('c-b', '\x02'),
+                               (' C-b ', '\x02')):
+            with self.subTest(name=name):
+                self.assertEqual(keypad.prefix_sequence(name), expected)
+
+    def test_the_caret_form_people_write_in_notes(self):
+        self.assertEqual(keypad.prefix_sequence('^B'), '\x02')
+        self.assertEqual(keypad.prefix_sequence('^a'), '\x01')
+
+    def test_the_control_codes_that_are_not_letters(self):
+        """C-@ and C-Space are both NUL, which is what tmux means by either --
+        and `show-options -gv prefix` prints the second spelling."""
+        for name, expected in (('C-@', '\x00'), ('C-Space', '\x00'),
+                               ('C-[', '\x1b'), ('C-\\', '\x1c'),
+                               ('C-]', '\x1d'), ('C-^', '\x1e'),
+                               ('C-_', '\x1f'), ('C-?', '\x7f')):
+            with self.subTest(name=name):
+                self.assertEqual(keypad.prefix_sequence(name), expected)
+
+    def test_a_meta_prefix_is_escape_then_the_key(self):
+        self.assertEqual(keypad.prefix_sequence('M-a'), '\x1ba')
+        self.assertEqual(keypad.prefix_sequence('M-Space'), '\x1b ')
+
+    def test_a_bare_key_is_taken_literally(self):
+        """`set -g prefix \\`` and `set -g prefix ^` are both real."""
+        self.assertEqual(keypad.prefix_sequence('`'), '`')
+        self.assertEqual(keypad.prefix_sequence('^'), '^')
+
+    def test_a_name_that_names_nothing_yields_none_rather_than_a_guess(self):
+        for name in ('', '   ', 'C-', 'C-bb', 'M-', 'M-Enter', 'nonsense',
+                     'F1', None, 5, 'C-\x01', '\x02'):
+            with self.subTest(name=name):
+                self.assertIsNone(keypad.prefix_sequence(name))
+
+    def test_the_default_is_tmuxs_own(self):
+        self.assertEqual(keypad.tmux_prefix({}), '\x02')
+        self.assertEqual(keypad.PREFIX_DEFAULT, '\x02')
+
+    def test_a_rebound_prefix_is_read_from_the_environment(self):
+        self.assertEqual(
+            keypad.tmux_prefix({keypad.TMUX_PREFIX_ENV: 'C-a'}), '\x01')
+
+    def test_an_unreadable_setting_falls_back_rather_than_breaking_every_button(
+            self):
+        """None from prefix_sequence means "I cannot tell". Sending nothing
+        would leave the client without a prefix at all; sending C-b leaves it
+        with the one that is right for almost everyone."""
+        for value in ('', 'garbage', 'C-'):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    keypad.tmux_prefix({keypad.TMUX_PREFIX_ENV: value}),
+                    '\x02')
 
 
 class TouchModeTests(unittest.TestCase):
