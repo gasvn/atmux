@@ -940,7 +940,7 @@
   // sequence that turns it on is watched directly. 1000 is click tracking,
   // 1002 adds drag, 1003 any motion; 1005/1006/1015 only pick an encoding and
   // say nothing about whether the program wants events.
-  var mouseOn = false;
+  var mouseOn = false, mouseSgr = false;
   [['h', true], ['l', false]].forEach(function (pair) {
     try {
       term.parser.registerCsiHandler({ prefix: '?', final: pair[0] },
@@ -950,6 +950,9 @@
             if (mode === 1000 || mode === 1002 || mode === 1003) {
               mouseOn = pair[1];
             }
+            // 1006 does not say the program wants events, only how it wants
+            // them spelled. Tracked separately for exactly that reason.
+            if (mode === 1006) mouseSgr = pair[1];
           }
           return false;              // xterm still has to act on it
         });
@@ -973,11 +976,7 @@
     // was on screen before the program started. Claude Code, vim, htop, less
     // and tmux-with-`mouse on` are all in this class, and all of them already
     // answer the wheel -- so send the wheel.
-    // NOT YET: mouseOn is tracked and correct, but dispatching a
-    // synthetic WheelEvent produced no report on the wire when
-    // measured against Textual, and an unverified branch is how the
-    // last three rounds went wrong. See swipeBy's 'wheel' arm.
-    // if (mouseOn) return 'wheel';
+    if (mouseOn) return 'wheel';
     var type = bufferType();
     if (type === 'normal') return 'local';
     if (type !== 'alternate') return '';
@@ -1034,19 +1033,14 @@
     if (!lines || !kind) return !!kind;
     var up = lines > 0, n = Math.abs(lines);
     if (kind === 'wheel') {
-      // Encoded by xterm exactly as it encodes a real mouse, rather than by
-      // us: the program has told the terminal how it wants these, and there
-      // is only one place that knows the answer.
-      var screen = host.querySelector('.xterm-screen') || host;
-      var box = screen.getBoundingClientRect();
-      try {
-        screen.dispatchEvent(new WheelEvent('wheel', {
-          deltaY: -lines * lineHeight(), deltaMode: 0,
-          clientX: box.left + box.width / 2,
-          clientY: box.top + box.height / 2,
-          bubbles: true, cancelable: true
-        }));
-      } catch (e) {}
+      // A wheel notch, not a line: that is the unit the program was built
+      // around, and every one of them turns a notch into however many lines
+      // it thinks a notch is worth (tmux's own binding is five). Sending one
+      // report per line would scroll several times too fast for the same
+      // finger travel.
+      wheelDebt += lines;
+      while (wheelDebt >= NOTCH) { wheelDebt -= NOTCH; sendText(wheelReport(true)); }
+      while (wheelDebt <= -NOTCH) { wheelDebt += NOTCH; sendText(wheelReport(false)); }
     } else if (kind === 'local') {
       // Stays in the browser: nothing reaches the program at all.
       try { term.scrollLines(-lines); } catch (e) {}
@@ -1091,6 +1085,31 @@
   // deliberate drag answers at once. Only the *first* line of a gesture pays
   // it; after that the content tracks the finger row for row.
   var SLOP = 16;
+
+  // Where the finger is, in cells, because a mouse report carries a position
+  // and some programs scroll the pane under it rather than the focused one.
+  var lastX = 0, lastY = 0;
+  function cellAt() {
+    var box = host.getBoundingClientRect();
+    var cols = term.cols || 80, rows = term.rows || 24;
+    var col = Math.floor((lastX - box.left) / (box.width / cols)) + 1;
+    var row = Math.floor((lastY - box.top) / (box.height / rows)) + 1;
+    return [Math.min(Math.max(col, 1), cols), Math.min(Math.max(row, 1), rows)];
+  }
+
+  // 64 is wheel up and 65 wheel down, in both encodings. SGR is unbounded and
+  // is what anything modern asks for with 1006; the original is three bytes
+  // biased by 32, which cannot express a coordinate past 223 -- so a report
+  // that would lie is not sent at all rather than pointing somewhere else.
+  var NOTCH = 3, wheelDebt = 0;
+  function wheelReport(up) {
+    var at = cellAt(), button = up ? 64 : 65;
+    if (mouseSgr) {
+      return '\x1b[<' + button + ';' + at[0] + ';' + at[1] + 'M';
+    }
+    if (at[0] > 223 || at[1] > 223) return '';
+    return '\x1b[M' + String.fromCharCode(32 + button, 32 + at[0], 32 + at[1]);
+  }
 
   // A row's height in CSS pixels, which is what turns finger travel into
   // lines. Derived rather than read out of xterm: the renderer's own cell
@@ -1198,6 +1217,8 @@
     }
     if (event.touches.length !== 1 || pinchStart > 0) return;
     moves += 1;
+    lastX = event.touches[0].clientX;
+    lastY = event.touches[0].clientY;
     var dy = event.touches[0].clientY - dragFrom;
     showDebug(dy);
     // Slop first, so a tap that trembles is still a tap; after that the
@@ -1222,7 +1243,7 @@
       pinchStart = 0; swiped = false;
       holdWrites(false);
       // The count belonged to the gesture; what remains is where you are.
-      scrolled = 0; pageDebt = 0;
+      scrolled = 0; pageDebt = 0; wheelDebt = 0;
       paintHistory('');
     });
   });

@@ -1510,7 +1510,7 @@ class KeypadVocabularyTests(unittest.TestCase):
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
     FUNCTIONS = ('bufferType', 'swipeKind',
                  'showDebug', 'feed', 'holdWrites', 'flushHeld', 'flushSoon',
-                 'swipeBy', 'lineHeight',
+                 'swipeBy', 'lineHeight', 'wheelReport', 'cellAt',
                  'typed', 'paintHistory', 'enterHistory',
                  'leaveHistory',
                  'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
@@ -1520,7 +1520,7 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
                'var held =', 'var SLOP =', 'var scrolledBack =',
-               'var mouseOn =',
+               'var mouseOn =', 'var NOTCH =', 'var lastX =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
@@ -2013,7 +2013,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         return self.run_js(f'''
             sent = [];
             scrolledBack = false;
-            mouseOn = false;
+            mouseOn = false; wheelDebt = 0;
             published = {json.dumps(mode)};
             term = {{
               rows: 40,
@@ -2058,18 +2058,91 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertEqual(self.swipe('alternate', 'app', lines=3),
                          ['keys', True, []])
 
-    def test_the_mouse_branch_reads_the_sequence_that_turns_it_on(self):
-        """xterm 6 removed term.modes and reading it throws, so this watches
-        DECSET directly. 1000/1002/1003 are the ones that mean the program
-        wants events; 1005/1006/1015 only pick an encoding."""
+    def test_a_program_that_asked_for_the_mouse_is_given_the_mouse(self):
+        """Claude Code, vim, htop, less and tmux-with-`mouse on` draw in the
+        alternate buffer and scroll themselves. tmux cannot do it for them:
+        an alternate-screen program's lines never enter the pane's history,
+        so copy-mode would scroll back through whatever was on screen before
+        the program started -- the wrong content entirely.
+
+        Measured end to end against a target that turns on 1000+1006 inside
+        tmux: the swipe sent ESC[<64;35;33M and the program echoed back
+        having received exactly that, while tmux never entered copy-mode.
+        """
+        self.assertEqual(self.run_js("""
+            mouseOn = true;
+            term = { rows: 40, buffer: { active: { type: 'alternate' } } };
+            var a = swipeKind();
+            published = 'external';
+            var b = swipeKind();
+            term.buffer.active.type = 'normal';
+            var c = swipeKind();
+            mouseOn = false;
+            var d = swipeKind();
+            console.log(JSON.stringify([a, b, c, d]));"""),
+            ['wheel', 'wheel', 'wheel', 'local'])
+        # It outranks both other branches on purpose: they are true at the
+        # same time whenever a mouse-driven program runs inside tmux, and the
+        # program is the one holding the scrollback being reached for.
+        body = _extract(self.js, 'swipeKind')
+        self.assertLess(body.index('mouseOn'), body.index('bufferType'))
+
+    def test_the_report_is_spelled_the_way_the_program_asked_for(self):
+        """1006 says how, not whether. The original encoding biases three
+        bytes by 32 and cannot express a coordinate past 223, so a report
+        that would point somewhere else is not sent at all."""
+        self.assertEqual(self.run_js("""
+            term = { cols: 80, rows: 40 };
+            host = { getBoundingClientRect: function () {
+              return {left: 0, top: 0, width: 800, height: 400}; } };
+            lastX = 345; lastY = 155;              // col 35, row 16
+            mouseSgr = true;
+            var sgr = [wheelReport(true), wheelReport(false)];
+            mouseSgr = false;
+            var x10 = wheelReport(true);
+            term.cols = 400; lastX = 3990;         // past what 3 bytes can say
+            var refused = wheelReport(true);
+            console.log(JSON.stringify([sgr, x10, refused]));"""),
+            [['\x1b[<64;35;16M', '\x1b[<65;35;16M'],
+             '\x1b[M' + chr(32 + 64) + chr(32 + 35) + chr(32 + 16),
+             ''])
+
+    def test_a_notch_is_not_a_line(self):
+        """Every program turns one wheel notch into however many lines it
+        thinks a notch is worth -- tmux's own binding is five. One report per
+        line would scroll several times too fast for the same travel."""
+        got = self.run_js("""
+            sent = []; mouseOn = true; mouseSgr = true; wheelDebt = 0;
+            term = { cols: 80, rows: 40, buffer: { active: { type: 'alternate' } } };
+            host = { getBoundingClientRect: function () {
+              return {left: 0, top: 0, width: 800, height: 400}; } };
+            lastX = 0; lastY = 0;
+            swipeBy(2); var short = sent.length;   // under a notch: nothing yet
+            swipeBy(1); var reached = sent.length; // the remainder carries
+            swipeBy(6); var more = sent.length;
+            console.log(JSON.stringify([short, reached, more]));""")
+        self.assertEqual(got, [0, 1, 3])
+
+    def test_wanting_the_mouse_and_spelling_it_are_read_apart(self):
+        """xterm 6 removed term.modes and reading it throws, so DECSET is
+        watched directly. 1000/1002/1003 say the program wants events at all;
+        1006 only says how it wants them spelled, and a program that sent
+        1006 without one of the others is not asking to be scrolled."""
         setup = self.js[self.js.index('var mouseOn'):]
         setup = setup[:setup.index('function bufferType')]
+        wants = setup[setup.index('mouseOn = pair[1]') - 220:
+                      setup.index('mouseOn = pair[1]')]
         for mode in ('1000', '1002', '1003'):
             with self.subTest(mode=mode):
-                self.assertIn(mode, setup)
-        for encoding in ('1005', '1006', '1015'):
-            with self.subTest(encoding=encoding):
-                self.assertNotIn(encoding, setup)
+                self.assertIn(mode, wants)
+        self.assertNotIn('1006', wants)
+        spells = setup[setup.index('mouseSgr = pair[1]') - 60:
+                       setup.index('mouseSgr = pair[1]')]
+        self.assertIn('1006', spells)
+        # Encodings nobody asks for any more are not tracked at all.
+        for ignored in ('1005', '1015'):
+            with self.subTest(ignored=ignored):
+                self.assertNotIn(ignored, setup)
         # Returning false leaves xterm to act on the sequence as well.
         self.assertIn('return false', setup)
 
