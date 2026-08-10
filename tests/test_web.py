@@ -938,6 +938,79 @@ class MountPathTests(unittest.TestCase):
         self.assertEqual(derive('/a/b/'), '/a/b/ws')
 
 
+class TrailingSlashTests(_ServedFixture):
+    """The address `tailscale serve` prints has no trailing slash.
+
+    `https://host/term` and `https://host/term/` are different base URLs: with
+    no slash the browser treats `term` as a filename and resolves `dash.js`
+    against the host root, where nothing is mounted. Measured against the live
+    tailnet front, all four forms:
+
+        /term/          7 rows            ok
+        /term           404 /dash.js      header, two buttons, no list
+        /term/console/  terminal drawn    ok
+        /term/console   404 /console/     "404 page not found"
+
+    Both failures are one mistake -- assuming this server is mounted at the
+    root -- made in two places, and the second page was the one people open.
+    """
+
+    PAGES = ('index.html', 'dash.html')
+
+    def test_both_pages_can_put_the_slash_back(self):
+        """The console had the bootstrap from the start. The dashboard did
+        not, so it was the one page that could not correct the address, and
+        it is the one the printed URL lands on."""
+        for name in self.PAGES:
+            with self.subTest(page=name):
+                with open(os.path.join(web.ASSETS, name), encoding='utf-8') as f:
+                    self.assertIn(web._BOOTSTRAP_SLOT, f.read())
+
+    def test_the_server_fills_the_slot_in_on_the_way_out(self):
+        """A slot left as a comment is a page that still cannot correct."""
+        for path, marker in (('/', b'dash.js'), (web.CONSOLE, b'app.js')):
+            with self.subTest(path=path):
+                head, body = self.get(path)
+                self.assertIn('200', head)
+                self.assertIn(marker, body)
+                self.assertIn(web.BOOTSTRAP_JS.encode('utf-8'), body)
+                self.assertNotIn(web._BOOTSTRAP_SLOT.encode('ascii'), body)
+
+    def test_the_redirect_does_not_claim_to_know_where_it_is_mounted(self):
+        """`Location: /console/` is such a claim, and behind --set-path the
+        prefix is stripped before we ever see it, so the browser was sent to
+        a path nothing serves. A relative target resolves against whatever it
+        actually asked for."""
+        head, _ = self.get(web.CONSOLE.rstrip('/'))
+        self.assertIn('302', head)
+        location = re.search(r'(?im)^Location:\s*(\S+)', head)
+        self.assertIsNotNone(location, head)
+        target = location.group(1)
+        self.assertFalse(target.startswith('/'), target)
+        self.assertNotRegex(target, r'^[a-z]+://')
+        self.assertEqual(target, 'console/')
+
+    def test_the_browser_rule_lands_where_it_should_under_any_mount(self):
+        """urljoin is the rule a browser applies to a relative Location."""
+        from urllib.parse import urljoin
+        for asked, expected in (
+                ('https://h/console', 'https://h/console/'),
+                ('https://h/term/console', 'https://h/term/console/'),
+                ('https://h/a/b/console', 'https://h/a/b/console/')):
+            with self.subTest(asked=asked):
+                self.assertEqual(urljoin(asked, 'console/'), expected)
+
+    def test_the_dashboard_loads_nothing_by_an_absolute_path(self):
+        """One absolute reference is a page that only works at the root --
+        which is the whole bug, in the other direction."""
+        with open(os.path.join(web.ASSETS, 'dash.html'), encoding='utf-8') as f:
+            html = f.read()
+        for reference in re.findall(r'(?:src|href)="([^"]+)"', html):
+            with self.subTest(reference=reference):
+                self.assertFalse(reference.startswith('/'), reference)
+                self.assertNotRegex(reference, r'^[a-z]+://')
+
+
 class SafeAreaTests(unittest.TestCase):
     """viewport-fit=cover is what lets the background reach every edge of a
     notched phone -- and it makes the insets ours to apply. Skip them and the

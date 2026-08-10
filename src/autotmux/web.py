@@ -323,7 +323,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == CONSOLE:
             self._asset('index.html')
         elif path == CONSOLE.rstrip('/'):
-            self._redirect(CONSOLE)
+            # Relative, because an absolute one is a claim about where this
+            # server is mounted and it does not know. Behind `tailscale serve
+            # --set-path /term` the prefix is stripped before we see it, so
+            # `/console/` sent the browser to a path nothing is served at.
+            # `console/` resolves against whatever it actually asked for.
+            self._redirect(CONSOLE.lstrip('/'))
         elif path == '/healthz':
             self._bytes(b'{"ok":true}\n', _ASSET_TYPES['.json'])
         elif path.startswith(CONSOLE):
@@ -365,10 +370,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             self.send_error(404)
             return
-        if name == 'index.html':
+        # Both pages, not just the console. The dashboard is the one people
+        # actually open -- `tailscale serve` prints /term, without the slash --
+        # and it was the one page that could not correct for it: dash.js
+        # resolved to the host root, 404'd, and left a page with a header, two
+        # buttons and no list. That is what "it comes up black" was.
+        if name in ('index.html', 'dash.html'):
             body = body.replace(
                 _BOOTSTRAP_SLOT.encode('ascii'),
                 f'<script>{BOOTSTRAP_JS}</script>'.encode('utf-8'))
+        # Only the console has a character grid to fit.
+        if name == 'index.html':
             body = body.replace(_LAYOUT_SLOT.encode('ascii'),
                                 _layout_meta().encode('utf-8'))
         ctype = _ASSET_TYPES.get(os.path.splitext(name)[1],
