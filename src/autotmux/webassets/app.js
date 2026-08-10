@@ -51,6 +51,7 @@
   });
   var host = document.getElementById('term');
   term.open(host);
+  var hist = document.getElementById('hist');
 
   var textarea = host.querySelector('textarea');
 
@@ -132,7 +133,7 @@
   // Through the latch, so an armed ctrl applies to what you type on the
   // software keyboard and not only to what you tap on the pad. Anything else
   // would be a modifier that works on some keys and silently not on others.
-  term.onData(function (data) { sendText(applyLatch(data)); });
+  term.onData(function (data) { typed(data); });
   term.onBinary(function (data) {
     var bytes = new Uint8Array(data.length);
     for (var i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 255;
@@ -257,6 +258,15 @@
     { l: 'esc', k: '\x1b' },
     { l: 'ctrl', m: 'ctrl' },
     { l: 'alt', m: 'alt' },
+    // A prefix that latches is a different offer from the prefix button this
+    // once had and dropped. That one sent C-b and then wanted a letter, which
+    // meant raising the keyboard over the screen you were acting on. Latched,
+    // it survives the keyboard, it survives being locked for a run of chords,
+    // and -- unlike ctrl and alt, which rewrite a character -- it is a key
+    // that comes *first*, so it composes with the arrows too: `prefix ←`
+    // selects the pane to the left. Four verbs I chose become the whole
+    // binding table.
+    { l: 'pfx', m: 'prefix' },
     { l: 'tab', k: '\t' },
     { l: '⏎', k: '\r' },
     { l: '←', k: '\x1b[D' },
@@ -275,7 +285,7 @@
   // chord become reachable without a button each; enumerating them was the
   // old strategy and it is why the pad once had three pages nobody opened.
   var OFF = 0, ARMED = 1, LOCKED = 2;
-  var latch = { ctrl: OFF, alt: OFF };
+  var latch = { ctrl: OFF, alt: OFF, prefix: OFF };
   var modButtons = {};
 
   function paintLatch() {
@@ -306,14 +316,21 @@
   // either would produce a byte nobody asked for, so they pass through and
   // clear the latch instead, which is what a mis-tap deserves.
   function applyLatch(data) {
-    if (latch.ctrl === OFF && latch.alt === OFF) return data;
+    if (latch.ctrl === OFF && latch.alt === OFF && latch.prefix === OFF) {
+      return data;
+    }
     var out = data;
     if (data.length === 1 && data.charCodeAt(0) >= 0x20) {
       if (latch.ctrl !== OFF) out = ctrlify(out);
       if (latch.alt !== OFF) out = '\x1b' + out;
     }
+    // Outside that test on purpose: the prefix is not a transformation of the
+    // key, it is a keystroke that precedes it, so it composes with sequences
+    // ctrl and alt have to refuse. `prefix ←` is select-pane -L.
+    if (latch.prefix !== OFF) out = prefixSeq + out;
     if (latch.ctrl === ARMED) latch.ctrl = OFF;
     if (latch.alt === ARMED) latch.alt = OFF;
+    if (latch.prefix === ARMED) latch.prefix = OFF;
     paintLatch();
     return out;
   }
@@ -447,8 +464,18 @@
   }
 
   function press(seq) {
-    sendText(applyLatch(seq));
+    typed(seq);
     haptic();
+  }
+
+  // The single door every keystroke goes through, from the pad and from the
+  // software keyboard alike. Typing while the pane is in copy-mode reaches
+  // nothing -- measured -- so anything typed is taken as "I am done reading"
+  // and leaves first. Without this the bar is the only way out, and a bar is
+  // only a way out for someone who reads it.
+  function typed(data) {
+    if (scrolledBack) leaveHistory();
+    sendText(applyLatch(data));
   }
 
   function renderNav() {
@@ -810,6 +837,12 @@
     // a swipe means, because the dashboard and tmux want different keys and
     // sending one the other's is worse than sending nothing. See swipeKind.
     if (data.mode === 'app' || data.mode === 'external') published = data.mode;
+    // The app is drawing again: whatever pane we put into copy-mode is not
+    // the screen any more, so the bar would be pointing at nothing.
+    if (data.mode === 'app' && scrolledBack) {
+      scrolledBack = false;
+      paintHistory('');
+    }
     setKeys(data.keys.filter(function (entry) {
       return entry && typeof entry.k === 'string' && entry.k
           && typeof entry.l === 'string' && entry.l
@@ -921,6 +954,45 @@
     return '';
   }
 
+  // ── reading history is a state, and states need a door ────────────────
+  // `prefix PageUp` is copy-mode, and tmux never leaves it on its own.
+  // Measured: after swiping up and back down to the bottom the pane still
+  // reported pane_in_mode=1, and a typed `echoXYZ` produced nothing at all
+  // -- the screen looked live, the keystrokes went into copy-mode commands
+  // and vanished. It also survives detach and reattach.
+  //
+  // Two ways out, because one of them has to be the one you happen to try:
+  // the bar says where you are and is itself the button, and typing anything
+  // at all leaves first. There is no sequence of taps that strands you.
+  var scrolledBack = false, histText = null;
+  function paintHistory(during) {
+    if (!hist) return;
+    if (!histText) hist.appendChild(histText = document.createTextNode(''));
+    var show = during || (scrolledBack ? '历史 · 点此回到实时' : '');
+    // nodeValue, never textContent: replacing children is a structural change
+    // and this one updates mid-gesture, which is when that ends the gesture.
+    if (histText.nodeValue !== show) histText.nodeValue = show;
+    if (hist.hidden === !show) return;
+    hist.hidden = !show;
+    refit();                       // the terminal just lost or gained a row
+  }
+  if (hist) {
+    hist.addEventListener('click', function () { leaveHistory(); });
+    keepFocus(hist);
+  }
+  function enterHistory() {
+    if (scrolledBack) return;
+    scrolledBack = true;
+    paintHistory('');
+  }
+  // q is copy-mode's cancel in both key tables, and harmless outside one.
+  function leaveHistory() {
+    if (!scrolledBack) return;
+    scrolledBack = false;
+    sendText('q');
+    paintHistory('');
+  }
+
   function swipePage(up) {
     var kind = swipeKind();
     if (kind === 'local') {
@@ -930,10 +1002,20 @@
       // Idempotent: pressed again inside copy-mode it simply scrolls another
       // page, so there is no state here to track and get wrong.
       sendText(up ? prefixSeq + '\x1b[5~' : '\x1b[6~');
+      if (up) enterHistory();
     } else if (kind === 'keys') {
       sendText(up ? '\x1b[5~' : '\x1b[6~');
     }
-    if (kind) haptic();
+    if (kind) {
+      haptic();
+      pages += up ? 1 : -1;
+      paintHistory((pages > 0 ? '▲ ' : '▼ ') + Math.abs(pages) + ' 页');
+      // Let this page, and only this page, reach the screen. Holding every
+      // byte for the whole gesture was the safe answer and it made a drag
+      // feel dead; holding everything *except* what the drag itself asked
+      // for is the same protection with the feedback back.
+      flushSoon();
+    }
     return !!kind;
   }
 
@@ -974,25 +1056,36 @@
   // So nothing reaches the renderer while a finger is down: the bytes are
   // held and played out on release. The screen catches up in one step
   // rather than live, which is what the gesture costs to exist here.
-  var held = [], holdTimer = 0;
+  var held = [], holding = false, holdTimer = 0, flushTimer = 0;
   function feed(data) {
-    if (holdTimer) held.push(data);
+    if (holding) held.push(data);
     else term.write(data);
   }
+  // Everything queued goes to the screen, in order. The hold itself stays on:
+  // this is used mid-gesture to let one page through.
+  function flushHeld() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
+    var pending = held;
+    held = [];
+    pending.forEach(function (data) { term.write(data); });
+  }
+  // tmux answers a page over the socket, so there is nothing to flush at the
+  // moment the key goes out; this waits for the reply rather than guessing.
+  function flushSoon() {
+    if (flushTimer) clearTimeout(flushTimer);
+    flushTimer = setTimeout(flushHeld, 90);
+  }
   function holdWrites(on) {
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; }
+    holding = on;
     if (on) {
-      if (holdTimer) clearTimeout(holdTimer);
       // A backstop, not the mechanism: touchend and touchcancel release
       // this. A gesture that somehow ends without either must not leave the
       // terminal frozen, and no swipe lasts three seconds.
       holdTimer = setTimeout(function () { holdWrites(false); }, 3000);
       return;
     }
-    if (holdTimer) clearTimeout(holdTimer);
-    holdTimer = 0;
-    var pending = held;
-    held = [];
-    pending.forEach(function (data) { term.write(data); });
+    flushHeld();
   }
 
   // ── a readout for a device you cannot attach a debugger to ────────────
@@ -1013,7 +1106,7 @@
     debugBox.appendChild(debugText);
     document.getElementById('app').appendChild(debugBox);
   }
-  var moves = 0;
+  var moves = 0, pages = 0;
   function showDebug(dy) {
     if (!debugText) return;
     debugText.nodeValue =
@@ -1039,6 +1132,7 @@
       dragFrom = event.touches[0].clientY;
       swiped = false;
       moves = 0;
+      pages = 0;
       showDebug(0);
     }
   }, { passive: true });
@@ -1077,6 +1171,9 @@
     host.addEventListener(name, function () {
       pinchStart = 0; swiped = false;
       holdWrites(false);
+      // The count belonged to the gesture; what remains is where you are.
+      pages = 0;
+      paintHistory('');
     });
   });
   function spread(touches) {

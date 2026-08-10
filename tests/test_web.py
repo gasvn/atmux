@@ -1434,12 +1434,18 @@ El.prototype.emit = function (type, event) {
 El.prototype.getBoundingClientRect = function () {
   return { width: this._width || 0, height: 0 };
 };
+// A text node, because the page writes its live readouts through nodeValue
+// rather than textContent: replacing an element's children is a structural
+// change, and on iOS a structural change mid-gesture ends the gesture.
+function TextNode(v) { this.nodeValue = String(v); this.parentNode = null; }
 var document = { createElement: function (t) { return new El(t); },
+                 createTextNode: function (v) { return new TextNode(v); },
                  body: new El('body') };
 
 // What the pad needs around it, and nothing more. Every one of these is a
 // thing the browser owns, not a thing the keypad decides.
 var keys = new El('div'), nav = new El('div'), expander = new El('button');
+var hist = new El('div');
 var pinRow = new El('div'), editButton = new El('button');
 var current = [], expanded = false;
 var sent = [];
@@ -1503,14 +1509,16 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
     FUNCTIONS = ('bufferType', 'swipeKind', 'swipePage', 'swipeStep',
-                 'showDebug', 'feed', 'holdWrites', 'stepNow',
+                 'showDebug', 'feed', 'holdWrites', 'flushHeld', 'flushSoon',
+                 'stepNow', 'typed', 'paintHistory', 'enterHistory',
+                 'leaveHistory',
                  'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
                  'renderRows', 'recolumn', 'renderNav', 'renderPins',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
-               'var held =', 'var FIRST_PAGE =',
+               'var held =', 'var FIRST_PAGE =', 'var scrolledBack =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
@@ -1556,11 +1564,40 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertEqual([bytes_for.get(g) for g in ('←', '↓', '↑', '→')],
                          ['\x1b[D', '\x1b[B', '\x1b[A', '\x1b[C'])
 
+    def test_the_prefix_latches_like_the_other_modifiers(self):
+        """The prefix button this once had sent C-b and then wanted a letter,
+        which meant raising the keyboard over the screen you were acting on.
+        A latch survives the keyboard and can be locked for a run of chords,
+        and it turns four verbs someone chose for you into tmux's whole
+        binding table."""
+        mods = {e['l']: e for e in self.table('NAV_KEYS') if 'm' in e}
+        self.assertEqual(sorted(mods), ['alt', 'ctrl', 'pfx'])
+        self.assertEqual(mods['pfx']['m'], 'prefix')
+        self.assertNotIn('k', mods['pfx'])
+
+    def test_the_prefix_comes_before_the_key_rather_than_rewriting_it(self):
+        """ctrl and alt rewrite a character and so have to refuse anything
+        that is already a sequence. The prefix is a keystroke that precedes
+        the next one, so it composes with the arrows: `prefix ←` is
+        select-pane -L, and refusing it would be a modifier that works on
+        some keys and silently not on others."""
+        self.assertEqual(self.run_js('''
+            prefixSeq = '\\x02';
+            latch = { ctrl: OFF, alt: OFF, prefix: ARMED };
+            var arrow = applyLatch('\\x1b[D');
+            latch.prefix = ARMED;
+            var letter = applyLatch('c');
+            latch.prefix = LOCKED;
+            var held1 = applyLatch('n'), held2 = applyLatch('n');
+            console.log(JSON.stringify([arrow, letter, held1, held2,
+                                        latch.prefix]));'''),
+            ['\x02\x1b[D', '\x02c', '\x02n', '\x02n', 2])
+
     def test_a_modifier_is_a_latch_rather_than_a_byte(self):
         """There is no byte for ctrl. A key that claimed to send one would
         send nothing, look pressed, and be indistinguishable from broken."""
         mods = {e['l']: e for e in self.table('NAV_KEYS') if 'm' in e}
-        self.assertEqual(sorted(mods), ['alt', 'ctrl'])
+        self.assertEqual(sorted(mods), ['alt', 'ctrl', 'pfx'])
         for entry in mods.values():
             self.assertNotIn('k', entry)
 
@@ -2093,6 +2130,70 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertEqual(got, [44, 167, 44])
         self.assertGreater(got[0], 10, 'must not fire on a tap')
         self.assertLessEqual(got[2], 64, 'never more than the full step')
+
+    # ── reading history is a state ────────────────────────────────────────
+
+    def history(self, body):
+        """The bar, with hist wired up and the terminal in tmux."""
+        return self.run_js('''
+            sent = [];
+            var shown = [];
+            hist = new El('div');
+            hist.hidden = true;
+            Object.defineProperty(hist, 'hidden', {
+              get: function () { return this._h; },
+              set: function (v) { this._h = v; shown.push(v ? '' : 'on'); }
+            });
+            histText = null;
+            scrolledBack = false;
+            published = 'external';
+            term = { rows: 40, write: function () {},
+                     buffer: { active: { type: 'alternate' } } };
+            ''' + body + '''
+            console.log(JSON.stringify(
+              [sent, scrolledBack, histText ? histText.nodeValue : null]));''')
+
+    def test_a_swipe_up_says_you_are_reading_history(self):
+        """Measured: after `prefix PageUp` the pane reports pane_in_mode=1 and
+        stays there through a swipe back to the bottom, across a detach, and
+        for every keystroke after -- a typed `echoXYZ` produced nothing at
+        all. The screen looks live and is not."""
+        sent, back, label = self.history('swipePage(true);')
+        self.assertEqual(sent, ['\x02\x1b[5~'])
+        self.assertTrue(back)
+        self.assertIn('页', label)              # the drag's own count first
+
+    def test_the_bar_is_the_way_back_to_live(self):
+        """q is copy-mode's cancel in both key tables."""
+        sent, back, label = self.history('''
+            swipePage(true); sent = []; leaveHistory();''')
+        self.assertEqual(sent, ['q'])
+        self.assertFalse(back)
+        self.assertEqual(label, '')
+
+    def test_typing_leaves_history_before_it_types(self):
+        """The other door, and the one that matters: the bar only helps
+        someone who reads it. Anything typed is a statement that you are done
+        reading, so no sequence of taps can strand you in a mode that eats
+        your keystrokes."""
+        sent, back, _ = self.history('''
+            swipePage(true); sent = []; typed('l'); typed('s');''')
+        self.assertEqual(sent, ['q', 'l', 's'])
+        self.assertFalse(back)
+
+    def test_leaving_twice_does_not_send_q_twice(self):
+        """A stray q reaches the shell as a character."""
+        sent, _, _ = self.history('''
+            swipePage(true); sent = [];
+            leaveHistory(); leaveHistory(); typed('x');''')
+        self.assertEqual(sent, ['q', 'x'])
+
+    def test_a_swipe_down_from_live_claims_nothing(self):
+        """Paging down at the bottom is not entering history, and a bar that
+        appeared for it would be lying about where you are."""
+        sent, back, _ = self.history('swipePage(false);')
+        self.assertEqual(sent, ['\x1b[6~'])
+        self.assertFalse(back)
 
     def test_nothing_is_drawn_while_a_finger_is_down(self):
         """Safari iOS stops firing touch events for the rest of a gesture as

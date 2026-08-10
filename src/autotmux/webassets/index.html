@@ -94,6 +94,18 @@
     opacity: 0 !important; z-index: 5;
     resize: none; border: 0; padding: 0;
   }
+  /* Sits between the terminal and the pad rather than floating over the
+     screen: it is on while you are reading, and something that covers the
+     text you are reading to tell you that you are reading is its own joke.
+     Full width because it is also the target -- a thumb should not have to
+     find it. */
+  #hist {
+    flex: 0 0 auto; text-align: center; padding: 9px 8px;
+    font: 13px/1.2 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    color: #f0d9a0; background: #3a3020; border-top: 1px solid #5a4a28;
+    user-select: none; -webkit-user-select: none; touch-action: none;
+  }
+  #hist[hidden] { display: none; }
   /* Created by app.js only under ?debug=1, so this styles nothing the rest
      of the time. pointer-events: none -- a readout that swallowed the very
      gesture it is reporting on would be worse than no readout. */
@@ -241,6 +253,17 @@
        true of every program and has to work when nothing is publishing at
        all -- in a bare shell, during a reconnect, after the handover to
        tmux. -->
+  <!-- Where you are, when that is not "live". A swipe puts tmux into
+       copy-mode and nothing in tmux takes it back out: measured, after
+       scrolling up and back down the pane still reported pane_in_mode=1 and
+       a typed `echoXYZ` reached nothing at all. The screen looks live and
+       is not, which is a state you have to be told you are in. Chat clients
+       solved the same problem years ago -- lock the position, show a way
+       back to the latest -- and this is that button.
+
+       Static, never created at runtime: it also carries the page count
+       during a drag, when a structural DOM change would end the gesture. -->
+  <div id="hist" hidden></div>
   <div id="pad">
     <!-- esc, the two modifiers, tab and the arrows. Fixed, in this order, and
          nothing below may reflow it: a key that moves because the far end
