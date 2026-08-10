@@ -99,8 +99,13 @@
      text you are reading to tell you that you are reading is its own joke.
      Full width because it is also the target -- a thumb should not have to
      find it. */
+  /* Overlaid, not laid out. As a flex child it took a row from the terminal
+     the moment it appeared, and giving the terminal a different number of
+     rows mid-swipe makes tmux reflow and repaint the whole screen -- a jolt
+     on every gesture. #app is position:fixed, so this anchors to it. */
   #hist {
-    flex: 0 0 auto; text-align: center; padding: 9px 8px;
+    position: absolute; top: 0; left: 0; right: 0; z-index: 15;
+    text-align: center; padding: 9px 8px;
     font: 13px/1.2 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
     color: #f0d9a0; background: #3a3020; border-top: 1px solid #5a4a28;
     user-select: none; -webkit-user-select: none; touch-action: none;

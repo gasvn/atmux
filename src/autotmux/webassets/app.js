@@ -1003,18 +1003,26 @@
     // nodeValue, never textContent: replacing children is a structural change
     // and this one updates mid-gesture, which is when that ends the gesture.
     if (histText.nodeValue !== show) histText.nodeValue = show;
-    if (hist.hidden === !show) return;
+    // Shown and hidden without touching the layout, and emphatically without
+    // refit(): resizing the terminal mid-gesture makes tmux reflow and
+    // repaint the whole screen, which is a jolt on every single swipe. It
+    // overlays a row instead. A row is cheaper than the screen jumping.
     hist.hidden = !show;
-    refit();                       // the terminal just lost or gained a row
   }
   if (hist) {
     hist.addEventListener('click', function () { leaveHistory(); });
     keepFocus(hist);
   }
+  // The label a gesture in progress owns, so that entering history halfway
+  // through one does not replace the running count with the standing bar.
+  function duringLabel() {
+    if (!scrolled) return '';
+    return (scrolled > 0 ? '▲ ' : '▼ ') + Math.abs(scrolled) + ' 行';
+  }
   function enterHistory() {
     if (scrolledBack) return;
     scrolledBack = true;
-    paintHistory('');
+    paintHistory(duringLabel());
   }
   // q is copy-mode's cancel in both key tables, and harmless outside one.
   function leaveHistory() {
@@ -1031,6 +1039,19 @@
   function swipeBy(lines) {
     var kind = swipeKind();
     if (!lines || !kind) return !!kind;
+    scrollSoon(lines);
+    haptic();
+    scrolled += lines;
+    paintHistory(duringLabel());
+    return true;
+  }
+
+  // What actually goes out, once a cadence rather than once an event. The
+  // kind is re-read here because a program can turn the mouse on or off
+  // between the finger moving and this running.
+  function emitScroll(lines) {
+    var kind = swipeKind();
+    if (!lines || !kind) return;
     var up = lines > 0, n = Math.abs(lines);
     if (kind === 'wheel') {
       // A wheel notch, not a line: that is the unit the program was built
@@ -1070,15 +1091,11 @@
       while (pageDebt >= rows) { pageDebt -= rows; sendText('\x1b[5~'); }
       while (pageDebt <= -rows) { pageDebt += rows; sendText('\x1b[6~'); }
     }
-    haptic();
-    scrolled += lines;
-    paintHistory((scrolled > 0 ? '▲ ' : '▼ ') + Math.abs(scrolled) + ' 行');
     // Let what this drag asked for reach the screen, and nothing else.
     // Holding every byte for a whole gesture was the safe answer to the iOS
     // cascade and it made a drag feel dead; holding everything *except* the
     // drag's own answer is the same protection with the feedback back.
     flushSoon();
-    return true;
   }
 
   // Far enough above tap slop (~10px) that no tap scrolls, near enough that a
@@ -1101,6 +1118,24 @@
   // is what anything modern asks for with 1006; the original is three bytes
   // biased by 32, which cannot express a coordinate past 223 -- so a report
   // that would lie is not sent at all rather than pointing somewhere else.
+  // Every scroll the far end is asked for costs a full-screen repaint coming
+  // back, and touchmove fires sixty times a second. Sent one per event, that
+  // is sixty screens a second over the socket for one flick -- which is what
+  // "slow to pull" was. Batched on a cadence instead: the same total travel,
+  // a handful of repaints.
+  var owed = 0, owedTimer = 0;
+  function scrollSoon(lines) {
+    owed += lines;
+    if (owedTimer) return;
+    owedTimer = setTimeout(payScroll, 45);
+  }
+  function payScroll() {
+    owedTimer = 0;
+    var lines = owed;
+    owed = 0;
+    if (lines) emitScroll(lines);
+  }
+
   var NOTCH = 3, wheelDebt = 0;
   function wheelReport(up) {
     var at = cellAt(), button = up ? 64 : 65;
@@ -1144,9 +1179,12 @@
   }
   // tmux answers over the socket, so there is nothing to flush at the moment
   // the keys go out; this waits for the reply rather than guessing.
+  // A cadence, not a delay after the last call. Rescheduling on every call
+  // was the bug: touchmove fires every ~16ms and each one asked again, so the
+  // timer never expired and nothing was drawn until the finger came up.
   function flushSoon() {
-    if (flushTimer) clearTimeout(flushTimer);
-    flushTimer = setTimeout(flushHeld, 60);
+    if (flushTimer) return;
+    flushTimer = setTimeout(flushHeld, 50);
   }
   function holdWrites(on) {
     if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; }
@@ -1244,6 +1282,9 @@
       holdWrites(false);
       // The count belonged to the gesture; what remains is where you are.
       scrolled = 0; pageDebt = 0; wheelDebt = 0;
+      // Anything still owed belongs to the gesture that just ended.
+      if (owedTimer) { clearTimeout(owedTimer); owedTimer = 0; }
+      payScroll();
       paintHistory('');
     });
   });

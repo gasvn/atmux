@@ -1510,7 +1510,8 @@ class KeypadVocabularyTests(unittest.TestCase):
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
     FUNCTIONS = ('bufferType', 'swipeKind',
                  'showDebug', 'feed', 'holdWrites', 'flushHeld', 'flushSoon',
-                 'swipeBy', 'lineHeight', 'wheelReport', 'cellAt',
+                 'swipeBy', 'emitScroll', 'scrollSoon', 'payScroll',
+                 'lineHeight', 'wheelReport', 'cellAt', 'duringLabel',
                  'typed', 'paintHistory', 'enterHistory',
                  'leaveHistory',
                  'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
@@ -1521,6 +1522,7 @@ class KeypadVocabularyTests(unittest.TestCase):
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
                'var held =', 'var SLOP =', 'var scrolledBack =',
                'var mouseOn =', 'var NOTCH =', 'var lastX =',
+               'var owed =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
@@ -2020,7 +2022,7 @@ class KeypadVocabularyTests(unittest.TestCase):
               scrollLines: function (n) {{ sent.push('scrollLines:' + n); }},
               buffer: {{ active: {{ type: {json.dumps(buffer_type)} }} }}
             }};
-            var acted = swipeBy({json.dumps(int(lines))});
+            var acted = swipeBy({json.dumps(int(lines))}); payScroll();
             console.log(JSON.stringify([swipeKind(), acted, sent]));''')
 
     def test_a_plain_shell_scrolls_without_the_program_hearing_anything(self):
@@ -2044,7 +2046,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertEqual(self.run_js("""
             sent = []; scrolledBack = false; published = 'external';
             term = { rows: 40, buffer: { active: { type: 'alternate' } } };
-            swipeBy(4); sent = []; swipeBy(-2);
+            swipeBy(4); payScroll(); sent = []; swipeBy(-2); payScroll();
             console.log(JSON.stringify(sent));"""),
             ['\x1b[1;5B\x1b[1;5B'])
 
@@ -2117,9 +2119,9 @@ class KeypadVocabularyTests(unittest.TestCase):
             host = { getBoundingClientRect: function () {
               return {left: 0, top: 0, width: 800, height: 400}; } };
             lastX = 0; lastY = 0;
-            swipeBy(2); var short = sent.length;   // under a notch: nothing yet
-            swipeBy(1); var reached = sent.length; // the remainder carries
-            swipeBy(6); var more = sent.length;
+            swipeBy(2); payScroll(); var short = sent.length;   // under a notch: nothing yet
+            swipeBy(1); payScroll(); var reached = sent.length; // the remainder carries
+            swipeBy(6); payScroll(); var more = sent.length;
             console.log(JSON.stringify([short, reached, more]));""")
         self.assertEqual(got, [0, 1, 3])
 
@@ -2226,7 +2228,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         stays there through a swipe back to the bottom, across a detach, and
         for every keystroke after -- a typed `echoXYZ` produced nothing at
         all. The screen looks live and is not."""
-        sent, back, label = self.history('swipeBy(3);')
+        sent, back, label = self.history('swipeBy(3); payScroll();')
         self.assertEqual(sent, ['\x02[', '\x1b[1;5A' * 3])
         self.assertTrue(back)
         self.assertIn('行', label)              # the drag's own count first
@@ -2234,7 +2236,7 @@ class KeypadVocabularyTests(unittest.TestCase):
     def test_the_bar_is_the_way_back_to_live(self):
         """q is copy-mode's cancel in both key tables."""
         sent, back, label = self.history('''
-            swipeBy(3); sent = []; leaveHistory();''')
+            swipeBy(3); payScroll(); sent = []; leaveHistory();''')
         self.assertEqual(sent, ['q'])
         self.assertFalse(back)
         self.assertEqual(label, '')
@@ -2245,14 +2247,14 @@ class KeypadVocabularyTests(unittest.TestCase):
         reading, so no sequence of taps can strand you in a mode that eats
         your keystrokes."""
         sent, back, _ = self.history('''
-            swipeBy(3); sent = []; typed('l'); typed('s');''')
+            swipeBy(3); payScroll(); sent = []; typed('l'); typed('s');''')
         self.assertEqual(sent, ['q', 'l', 's'])
         self.assertFalse(back)
 
     def test_leaving_twice_does_not_send_q_twice(self):
         """A stray q reaches the shell as a character."""
         sent, _, _ = self.history('''
-            swipeBy(3); sent = [];
+            swipeBy(3); payScroll(); sent = [];
             leaveHistory(); leaveHistory(); typed('x');''')
         self.assertEqual(sent, ['q', 'x'])
 
@@ -2260,12 +2262,12 @@ class KeypadVocabularyTests(unittest.TestCase):
         """There is nothing below the bottom of the scrollback. Entering
         copy-mode to look would put you in a mode you did not ask for, to be
         shown the screen you were already on."""
-        sent, back, _ = self.history('swipeBy(-3);')
+        sent, back, _ = self.history('swipeBy(-3); payScroll();')
         self.assertEqual(sent, [])
         self.assertFalse(back)
 
     def test_a_swipe_down_inside_history_scrolls_back_toward_live(self):
-        sent, back, _ = self.history('swipeBy(3); sent = []; swipeBy(-2);')
+        sent, back, _ = self.history('swipeBy(3); payScroll(); sent = []; swipeBy(-2); payScroll();')
         self.assertEqual(sent, ['\x1b[1;5B' * 2])
         self.assertTrue(back)
 
@@ -2356,7 +2358,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         back felt like jumping. C-Up is one line -- measured through
         #{scroll_position}: five presses gave 5, three back gave 2, while one
         PageUp jumped 41."""
-        body = _extract(self.js, 'swipeBy')
+        body = _extract(self.js, 'emitScroll')
         self.assertIn('\\x1b[1;5A', body)
         self.assertIn('\\x1b[1;5B', body)
         self.assertNotIn('\\x1b[5~\'', body.split("kind === 'keys'")[0])
