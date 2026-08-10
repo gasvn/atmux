@@ -2275,6 +2275,20 @@ class DashboardTests(_ServedFixture):
         self.assertIn("new URL('api/", js)
         self.assertNotIn("'/api/", js)
 
+    def test_the_debug_flag_survives_the_tap_into_a_session(self):
+        """Tapping a row is the only navigation between the list and the
+        terminal, and go() rebuilds the URL from scratch. Dropping the flag
+        there leaves the readout reachable only by typing
+        ?attach=NODE:SESSION&debug=1 by hand -- on a phone, which is the one
+        device it exists for."""
+        with open(os.path.join(web.ASSETS, 'dash.js'), encoding='utf-8') as f:
+            js = f.read()
+        go = _extract(js, 'go')
+        self.assertIsNotNone(go)
+        self.assertIn('debug', go)
+        # Carried, never invented: a list opened without it stays clean.
+        self.assertIn('/[?&]debug=1/.test(location.search)', go)
+
     def test_the_page_renders_no_html_from_the_wire(self):
         """Session names, node names and squeue output are all attacker-
         adjacent in the sense that they come from a cluster. textContent

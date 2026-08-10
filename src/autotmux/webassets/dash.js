@@ -137,6 +137,10 @@
     } else if (row.kind === 'session' && row.node && row.session) {
       url.searchParams.set(verb, row.node + ':' + row.session);
     }
+    // Carried, because this is the one navigation between the list and the
+    // terminal: a readout you can only reach by typing ?attach=NODE:SESSION
+    // by hand on a phone is a readout for the window nobody is debugging.
+    if (/[?&]debug=1/.test(location.search)) url.searchParams.set('debug', '1');
     location.href = url.toString();
   }
 
