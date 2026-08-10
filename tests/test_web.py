@@ -1503,14 +1503,14 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
     FUNCTIONS = ('bufferType', 'swipeKind', 'swipePage', 'swipeStep',
-                 'showDebug', 'feed', 'holdWrites',
+                 'showDebug', 'feed', 'holdWrites', 'stepNow',
                  'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
                  'renderRows', 'recolumn', 'renderNav', 'renderPins',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
-               'var held =',
+               'var held =', 'var FIRST_PAGE =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
@@ -2076,6 +2076,24 @@ class KeypadVocabularyTests(unittest.TestCase):
             });
             console.log(JSON.stringify(seen));'''), [200, 175, 80, 64])
 
+    def test_the_first_page_of_a_gesture_comes_cheap(self):
+        """A quarter of the terminal is fair for a *second* page and dead as
+        the price of any response at all: the readout from the phone this is
+        for showed a flick delivering 57px against a 167px threshold, so
+        nothing happened. Above tap slop, so no tap becomes a page."""
+        got = self.run_js('''
+            host = { getBoundingClientRect: function () { return {height: 668}; } };
+            swiped = false; var first = Math.round(stepNow());
+            swiped = true;  var rest = Math.round(stepNow());
+            // A terminal shorter than the cheap first page must not make the
+            // first page cost more than the ones after it.
+            host = { getBoundingClientRect: function () { return {height: 100}; } };
+            swiped = false; var tiny = Math.round(stepNow());
+            console.log(JSON.stringify([first, rest, tiny]));''')
+        self.assertEqual(got, [44, 167, 44])
+        self.assertGreater(got[0], 10, 'must not fire on a tap')
+        self.assertLessEqual(got[2], 64, 'never more than the full step')
+
     def test_nothing_is_drawn_while_a_finger_is_down(self):
         """Safari iOS stops firing touch events for the rest of a gesture as
         soon as the DOM changes structurally under it -- appendChild counts,
@@ -2103,6 +2121,22 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertIn('clearTimeout', held)
         self.assertRegex(held, r'setTimeout\([^,]*,\s*(\d{4})\)')
 
+    def test_the_readout_fits_a_phone(self):
+        """The first report back from a real phone carried two of the five
+        fields; the three that would have told us which fault it was ran off
+        the right edge. One line of this is ~60 characters at 11px, which is
+        wider than a 390px screen."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        rule = re.search(r'#debug \{[^}]*\}', css).group(0)
+        self.assertIn('white-space: normal', rule)
+        self.assertNotIn('nowrap', rule)
+
+    def test_the_readout_names_the_threshold_actually_in_force(self):
+        """It shows dy against a number the drag has to cross. Showing the
+        full step while the cheap first page is what applies would say the
+        gesture was 100px short when it was about to fire."""
+        self.assertIn('stepNow()', _extract(self.js, 'showDebug'))
+
     def test_the_readout_cannot_kill_the_gesture_it_reports_on(self):
         """textContent replaces an element's children, which is the exact
         structural change that ends the cascade. nodeValue on a node made
@@ -2127,7 +2161,7 @@ class KeypadVocabularyTests(unittest.TestCase):
             [True, True, False, False, False])
         # It reports what the branch table reads, not a restatement of it.
         readout = _extract(self.js, 'showDebug')
-        for value in ('bufferType()', 'published', 'swipeKind()', 'swipeStep()'):
+        for value in ('bufferType()', 'published', 'swipeKind()', 'stepNow()'):
             with self.subTest(value=value):
                 self.assertIn(value, readout)
 

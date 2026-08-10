@@ -946,6 +946,18 @@
     return Math.max(64, host.getBoundingClientRect().height * 0.25);
   }
 
+  // The first page of a gesture comes cheap, the rest cost a full step. A
+  // quarter of the terminal is a fair distance to ask for a *second* page,
+  // but as the price of any response at all it reads as dead: measured on
+  // the phone this exists for, a flick delivered 57px against a 167px
+  // threshold, so nothing ever happened. 44px is far enough above tap slop
+  // (~10px) that no tap becomes a page.
+  var FIRST_PAGE = 44;
+  function stepNow() {
+    var full = swipeStep();
+    return swiped ? full : Math.min(FIRST_PAGE, full);
+  }
+
   // ── iOS: a repaint during a drag kills the rest of the gesture ────────
   // "During the touch event cascade, Safari iOS stops firing events when a
   // DOM change takes place. Only DOM methods such as appendChild() count --
@@ -1005,7 +1017,7 @@
   function showDebug(dy) {
     if (!debugText) return;
     debugText.nodeValue =
-      'mv ' + moves + '  dy ' + Math.round(dy) + '/' + Math.round(swipeStep())
+      'mv ' + moves + '  dy ' + Math.round(dy) + '/' + Math.round(stepNow())
       + '  buf ' + (bufferType() || '?') + '  pub ' + (published || '?')
       + '  kind ' + (swipeKind() || '-');
   }
@@ -1037,19 +1049,22 @@
       return;
     }
     if (event.touches.length !== 1 || pinchStart > 0) return;
-    var step = swipeStep();
+    var step = stepNow();
     moves += 1;
     showDebug(event.touches[0].clientY - dragFrom);
-    // Dragging down uncovers what is above, which is a page up.
+    // Dragging down uncovers what is above, which is a page up. Re-read the
+    // step after each page: the first one is cheap and the rest are not.
     while (event.touches[0].clientY - dragFrom >= step) {
       dragFrom += step;
       if (!swipePage(true)) return;
       swiped = true;
+      step = stepNow();
     }
     while (dragFrom - event.touches[0].clientY >= step) {
       dragFrom -= step;
       if (!swipePage(false)) return;
       swiped = true;
+      step = stepNow();
     }
     // Only once the gesture is ours. Claiming it before then would take the
     // one the browser might still want.
