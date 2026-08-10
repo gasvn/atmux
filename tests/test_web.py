@@ -658,6 +658,28 @@ class TouchKeypadTests(unittest.TestCase):
                     len(binding.description), 1,
                     f'{binding.key}: {binding.description!r} is just a letter')
 
+    def test_the_terminal_does_not_hand_the_swipe_back_to_the_browser(self):
+        """`touch-action: pan-y` declares the vertical drag to be the
+        browser's, which is the exact gesture that pages the scrollback.
+
+        A declared pan arrives uncancelable and on iOS can end in
+        touchcancel, so the listener runs and achieves nothing -- and no test
+        that synthesises touches can catch it, because CDP-dispatched events
+        bypass the compositor's gesture arbitration entirely. It survived one
+        deploy that way. Nothing under #term ever scrolled natively: xterm 6
+        removed the scrollable viewport and #app is position:fixed.
+        """
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        term = re.search(r'#term \{[^}]*\}', css).group(0)
+        self.assertIn('touch-action: none', term)
+        self.assertNotIn('pan-y', css)
+
+    def test_a_gesture_the_system_takes_away_does_not_seed_the_next_one(self):
+        """iOS fires touchcancel rather than touchend when it claims a drag.
+        Leftover state from a drag that never ended reads a later pinch as a
+        swipe."""
+        self.assertIn('touchcancel', self.js)
+
     def test_no_key_stretches_into_something_it_is_not(self):
         """flex-wrap stretched whichever key landed alone on the last line
         into a full-width button, which read as something important rather

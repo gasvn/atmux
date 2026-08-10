@@ -982,8 +982,13 @@
     // one the browser might still want.
     if (swiped) event.preventDefault();
   }, { passive: false });
-  host.addEventListener('touchend', function () {
-    pinchStart = 0; swiped = false;
+  // touchcancel as well as touchend: iOS fires it when the system takes a
+  // gesture away mid-drag, and a run of state left over from a drag that
+  // never ended seeds the next one wrong -- a pinch that reads as a swipe.
+  ['touchend', 'touchcancel'].forEach(function (name) {
+    host.addEventListener(name, function () {
+      pinchStart = 0; swiped = false;
+    });
   });
   function spread(touches) {
     var dx = touches[0].clientX - touches[1].clientX;

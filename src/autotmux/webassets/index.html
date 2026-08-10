@@ -51,8 +51,15 @@
        remainder into a hairline on each side instead of a band down one. */
     display: flex; align-items: center; justify-content: center;
     background: #121212;
-    touch-action: pan-y;                /* keep vertical scroll, drop the
-                                           double-tap-to-zoom delay */
+    /* None, not pan-y. There is no native vertical scroll here to keep:
+       xterm 6 removed the scrollable viewport, and #app is position:fixed,
+       so nothing under this box ever scrolled. pan-y meanwhile declares the
+       vertical drag to be the BROWSER's -- which is exactly the gesture that
+       pages the scrollback, and a declared pan arrives uncancelable (and on
+       iOS can end in touchcancel) no matter what the listener does. Same
+       reason .key is none: on this page a drag is ours or it is nothing.
+       Also drops the double-tap-to-zoom delay, which is what pan-y was for. */
+    touch-action: none;
   }
   /* xterm's own stylesheet paints this element #000 and reserves a scrollbar
      on it. Both show up as a black stripe beside the dashboard, because the
