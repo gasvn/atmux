@@ -442,7 +442,7 @@
   var expander = document.getElementById('more');
   // Two rows fit under a phone's thumb without eating the dashboard. The
   // rest are one tap away rather than one page away.
-  var ROWS_COLLAPSED = 2;
+  var ROWS_COLLAPSED = 1;
   var current = [], expanded = false;
 
   // How many across is the screen's decision, not a constant -- the same rule
@@ -478,14 +478,22 @@
     sendText(applyLatch(data));
   }
 
+  // Two rows of five, not one row of ten. `.key` asks for a 44px minimum
+  // touch target and got it in height only: ten across a 390px phone is 33px
+  // wide, a quarter under the minimum in the direction you actually aim.
+  // Five is 70px. The split falls where the row already divides -- what
+  // modifies a key above, what moves the cursor below.
+  var NAV_PER_ROW = 5;
   function renderNav() {
     if (!nav || nav.childElementCount) return;      // fixed; built once
-    var line = document.createElement('div');
-    line.className = 'krow';
-    NAV_KEYS.forEach(function (entry) {
-      line.appendChild(buildKey(entry));
-    });
-    nav.appendChild(line);
+    for (var start = 0; start < NAV_KEYS.length; start += NAV_PER_ROW) {
+      var line = document.createElement('div');
+      line.className = 'krow';
+      NAV_KEYS.slice(start, start + NAV_PER_ROW).forEach(function (entry) {
+        line.appendChild(buildKey(entry, true));
+      });
+      nav.appendChild(line);
+    }
     paintLatch();
   }
 
@@ -650,8 +658,12 @@
     return button;
   }
 
-  function buildKey(entry) {
-    if (entry.m) return buildModifier(entry);
+  // `instant` marks a key in a row that cannot scroll -- the fixed rows. There
+  // waiting for the finger to lift is pure latency, and a real key acts on the
+  // way down. The drawer keeps release, because a drag through it is how it
+  // scrolls and typing what you dragged past would be worse than the wait.
+  function buildKey(entry, instant) {
+    if (entry.m) return buildModifier(entry);   // already on the way down
     var label = entry.l, seq = entry.k;
     var button = document.createElement('button');
     button.className = 'key';
@@ -698,13 +710,16 @@
       originX = event.clientX; originY = event.clientY;
       lastY = event.clientY;
       button.classList.add('down');
+      // Editing is choosing, not pressing: a fixed key that typed on the way
+      // down while you were picking what to keep would be the same bug the
+      // whole editing mode exists to avoid.
+      if (instant && !editing) { fire(); repeated = true; }
       // Nothing repeats while you are choosing. A held key that pinned and
       // unpinned itself ten times a second is the obvious way to get this
       // wrong.
       if (repeats && !editing) {
         timer = setTimeout(function () {
-          repeated = true;
-          fire();
+          if (!instant) { repeated = true; fire(); }
           interval = setInterval(fire, 70);
         }, 400);
       }

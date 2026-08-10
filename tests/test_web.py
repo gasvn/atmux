@@ -1522,7 +1522,7 @@ class KeypadVocabularyTests(unittest.TestCase):
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
                'var held =', 'var SLOP =', 'var scrolledBack =',
                'var mouseOn =', 'var GAIN =', 'var lastX =',
-               'var owed =',
+               'var owed =', 'var NAV_PER_ROW =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
@@ -1596,6 +1596,48 @@ class KeypadVocabularyTests(unittest.TestCase):
             console.log(JSON.stringify([arrow, letter, held1, held2,
                                         latch.prefix]));'''),
             ['\x02\x1b[D', '\x02c', '\x02n', '\x02n', 2])
+
+    def test_the_row_is_wide_enough_to_aim_at(self):
+        """`.key` asks for a 44px minimum touch target and got it in height
+        only: ten keys across a 390px phone measured 33px wide -- a quarter
+        under the minimum in the direction you actually aim. Five is 71px,
+        measured on the same viewport."""
+        self.assertEqual(self.run_js("""
+            nav = new El('div');
+            renderNav();
+            console.log(JSON.stringify(nav.children.map(function (row) {
+              return buttons(row, []).map(function (k) { return k.textContent; });
+            })));"""),
+            [['esc', 'ctrl', 'alt', 'pfx', 'tab'], ['⏎', '←', '↓', '↑', '→']])
+
+    def test_a_fixed_key_acts_on_the_way_down(self):
+        """The fixed rows cannot scroll, so waiting for the finger to lift is
+        latency and nothing else -- a real key acts on press. The drawer keeps
+        release, because a drag through it is how it scrolls and typing what
+        you dragged past would be worse than the wait."""
+        self.assertEqual(self.run_js("""
+            sent = [];
+            var fixed = buildKey({l: 'tab', k: '\\t'}, true);
+            fixed.emit('pointerdown', {}); var onDown = sent.slice();
+            fixed.emit('pointerup', {});   var afterUp = sent.slice();
+            sent = [];
+            var drawer = buildKey({l: 'tab', k: '\\t'});
+            drawer.emit('pointerdown', {}); var quiet = sent.slice();
+            drawer.emit('pointerup', {});
+            console.log(JSON.stringify([onDown, afterUp, quiet, sent]));"""),
+            [['\t'], ['\t'], [], ['\t']])
+
+    def test_a_fixed_key_still_chooses_rather_than_types_while_editing(self):
+        """Editing is picking what to keep. A key that typed on the way down
+        because it happens to sit in a fixed row would be the exact bug the
+        whole editing mode exists to prevent."""
+        self.assertEqual(self.run_js("""
+            sent = []; editing = true;
+            var fixed = buildKey({l: 'tab', k: '\\t'}, true);
+            fixed.emit('pointerdown', {});
+            fixed.emit('pointerup', {});
+            editing = false;
+            console.log(JSON.stringify(sent));"""), [])
 
     def test_a_modifier_is_a_latch_rather_than_a_byte(self):
         """There is no byte for ctrl. A key that claimed to send one would
@@ -1729,7 +1771,9 @@ class KeypadVocabularyTests(unittest.TestCase):
         Showing an empty drawer there is what put detach behind a tap."""
         shown = self.render()['keys']
         self.assertEqual(shown[0], 'detach')
-        self.assertEqual(len(shown), 8)          # two rows of four
+        # One row of four when collapsed, not two. The pad was taking 45% of
+        # the screen; the row this gives back is the one the nav split costs.
+        self.assertEqual(len(shown), 4)
 
     def test_an_open_drawer_reaches_every_section(self):
         published = [{'k': 'z', 'l': 'Layout'}]
@@ -1843,7 +1887,12 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     def test_the_fixed_row_does_not_scroll_the_drawer(self):
         """It is fixed on purpose, and dragging a key that stays put to move
-        something that does not is a gesture nobody asked for."""
+        something that does not is a gesture nobody asked for.
+
+        The key does type, once, on the way down -- that is what a fixed row
+        is for and it is covered above. What must not happen is the drawer
+        moving underneath it, and it must not type again on release.
+        """
         self.assertEqual(self.gesture('''
             renderNav();
             var key = keyAt(nav, 0);
@@ -1852,7 +1901,7 @@ class KeypadVocabularyTests(unittest.TestCase):
               key.emit('pointermove', {clientX: 50, clientY: y}); });
             key.emit('pointerup', {clientX: 50, clientY: 140});
             console.log(JSON.stringify([sent, keys.scrollTop]));'''),
-            [[], 0])
+            [['\x1b'], 0])
 
     def test_a_closed_drawer_has_nothing_to_scroll(self):
         self.assertEqual(self.run_js('''

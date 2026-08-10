@@ -129,14 +129,14 @@
      reflow it: a navigation key that moves because the app published a
      different number of actions is a key you have to look for every time. */
   #nav { flex: 0 0 auto; padding: 7px 7px 0; }
-  /* Nine keys across a 390px phone is ~37px each. The word `ctrl` has to fit
-     one line inside that -- a modifier that wraps mid-word reads as broken --
-     so this row runs smaller and tighter than the drawer below it. */
-  #nav .key { font-size: 11px; padding: 4px 1px; }
-  /* The arrows and Enter are glyphs, not words, and 11px makes them hard to
-     aim at. They have the room precisely because the words next to them do
-     not need it. */
-  #nav .key.glyph { font-size: 16px; }
+  /* Five across a 390px phone is 70px each, so `ctrl` fits on one line at the
+     same size as everything else. The 11px this used to run at existed only
+     to squeeze ten keys into a single row, which also left them 33px wide --
+     a quarter under the 44px minimum in the direction you aim. */
+  #nav .key { font-size: 13px; padding: 4px 5px; }
+  /* The arrows and Enter are glyphs, not words: they read at a size a word
+     would not need, and they are the keys that repeat. */
+  #nav .key.glyph { font-size: 18px; }
   #pins { flex: 0 0 auto; padding: 5px 7px 0; }
   /* Hidden means hidden: no smaller pad, no row of controls left behind. */
   body.touch.nopad #pad { display: none; }
