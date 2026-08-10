@@ -1597,6 +1597,21 @@ class KeypadVocabularyTests(unittest.TestCase):
                                         latch.prefix]));'''),
             ['\x02\x1b[D', '\x02c', '\x02n', '\x02n', 2])
 
+    def test_every_control_is_big_enough_to_hit(self):
+        """The bottom row was left at 40x34 when the keys were fixed -- under
+        the minimum in BOTH directions, which is why it was the one row you
+        had to aim at. Measured on a 390px phone after: 44x44, and seven of
+        them plus gaps and padding is 358px, so they fit."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        # The rule that sizes them, not merely the first one that mentions
+        # them -- the reduced-motion block names the same selector earlier.
+        sized = [r for r in re.findall(r'#tabs button \{[^}]*\}', css)
+                 if 'min-height' in r]
+        self.assertEqual(len(sized), 1, css.count('#tabs button'))
+        for want in ('min-height: 44px', 'min-width: 44px'):
+            with self.subTest(want=want):
+                self.assertIn(want, sized[0])
+
     def test_the_row_is_wide_enough_to_aim_at(self):
         """`.key` asks for a 44px minimum touch target and got it in height
         only: ten keys across a 390px phone measured 33px wide -- a quarter

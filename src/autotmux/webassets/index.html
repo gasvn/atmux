@@ -307,7 +307,12 @@
      shadow, and means nothing here can be mistaken for something that types.
      */
   #tabs button {
-    min-height: 34px; min-width: 40px; padding: 0 10px;
+    /* 44px both ways, same as the caps. This row was left at 40x34 when the
+       keys were fixed -- under the minimum in BOTH directions, which is why
+       it was the one row you had to aim at. Seven of them at 44 plus gaps and
+       padding is 358px, so a 390px phone has room and the spacer absorbs the
+       rest. */
+    min-height: 44px; min-width: 44px; padding: 0 8px;
     color: #8b8b95;
     background: linear-gradient(180deg, #131317 0%, #17171c 100%);
     border: 1px solid #000; border-radius: 8px;
