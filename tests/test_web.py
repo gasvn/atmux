@@ -1503,13 +1503,14 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
     FUNCTIONS = ('bufferType', 'swipeKind', 'swipePage', 'swipeStep',
-                 'showDebug',
+                 'showDebug', 'feed', 'holdWrites',
                  'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
                  'renderRows', 'recolumn', 'renderNav', 'renderPins',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
+               'var held =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
@@ -2074,6 +2075,41 @@ class KeypadVocabularyTests(unittest.TestCase):
               seen.push(Math.round(swipeStep()));
             });
             console.log(JSON.stringify(seen));'''), [200, 175, 80, 64])
+
+    def test_nothing_is_drawn_while_a_finger_is_down(self):
+        """Safari iOS stops firing touch events for the rest of a gesture as
+        soon as the DOM changes structurally under it -- appendChild counts,
+        innerHTML does not. xterm's DOM renderer rebuilds rows that way and
+        tmux repaints for every page, so the first page a swipe sent ended
+        the gesture that sent it. Held bytes arrive in order on release."""
+        self.assertEqual(self.run_js('''
+            var drawn = [];
+            term = { write: function (d) { drawn.push(d); } };
+            feed('a');                      // no gesture: straight through
+            holdWrites(true);
+            feed('b'); feed('c');
+            var during = drawn.slice();
+            holdWrites(false);
+            feed('d');
+            console.log(JSON.stringify([during, drawn]));'''),
+            [['a'], ['a', 'b', 'c', 'd']])
+
+    def test_a_gesture_that_never_ends_cannot_freeze_the_terminal(self):
+        """touchend and touchcancel release the hold; the timer is only a
+        backstop. Without it a lost release leaves a terminal that has
+        stopped drawing and no way for the user to know why."""
+        held = _extract(self.js, 'holdWrites')
+        self.assertIn('setTimeout', held)
+        self.assertIn('clearTimeout', held)
+        self.assertRegex(held, r'setTimeout\([^,]*,\s*(\d{4})\)')
+
+    def test_the_readout_cannot_kill_the_gesture_it_reports_on(self):
+        """textContent replaces an element's children, which is the exact
+        structural change that ends the cascade. nodeValue on a node made
+        once does not."""
+        readout = _extract(self.js, 'showDebug')
+        self.assertIn('nodeValue', readout)
+        self.assertNotIn('textContent', readout)
 
     def test_the_readout_exists_only_when_it_is_asked_for(self):
         """A permanent overlay across the top of a terminal costs a row and

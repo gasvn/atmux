@@ -99,7 +99,7 @@
     ws = new WebSocket(socketURL());
     ws.binaryType = 'arraybuffer';
     ws.onopen = function () { retry = 0; say('connected'); sendResize(); };
-    ws.onmessage = function (event) { term.write(new Uint8Array(event.data)); };
+    ws.onmessage = function (event) { feed(new Uint8Array(event.data)); };
     ws.onclose = function (event) {
       if (closed) return;
       // The program finished -- you detached, or quit the dashboard. Going
@@ -946,22 +946,65 @@
     return Math.max(64, host.getBoundingClientRect().height * 0.25);
   }
 
+  // ── iOS: a repaint during a drag kills the rest of the gesture ────────
+  // "During the touch event cascade, Safari iOS stops firing events when a
+  // DOM change takes place. Only DOM methods such as appendChild() count --
+  // innerHTML does not." (quirksmode, The iOS event cascade and innerHTML.)
+  //
+  // xterm's DOM renderer rebuilds its row elements exactly that way, and
+  // tmux repaints the whole screen for every page it scrolls. So the first
+  // page a swipe sent was also the last thing that gesture was allowed to
+  // do -- and with the old threshold, which needed most of a screen of
+  // travel, an unrelated repaint could end the gesture before the first
+  // page ever fired. Chromium has no such rule, which is why every headless
+  // run of this paged happily while a phone did nothing at all.
+  //
+  // So nothing reaches the renderer while a finger is down: the bytes are
+  // held and played out on release. The screen catches up in one step
+  // rather than live, which is what the gesture costs to exist here.
+  var held = [], holdTimer = 0;
+  function feed(data) {
+    if (holdTimer) held.push(data);
+    else term.write(data);
+  }
+  function holdWrites(on) {
+    if (on) {
+      if (holdTimer) clearTimeout(holdTimer);
+      // A backstop, not the mechanism: touchend and touchcancel release
+      // this. A gesture that somehow ends without either must not leave the
+      // terminal frozen, and no swipe lasts three seconds.
+      holdTimer = setTimeout(function () { holdWrites(false); }, 3000);
+      return;
+    }
+    if (holdTimer) clearTimeout(holdTimer);
+    holdTimer = 0;
+    var pending = held;
+    held = [];
+    pending.forEach(function (data) { term.write(data); });
+  }
+
   // ── a readout for a device you cannot attach a debugger to ────────────
   // Opt-in with ?debug=1, created only then. "Nothing happens" on someone
   // else's phone is otherwise indistinguishable between four different
   // faults: the events never arrived, the buffer is not what we think,
   // nothing published, or the drag never reached a step. This shows all
   // four, so the device answers instead of the next guess.
-  var debugBox = null;
+  var debugBox = null, debugText = null;
   if (/[?&]debug=1/.test(location.search)) {
     debugBox = document.createElement('div');
     debugBox.id = 'debug';
+    // Written through a text node's nodeValue, never textContent: assigning
+    // textContent replaces the element's children, and a structural change
+    // is precisely what ends a gesture on iOS. A readout that killed the
+    // thing it exists to measure would be worse than no readout.
+    debugText = document.createTextNode('');
+    debugBox.appendChild(debugText);
     document.getElementById('app').appendChild(debugBox);
   }
   var moves = 0;
   function showDebug(dy) {
-    if (!debugBox) return;
-    debugBox.textContent =
+    if (!debugText) return;
+    debugText.nodeValue =
       'mv ' + moves + '  dy ' + Math.round(dy) + '/' + Math.round(swipeStep())
       + '  buf ' + (bufferType() || '?') + '  pub ' + (published || '?')
       + '  kind ' + (swipeKind() || '-');
@@ -973,6 +1016,9 @@
   var pinchStart = 0, pinchFont = 0;
   var dragFrom = 0, swiped = false;
   host.addEventListener('touchstart', function (event) {
+    // Before anything else, and for a pinch as much as a swipe: both are
+    // gestures iOS will abandon the moment a row element is rebuilt.
+    holdWrites(true);
     if (event.touches.length === 2) {
       pinchStart = spread(event.touches);
       pinchFont = term.options.fontSize;
@@ -1015,6 +1061,7 @@
   ['touchend', 'touchcancel'].forEach(function (name) {
     host.addEventListener(name, function () {
       pinchStart = 0; swiped = false;
+      holdWrites(false);
     });
   });
   function spread(touches) {
