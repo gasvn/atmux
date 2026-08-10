@@ -78,7 +78,13 @@
        a vh-based cap would keep its full-screen height and leave the terminal
        no rows at all. */
     flex: 0 1 auto; display: flex; flex-direction: column; max-height: 62%;
-    background: #141418; border-top: 1px solid #2a2a30;
+    /* Lit from the terminal's edge and falling off downward, with a hairline
+       of light along the seam. Dark as a surface, not dark as an absence --
+       which is the difference between a panel and a hole in the page. */
+    background:
+      linear-gradient(180deg, #1b1b21 0%, #141418 42%, #101014 100%);
+    border-top: 1px solid #000;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055);
     padding-bottom: env(safe-area-inset-bottom);
     box-sizing: border-box;
     user-select: none; -webkit-user-select: none;
@@ -111,6 +117,13 @@
     user-select: none; -webkit-user-select: none; touch-action: none;
   }
   #hist[hidden] { display: none; }
+  /* Anyone who has asked the system for less motion gets the states without
+     the travel. The states are the information; the movement is manners. */
+  @media (prefers-reduced-motion: reduce) {
+    .key, #tabs button { transition: none; }
+    .key.down { transform: none; }
+    .key.armed { animation: none; }
+  }
   /* Created by app.js only under ?debug=1, so this styles nothing the rest
      of the time. pointer-events: none -- a readout that swallowed the very
      gesture it is reporting on would be worse than no readout. */
@@ -133,7 +146,15 @@
      same size as everything else. The 11px this used to run at existed only
      to squeeze ten keys into a single row, which also left them 33px wide --
      a quarter under the 44px minimum in the direction you aim. */
-  #nav .key { font-size: 13px; padding: 4px 5px; }
+  /* Equipment labelling: the modifier row is chrome, not content. Uppercase,
+     tracked out, and a shade cooler than the actions below it -- the two rows
+     did the same job visually before, which is why the pad read as one
+     undifferentiated slab of buttons. */
+  #nav .key {
+    font-size: 12px; padding: 4px 5px;
+    text-transform: uppercase; letter-spacing: .09em;
+    color: #b9b9c6;
+  }
   /* The arrows and Enter are glyphs, not words: they read at a size a word
      would not need, and they are the keys that repeat. */
   #nav .key.glyph { font-size: 18px; }
@@ -174,16 +195,36 @@
   .krow { display: flex; gap: 5px; margin-bottom: 5px; }
   .krow .key { flex: 1 1 0; min-width: 0; }
   .key.gap { background: none; border-color: transparent; }
+  /* ── the panel ────────────────────────────────────────────────────────
+     A terminal is an instrument, not an app, so the pad is built as one: a
+     key is a machined cap sitting proud of the surface, lit from above, with
+     a dark edge under it and its own shadow. That is also where interface
+     design went for 2026 -- depth and texture back after a decade of flat,
+     "pressable rather than symbolic" -- and it costs three gradients.
+
+     One accent, and it means one thing: mint says the next keystroke will
+     come out changed. Amber, on the history bar, says you are not live.
+     Nothing else is coloured, so both read at a glance in a dark room. */
   .key {
     min-height: 44px;                   /* Apple's minimum touch target */
     padding: 4px 5px;
-    background: #26262c; color: #e2e2e6; border: 1px solid #383840;
-    border-radius: 9px;
+    color: #e4e4ea;
+    background:
+      linear-gradient(180deg, #33333c 0%, #2a2a32 55%, #24242b 100%);
+    border: 1px solid #1a1a20;
+    border-radius: 10px;
+    /* Top highlight, bottom edge, cast shadow: the three lines that turn a
+       rectangle into something with a thickness. */
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.10),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.45),
+      0 1px 2px rgba(0, 0, 0, 0.55);
     /* The labels are the app's own descriptions -- "Auto-renew job", not a
        bare `k` -- so they wrap rather than clip. A truncated label is a
        button whose meaning you have to already know, which is the problem
        these replaced. */
     font: 11px/1.15 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .01em;
     white-space: normal; overflow-wrap: anywhere; hyphens: auto;
     -webkit-tap-highlight-color: transparent;
     /* Still none: the gesture stays ours, and app.js scrolls the drawer with
@@ -191,17 +232,55 @@
        button that is allowed its default takes focus, and losing focus closes
        the software keyboard -- right when you reached for the symbol row. */
     touch-action: none;
+    /* Transform and shadow only: both composite, so a key can depress while
+       the terminal is repainting without costing a layout. */
+    transition: transform 70ms ease-out, box-shadow 70ms ease-out,
+                background-color 70ms ease-out;
   }
-  .key.down { background: #4a4a58; border-color: #6f6f80; }
-  .key.on { background: #3c5a8a; border-color: #5b82bd; color: #fff; }
+  .key.gap {
+    background: none; border-color: transparent; box-shadow: none;
+  }
+  /* Pressed: the cap goes down into the panel. The cast shadow collapses and
+     the inner shadow inverts, which is what makes it read as travel rather
+     than as a colour change. */
+  .key.down {
+    transform: translateY(1px);
+    background: linear-gradient(180deg, #3d3d48 0%, #35353f 100%);
+    box-shadow:
+      inset 0 2px 4px rgba(0, 0, 0, 0.55),
+      inset 0 -1px 0 rgba(255, 255, 255, 0.05),
+      0 0 0 rgba(0, 0, 0, 0);
+  }
+  /* Locked until you clear it: filled, and lit, because it stays that way. */
+  .key.on {
+    color: #04140f;
+    background: linear-gradient(180deg, #6ef0c4 0%, #46d3a4 100%);
+    border-color: #2fae86;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),
+      0 0 12px rgba(70, 211, 164, 0.28),
+      0 1px 2px rgba(0, 0, 0, 0.5);
+  }
   /* Armed for one keystroke vs locked until you clear it. Two states that
      behave differently have to look different, or the row goes on typing
      control characters after you thought it had stopped: outlined for the
-     one-shot, filled (.on) for the lock. */
+     one-shot, filled for the lock. */
   .key.armed {
-    background: #26262c; border-color: #5b82bd; color: #9dc1f0;
-    box-shadow: inset 0 0 0 1px #5b82bd;
+    color: #7ff0cb;
+    border-color: #46d3a4;
+    box-shadow:
+      inset 0 0 0 1px #46d3a4,
+      inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      0 0 10px rgba(70, 211, 164, 0.18);
   }
+  /* One pulse when it arms, not a loop: it marks the moment the state
+     changed and then gets out of the way. A modifier that throbbed forever
+     would be an alarm. */
+  @keyframes armpulse {
+    from { box-shadow: inset 0 0 0 1px #46d3a4, 0 0 0 0 rgba(70,211,164,.55); }
+    to   { box-shadow: inset 0 0 0 1px #46d3a4, 0 0 0 9px rgba(70,211,164,0); }
+  }
+  .key.armed { animation: armpulse 340ms ease-out; }
   /* Choosing, not pressing. A key that looks the same in both modes is a key
      that types when you meant to keep it. */
   .key.choose { border-style: dashed; color: #a8a8b4; }
@@ -222,14 +301,32 @@
     flex: 0 0 auto;
     display: flex; gap: 6px; padding: 0 7px 7px; align-items: center;
   }
+  /* Settings, not keys: these change how the pad behaves rather than typing
+     anything, so they are cut INTO the panel where the caps sit ON it. Same
+     material, opposite relief -- which is the whole difference in one line of
+     shadow, and means nothing here can be mistaken for something that types.
+     */
   #tabs button {
     min-height: 34px; min-width: 40px; padding: 0 10px;
-    background: transparent; color: #8b8b95;
-    border: 1px solid #2e2e36; border-radius: 8px;
+    color: #8b8b95;
+    background: linear-gradient(180deg, #131317 0%, #17171c 100%);
+    border: 1px solid #000; border-radius: 8px;
+    box-shadow:
+      inset 0 1px 2px rgba(0, 0, 0, 0.5),
+      0 1px 0 rgba(255, 255, 255, 0.045);
     font: 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
     -webkit-tap-highlight-color: transparent;
+    transition: color 90ms ease-out, box-shadow 90ms ease-out;
   }
-  #tabs button.on { background: #2f2f3a; color: #e2e2e6; border-color: #4d4d5c; }
+  /* Engaged: lit from within rather than filled, so the row still reads as
+     recessed. */
+  #tabs button.on {
+    color: #7ff0cb;
+    box-shadow:
+      inset 0 1px 2px rgba(0, 0, 0, 0.5),
+      inset 0 0 0 1px rgba(70, 211, 164, 0.55),
+      0 0 8px rgba(70, 211, 164, 0.12);
+  }
   #tabs .spacer { flex: 1 1 auto; }
   #status {
     position: fixed; left: 50%; top: 8px; transform: translateX(-50%);
