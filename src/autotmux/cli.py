@@ -5645,6 +5645,30 @@ def _valid_select(target) -> tuple[str, str] | None:
     return node, session
 
 
+def _announce_external() -> None:
+    """Tell a browser client the screen is about to belong to tmux.
+
+    The dashboard says this in ``suspend()``, but a direct attach never
+    builds a dashboard: it hands the terminal to tmux and exits.  Without
+    this, the phone that tapped a session row — the single most common way
+    to reach tmux from a browser — is the one client that is never told what
+    is on the other end, and both its keys and its swipe have to guess.
+
+    Silent unless a client said it draws its own controls, so a terminal
+    never sees this: ``touch_mode`` is 'web' only when the web server set it.
+    """
+    if keypad.touch_mode() != 'web':
+        return
+    try:
+        sys.stdout.write(keypad.encode(
+            'external', keypad.EXTERNAL_KEYS, keypad.tmux_prefix()))
+        sys.stdout.flush()
+    except Exception:
+        # An attach that fails because a phone could not be told about a
+        # button is a worse outcome than a phone with the wrong buttons.
+        return
+
+
 def _direct_attach(target: str) -> int:
     """`atmux -a NODE:SESSION` — skip the TUI and attach directly.
 
@@ -5674,6 +5698,10 @@ def _direct_attach(target: str) -> int:
             sys.stderr.write(
                 'atmux: outer-tmux passthrough unavailable; use the outer '
                 'prefix twice for the inner tmux\n')
+    # After validation, before the handover: a target that was rejected above
+    # never reaches tmux, and announcing one that did not happen would leave
+    # the client holding tmux's keys in front of an error message.
+    _announce_external()
     try:
         with urlhandler.attached(node, session):
             if node == 'localhost':

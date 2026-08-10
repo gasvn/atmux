@@ -6,10 +6,12 @@ true: a key that types something other than its label, a control that
 survives into a screen it does not belong to, an order that buries the
 action the app itself considers primary.
 """
+import io
 import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -271,3 +273,90 @@ class TouchModeTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(keypad.touch_mode({keypad.TOUCH_ENV: value}),
                                  'local')
+
+
+class DirectAttachAnnouncementTests(unittest.TestCase):
+    """`atmux -a` hands the screen to tmux without ever building a dashboard.
+
+    Every other handover says so -- App.suspend publishes 'external' before
+    it yields -- but this one has no app to publish from, and it is the path
+    a phone takes when it taps a session row. A client that is never told
+    what is on the other end draws the wrong keys and has to refuse the
+    swipe, which is what it did until this existed.
+    """
+
+    def setUp(self):
+        from autotmux import cli
+        self.cli = cli
+        self.saved = os.environ.get(keypad.TOUCH_ENV)
+        if self.saved is not None:
+            del os.environ[keypad.TOUCH_ENV]
+
+    def tearDown(self):
+        os.environ.pop(keypad.TOUCH_ENV, None)
+        if self.saved is not None:
+            os.environ[keypad.TOUCH_ENV] = self.saved
+
+    def _announced(self):
+        stream = io.StringIO()
+        with mock.patch.object(self.cli.sys, 'stdout', stream):
+            self.cli._announce_external()
+        return stream.getvalue()
+
+    def test_a_web_client_is_told_the_screen_became_tmux(self):
+        os.environ[keypad.TOUCH_ENV] = 'web'
+        payload = keypad.decode(self._announced())
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['mode'], 'external')
+
+    def test_the_prefix_travels_with_it(self):
+        """The client builds its tmux chords from this. Sending the mode
+        without the prefix would leave every chord typing the default."""
+        os.environ[keypad.TOUCH_ENV] = 'web'
+        os.environ[keypad.TMUX_PREFIX_ENV] = 'C-a'
+        try:
+            payload = keypad.decode(self._announced())
+        finally:
+            del os.environ[keypad.TMUX_PREFIX_ENV]
+        self.assertEqual(payload['prefix'], '\x01')
+
+    def test_a_terminal_hears_nothing(self):
+        """This is bytes on the same pty as the screen. A client that did not
+        ask for it would be a terminal, and a terminal draws no buttons."""
+        for value in ('', 'local', '1'):
+            with self.subTest(value=value):
+                if value:
+                    os.environ[keypad.TOUCH_ENV] = value
+                else:
+                    os.environ.pop(keypad.TOUCH_ENV, None)
+                self.assertEqual(self._announced(), '')
+
+    def test_a_closed_pty_does_not_take_the_attach_down_with_it(self):
+        os.environ[keypad.TOUCH_ENV] = 'web'
+        broken = mock.Mock()
+        broken.write.side_effect = OSError('closed')
+        with mock.patch.object(self.cli.sys, 'stdout', broken):
+            self.cli._announce_external()          # must not raise
+
+    def test_the_attach_announces_before_handing_over(self):
+        """Order matters: tmux owns the terminal from the moment it starts,
+        and a client told afterwards spends the gap holding the app's keys."""
+        order = []
+        with mock.patch.object(self.cli, '_request_daemon_start'), \
+             mock.patch.object(self.cli, '_will_nest_tmux', return_value=False), \
+             mock.patch.object(self.cli, '_announce_external',
+                               side_effect=lambda: order.append('announce')), \
+             mock.patch.object(self.cli, '_run_user_command',
+                               side_effect=lambda *a: (order.append('attach'),
+                                                       (0, ''))[1]):
+            self.assertEqual(self.cli._direct_attach('localhost:main'), 0)
+        self.assertEqual(order, ['announce', 'attach'])
+
+    def test_a_rejected_target_announces_nothing(self):
+        """It never reaches tmux, so saying it did would leave the client
+        holding tmux's keys in front of an error message."""
+        with mock.patch.object(self.cli, '_announce_external') as announce:
+            for target in ('nocolon', ':session', 'node:', 'bad node:s'):
+                with self.subTest(target=target):
+                    self.assertEqual(self.cli._direct_attach(target), 2)
+        announce.assert_not_called()
