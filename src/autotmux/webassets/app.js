@@ -329,6 +329,10 @@
   // see the OSC handler -- because `set -g prefix C-a` is a thing people do
   // and nothing on the wire announces it.
   var prefixSeq = '\x02';
+  // The last mode the app published: 'app' (the dashboard is drawing) or
+  // 'external' (it has handed the screen to tmux). Read by swipeKind, which
+  // has to know which of the two is listening.
+  var published = '';
   var TMUX_VERBS = [
     { l: 'detach', s: 'd' },
     { l: 'new win', s: 'c' },
@@ -802,6 +806,10 @@
       prefixSeq = data.prefix;
       renderKeys();
     }
+    // Who is on the other end. Not used for drawing -- used for deciding what
+    // a swipe means, because the dashboard and tmux want different keys and
+    // sending one the other's is worse than sending nothing. See swipeKind.
+    if (data.mode === 'app' || data.mode === 'external') published = data.mode;
     setKeys(data.keys.filter(function (entry) {
       return entry && typeof entry.k === 'string' && entry.k
           && typeof entry.l === 'string' && entry.l
@@ -872,23 +880,111 @@
     });
   }
 
+  // ── swiping the terminal ──────────────────────────────────────────────
+  // Three different things own the scrollback, so one gesture has to mean
+  // three different things -- and sending the wrong one is much worse than
+  // sending nothing. Measured, all three:
+  //
+  //   normal buffer   xterm holds it. Shift+PageUp moved the top row from
+  //                   245 to 77, so it is still rendered in xterm 6 even
+  //                   though the scrollable <div> is gone.
+  //   tmux            xterm holds *nothing* -- the alternate buffer is
+  //                   repainted whole every frame. tmux holds it, in
+  //                   history-limit, and `prefix PageUp` is tmux's own
+  //                   default binding for reaching it (copy-mode -u). With
+  //                   mouse off, 400 lines of history: 346 -> 292 [54/346]
+  //                   -> 238 [108/346], PageDown back, q returns to live.
+  //   the dashboard   Textual, not tmux. PageUp/PageDown scroll it; \x02
+  //                   would mean something else entirely.
+  //
+  // The tempting fourth option is a wheel event, and it is a trap. In the
+  // alternate buffer with mouse reporting off -- which is tmux's default and
+  // this user's setting -- xterm translates a wheel into ARROW KEYS: measured
+  // \x1bOA / \x1bOB going out and nothing scrolling. That walks the shell's
+  // command history, one Enter away from re-running something.
+  function bufferType() {
+    try {
+      var type = term.buffer.active.type;
+      return typeof type === 'string' ? type : '';
+    } catch (e) { return ''; }
+  }
+
+  // '' means send nothing. Everything unrecognised lands here on purpose: an
+  // unknown program, a renamed API, a mode nobody published. The failure mode
+  // of this check has to be "behaves like it did yesterday", never a guess.
+  function swipeKind() {
+    var type = bufferType();
+    if (type === 'normal') return 'local';
+    if (type !== 'alternate') return '';
+    if (published === 'external') return 'tmux';
+    if (published === 'app') return 'keys';
+    return '';
+  }
+
+  function swipePage(up) {
+    var kind = swipeKind();
+    if (kind === 'local') {
+      // Stays in the browser: nothing reaches the program at all.
+      try { term.scrollLines(up ? -term.rows : term.rows); } catch (e) {}
+    } else if (kind === 'tmux') {
+      // Idempotent: pressed again inside copy-mode it simply scrolls another
+      // page, so there is no state here to track and get wrong.
+      sendText(up ? prefixSeq + '\x1b[5~' : '\x1b[6~');
+    } else if (kind === 'keys') {
+      sendText(up ? '\x1b[5~' : '\x1b[6~');
+    }
+    if (kind) haptic();
+    return !!kind;
+  }
+
+  // A page per screen-height of drag, so the gesture moves what you can see
+  // by what you can see. The same unit the PgUp key sends, which is why a
+  // swipe and a tap agree rather than being two different scroll speeds.
+  function swipeStep() {
+    return Math.max(80, host.getBoundingClientRect().height * 0.5);
+  }
+
   // Pinch to zoom the font. The page itself must not zoom -- a zoomed viewport
   // makes a terminal unreadable and unscrollable at once -- so this is the
   // only zoom available, and it is the one that helps.
   var pinchStart = 0, pinchFont = 0;
+  var dragFrom = 0, swiped = false;
   host.addEventListener('touchstart', function (event) {
     if (event.touches.length === 2) {
       pinchStart = spread(event.touches);
       pinchFont = term.options.fontSize;
+      swiped = false;
+    } else if (event.touches.length === 1) {
+      dragFrom = event.touches[0].clientY;
+      swiped = false;
     }
   }, { passive: true });
   host.addEventListener('touchmove', function (event) {
     if (event.touches.length === 2 && pinchStart > 0) {
       event.preventDefault();
       setFont(pinchFont * (spread(event.touches) / pinchStart));
+      return;
     }
+    if (event.touches.length !== 1 || pinchStart > 0) return;
+    var step = swipeStep();
+    // Dragging down uncovers what is above, which is a page up.
+    while (event.touches[0].clientY - dragFrom >= step) {
+      dragFrom += step;
+      if (!swipePage(true)) return;
+      swiped = true;
+    }
+    while (dragFrom - event.touches[0].clientY >= step) {
+      dragFrom -= step;
+      if (!swipePage(false)) return;
+      swiped = true;
+    }
+    // Only once the gesture is ours. Claiming it before then would take the
+    // one the browser might still want.
+    if (swiped) event.preventDefault();
   }, { passive: false });
-  host.addEventListener('touchend', function () { pinchStart = 0; });
+  host.addEventListener('touchend', function () {
+    pinchStart = 0; swiped = false;
+  });
   function spread(touches) {
     var dx = touches[0].clientX - touches[1].clientX;
     var dy = touches[0].clientY - touches[1].clientY;

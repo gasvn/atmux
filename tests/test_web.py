@@ -1475,12 +1475,14 @@ class KeypadVocabularyTests(unittest.TestCase):
     """
 
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
-    FUNCTIONS = ('ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
+    FUNCTIONS = ('bufferType', 'swipeKind', 'swipePage',
+                 'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
                  'renderRows', 'recolumn', 'renderNav', 'renderPins',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
-    SCALARS = ('var OFF =', 'var ROWS_COLLAPSED =', 'var KEY_TARGET =',
+    SCALARS = ('var published =', 'var OFF =', 'var ROWS_COLLAPSED =',
+               'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
                'var prefixSeq =', 'var PINS =', 'var pins =',
                'var PAD_STATE =')
@@ -1934,6 +1936,106 @@ class KeypadVocabularyTests(unittest.TestCase):
             var key = keyLabelled(pinRow, 'detach');
             key.emit('pointerdown', {}); key.emit('pointerup', {});
             console.log(JSON.stringify(sent));'''), ['\x02d'])
+
+    # ── swiping the terminal ──────────────────────────────────────────────
+
+    def swipe(self, buffer_type, mode, up=True):
+        """One swipe, with the terminal in a stated condition."""
+        return self.run_js(f'''
+            sent = [];
+            published = {json.dumps(mode)};
+            term = {{
+              rows: 40,
+              scrollLines: function (n) {{ sent.push('scrollLines:' + n); }},
+              buffer: {{ active: {{ type: {json.dumps(buffer_type)} }} }}
+            }};
+            var acted = swipePage({json.dumps(bool(up))});
+            console.log(JSON.stringify([swipeKind(), acted, sent]));''')
+
+    def test_a_plain_shell_scrolls_without_the_program_hearing_anything(self):
+        """xterm holds that scrollback -- measured, Shift+PageUp moved the top
+        row from 245 to 77 -- so this never reaches the wire at all."""
+        self.assertEqual(self.swipe('normal', ''),
+                         ['local', True, ['scrollLines:-40']])
+        self.assertEqual(self.swipe('normal', '', up=False),
+                         ['local', True, ['scrollLines:40']])
+
+    def test_tmux_is_asked_the_way_tmux_asks_itself(self):
+        """prefix+PageUp is tmux's own default binding (copy-mode -u) and
+        needs no `mouse on`. Measured against tmux 3.6a with mouse off and
+        400 lines of history: top row 346 -> 292 [54/346] -> 238 [108/346],
+        PageDown back, q returns to live."""
+        self.assertEqual(self.swipe('alternate', 'external'),
+                         ['tmux', True, ['\x02\x1b[5~']])
+        self.assertEqual(self.swipe('alternate', 'external', up=False),
+                         ['tmux', True, ['\x1b[6~']])
+
+    def test_the_dashboard_is_not_tmux_and_is_not_sent_a_prefix(self):
+        """Textual would make its own sense of \\x02, and none of it is
+        'scroll up'."""
+        self.assertEqual(self.swipe('alternate', 'app'),
+                         ['keys', True, ['\x1b[5~']])
+        self.assertEqual(self.swipe('alternate', 'app', up=False),
+                         ['keys', True, ['\x1b[6~']])
+
+    def test_an_unrecognised_state_sends_nothing_at_all(self):
+        """The safety argument for the whole feature. In the alternate buffer
+        with mouse reporting off -- tmux's default -- a wheel event becomes
+        ARROW KEYS: measured, \\x1bOA / \\x1bOB going out and nothing
+        scrolling, which walks the shell's command history one Enter away
+        from re-running something. Every case this cannot positively identify
+        has to land here instead of guessing."""
+        for buffer_type, mode in (('alternate', ''),
+                                  ('alternate', 'nonsense'),
+                                  ('', 'external'),
+                                  ('', ''),
+                                  ('something-new', 'external')):
+            with self.subTest(buffer=buffer_type, mode=mode):
+                self.assertEqual(self.swipe(buffer_type, mode),
+                                 ['', False, []])
+
+    def test_the_handover_is_recorded_so_a_swipe_knows_who_is_listening(self):
+        """The wire says nothing else about who is drawing, and the dashboard
+        and tmux want different keys for the same gesture.
+
+        Measured broken end to end before this line existed: on
+        `/console/?attach=NODE:SESSION` the mode was never recorded, so
+        swipeKind() saw '' and every swipe on the attach path -- the one a
+        phone takes when it taps a session row -- refused. The other half of
+        that fix is cli._announce_external, which is what sends this.
+        """
+        handler = self.js[self.js.index('registerOscHandler'):]
+        handler = handler[handler.index('{') + 1:handler.index('return true;\n  });')]
+        self.assertEqual(self.run_js(f'''
+            var seen = [];
+            function renderKeys() {{}}
+            function setKeys() {{}}
+            function osc(payload) {{ {handler} return true; }}
+            ['external', 'app', 'nonsense', ''].forEach(function (mode) {{
+              osc(JSON.stringify({{mode: mode, keys: []}}));
+              seen.push(published);
+            }});
+            console.log(JSON.stringify(seen));'''),
+            # The last two never happened: an unknown mode leaves the last
+            # known one standing rather than resetting to "cannot tell".
+            ['external', 'app', 'app', 'app'])
+
+    def test_a_terminal_that_cannot_be_asked_reads_as_unknown(self):
+        """A renamed or removed API must fail closed, not throw and not come
+        back as a truthy string."""
+        self.assertEqual(self.run_js('''
+            term = {};
+            var a = bufferType();
+            term = { buffer: { active: {} } };
+            var b = bufferType();
+            term = { get buffer() { throw new Error('gone'); } };
+            var c = bufferType();
+            console.log(JSON.stringify([a, b, c]));'''), ['', '', ''])
+
+    def test_the_swipe_and_the_key_move_by_the_same_amount(self):
+        """A swipe that scrolled by some other unit than the PgUp button would
+        be two scroll speeds for one screen."""
+        self.assertIn('term.rows', _extract(self.js, 'swipePage'))
 
     # ── getting out of the way ────────────────────────────────────────────
 
