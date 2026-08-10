@@ -94,6 +94,15 @@
     opacity: 0 !important; z-index: 5;
     resize: none; border: 0; padding: 0;
   }
+  /* Created by app.js only under ?debug=1, so this styles nothing the rest
+     of the time. pointer-events: none -- a readout that swallowed the very
+     gesture it is reporting on would be worse than no readout. */
+  #debug {
+    position: fixed; left: 0; right: 0; top: 0; z-index: 20;
+    font: 11px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+    text-align: center; color: #9fe8a0; background: rgba(0, 0, 0, 0.72);
+    pointer-events: none;
+  }
   /* Movement sits closest to the thumb and stays put. Nothing below it may
      reflow it: a navigation key that moves because the app published a
      different number of actions is a key you have to look for every time. */

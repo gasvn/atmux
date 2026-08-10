@@ -1451,6 +1451,11 @@ var localStorage = {
   setItem: function (k, v) { store[k] = String(v); },
   removeItem: function (k) { delete store[k]; }
 };
+// A browser global like the two above it. The page reads it once, to decide
+// whether ?debug=1 asked for the readout; without it the module throws on
+// load and every test in here fails for a reason that has nothing to do
+// with what it is testing.
+var location = { search: '' };
 function say() {}
 function refit() {}
 function haptic() {}
@@ -1497,13 +1502,15 @@ class KeypadVocabularyTests(unittest.TestCase):
     """
 
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
-    FUNCTIONS = ('bufferType', 'swipeKind', 'swipePage',
+    FUNCTIONS = ('bufferType', 'swipeKind', 'swipePage', 'swipeStep',
+                 'showDebug',
                  'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
                  'renderRows', 'recolumn', 'renderNav', 'renderPins',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
-    SCALARS = ('var published =', 'var OFF =', 'var ROWS_COLLAPSED =',
+    SCALARS = ('var published =', 'var debugBox =', 'var moves =',
+               'var OFF =', 'var ROWS_COLLAPSED =',
                'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
                'var prefixSeq =', 'var PINS =', 'var pins =',
@@ -2053,6 +2060,40 @@ class KeypadVocabularyTests(unittest.TestCase):
             term = { get buffer() { throw new Error('gone'); } };
             var c = bufferType();
             console.log(JSON.stringify([a, b, c]));'''), ['', '', ''])
+
+    def test_one_page_is_a_distance_a_thumb_actually_travels(self):
+        """It was half the terminal height: ~350px on an iPhone with the pad
+        collapsed, which is most of the screen. Nothing fired until you had
+        crossed it, so the gesture read as dead -- the headless run only
+        worked because it dragged 400px on purpose."""
+        self.assertEqual(self.run_js('''
+            host = { getBoundingClientRect: function () { return this.h; } };
+            var seen = [];
+            [800, 700, 320, 120].forEach(function (h) {
+              host.h = { height: h };
+              seen.push(Math.round(swipeStep()));
+            });
+            console.log(JSON.stringify(seen));'''), [200, 175, 80, 64])
+
+    def test_the_readout_exists_only_when_it_is_asked_for(self):
+        """A permanent overlay across the top of a terminal costs a row and
+        buys nothing once the answer is known."""
+        # The element is built inside the guard, not built and then hidden:
+        # a permanent node over the terminal is a row someone paid for.
+        guard = self.js[self.js.index('var debugBox'):]
+        guard = guard[:guard.index('createElement')]
+        self.assertIn('/[?&]debug=1/.test(location.search)', guard)
+        self.assertEqual(self.run_js('''
+            var re = /[?&]debug=1/;
+            console.log(JSON.stringify(['?debug=1', '?attach=a:b&debug=1',
+                                        '', '?attach=a:b', '?nodebug=1']
+              .map(function (q) { return re.test(q); })));'''),
+            [True, True, False, False, False])
+        # It reports what the branch table reads, not a restatement of it.
+        readout = _extract(self.js, 'showDebug')
+        for value in ('bufferType()', 'published', 'swipeKind()', 'swipeStep()'):
+            with self.subTest(value=value):
+                self.assertIn(value, readout)
 
     def test_the_swipe_and_the_key_move_by_the_same_amount(self):
         """A swipe that scrolled by some other unit than the PgUp button would

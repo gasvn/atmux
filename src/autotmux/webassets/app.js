@@ -937,11 +937,34 @@
     return !!kind;
   }
 
-  // A page per screen-height of drag, so the gesture moves what you can see
-  // by what you can see. The same unit the PgUp key sends, which is why a
-  // swipe and a tap agree rather than being two different scroll speeds.
+  // How far a thumb has to travel for one page. This was half the terminal
+  // height, which on an iPhone with the pad collapsed is ~350px -- further
+  // than a flick goes, so nothing ever fired and the whole gesture read as
+  // dead. A quarter is a swipe someone actually makes; the floor is for the
+  // short terminal left when the drawer is open.
   function swipeStep() {
-    return Math.max(80, host.getBoundingClientRect().height * 0.5);
+    return Math.max(64, host.getBoundingClientRect().height * 0.25);
+  }
+
+  // ── a readout for a device you cannot attach a debugger to ────────────
+  // Opt-in with ?debug=1, created only then. "Nothing happens" on someone
+  // else's phone is otherwise indistinguishable between four different
+  // faults: the events never arrived, the buffer is not what we think,
+  // nothing published, or the drag never reached a step. This shows all
+  // four, so the device answers instead of the next guess.
+  var debugBox = null;
+  if (/[?&]debug=1/.test(location.search)) {
+    debugBox = document.createElement('div');
+    debugBox.id = 'debug';
+    document.getElementById('app').appendChild(debugBox);
+  }
+  var moves = 0;
+  function showDebug(dy) {
+    if (!debugBox) return;
+    debugBox.textContent =
+      'mv ' + moves + '  dy ' + Math.round(dy) + '/' + Math.round(swipeStep())
+      + '  buf ' + (bufferType() || '?') + '  pub ' + (published || '?')
+      + '  kind ' + (swipeKind() || '-');
   }
 
   // Pinch to zoom the font. The page itself must not zoom -- a zoomed viewport
@@ -957,6 +980,8 @@
     } else if (event.touches.length === 1) {
       dragFrom = event.touches[0].clientY;
       swiped = false;
+      moves = 0;
+      showDebug(0);
     }
   }, { passive: true });
   host.addEventListener('touchmove', function (event) {
@@ -967,6 +992,8 @@
     }
     if (event.touches.length !== 1 || pinchStart > 0) return;
     var step = swipeStep();
+    moves += 1;
+    showDebug(event.touches[0].clientY - dragFrom);
     // Dragging down uncovers what is above, which is a page up.
     while (event.touches[0].clientY - dragFrom >= step) {
       dragFrom += step;
