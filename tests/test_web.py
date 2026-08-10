@@ -1508,9 +1508,10 @@ class KeypadVocabularyTests(unittest.TestCase):
     """
 
     TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
-    FUNCTIONS = ('bufferType', 'swipeKind', 'swipePage', 'swipeStep',
+    FUNCTIONS = ('bufferType', 'swipeKind',
                  'showDebug', 'feed', 'holdWrites', 'flushHeld', 'flushSoon',
-                 'stepNow', 'typed', 'paintHistory', 'enterHistory',
+                 'swipeBy', 'lineHeight',
+                 'typed', 'paintHistory', 'enterHistory',
                  'leaveHistory',
                  'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
@@ -1518,7 +1519,8 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'renderRows', 'recolumn', 'renderNav', 'renderPins',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
-               'var held =', 'var FIRST_PAGE =', 'var scrolledBack =',
+               'var held =', 'var SLOP =', 'var scrolledBack =',
+               'var mouseOn =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var KEY_TARGET =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
@@ -2006,26 +2008,28 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     # ── swiping the terminal ──────────────────────────────────────────────
 
-    def swipe(self, buffer_type, mode, up=True):
-        """One swipe, with the terminal in a stated condition."""
+    def swipe(self, buffer_type, mode, lines=3):
+        """One swipe of `lines` rows, with the terminal in a stated state."""
         return self.run_js(f'''
             sent = [];
+            scrolledBack = false;
+            mouseOn = false;
             published = {json.dumps(mode)};
             term = {{
               rows: 40,
               scrollLines: function (n) {{ sent.push('scrollLines:' + n); }},
               buffer: {{ active: {{ type: {json.dumps(buffer_type)} }} }}
             }};
-            var acted = swipePage({json.dumps(bool(up))});
+            var acted = swipeBy({json.dumps(int(lines))});
             console.log(JSON.stringify([swipeKind(), acted, sent]));''')
 
     def test_a_plain_shell_scrolls_without_the_program_hearing_anything(self):
         """xterm holds that scrollback -- measured, Shift+PageUp moved the top
         row from 245 to 77 -- so this never reaches the wire at all."""
         self.assertEqual(self.swipe('normal', ''),
-                         ['local', True, ['scrollLines:-40']])
-        self.assertEqual(self.swipe('normal', '', up=False),
-                         ['local', True, ['scrollLines:40']])
+                         ['local', True, ['scrollLines:-3']])
+        self.assertEqual(self.swipe('normal', '', lines=-3),
+                         ['local', True, ['scrollLines:3']])
 
     def test_tmux_is_asked_the_way_tmux_asks_itself(self):
         """prefix+PageUp is tmux's own default binding (copy-mode -u) and
@@ -2033,17 +2037,41 @@ class KeypadVocabularyTests(unittest.TestCase):
         400 lines of history: top row 346 -> 292 [54/346] -> 238 [108/346],
         PageDown back, q returns to live."""
         self.assertEqual(self.swipe('alternate', 'external'),
-                         ['tmux', True, ['\x02\x1b[5~']])
-        self.assertEqual(self.swipe('alternate', 'external', up=False),
-                         ['tmux', True, ['\x1b[6~']])
+                         ['tmux', True,
+                          ['\x02[', '\x1b[1;5A\x1b[1;5A\x1b[1;5A']])
+        # Down only means something once you are up in the history; from
+        # live there is nothing below to reach for.
+        self.assertEqual(self.run_js("""
+            sent = []; scrolledBack = false; published = 'external';
+            term = { rows: 40, buffer: { active: { type: 'alternate' } } };
+            swipeBy(4); sent = []; swipeBy(-2);
+            console.log(JSON.stringify(sent));"""),
+            ['\x1b[1;5B\x1b[1;5B'])
 
     def test_the_dashboard_is_not_tmux_and_is_not_sent_a_prefix(self):
         """Textual would make its own sense of \\x02, and none of it is
         'scroll up'."""
-        self.assertEqual(self.swipe('alternate', 'app'),
+        # A screen of travel, because Textual's arrows move the selection
+        # that decides what Enter attaches to -- not a viewport.
+        self.assertEqual(self.swipe('alternate', 'app', lines=40),
                          ['keys', True, ['\x1b[5~']])
-        self.assertEqual(self.swipe('alternate', 'app', up=False),
-                         ['keys', True, ['\x1b[6~']])
+        self.assertEqual(self.swipe('alternate', 'app', lines=3),
+                         ['keys', True, []])
+
+    def test_the_mouse_branch_reads_the_sequence_that_turns_it_on(self):
+        """xterm 6 removed term.modes and reading it throws, so this watches
+        DECSET directly. 1000/1002/1003 are the ones that mean the program
+        wants events; 1005/1006/1015 only pick an encoding."""
+        setup = self.js[self.js.index('var mouseOn'):]
+        setup = setup[:setup.index('function bufferType')]
+        for mode in ('1000', '1002', '1003'):
+            with self.subTest(mode=mode):
+                self.assertIn(mode, setup)
+        for encoding in ('1005', '1006', '1015'):
+            with self.subTest(encoding=encoding):
+                self.assertNotIn(encoding, setup)
+        # Returning false leaves xterm to act on the sequence as well.
+        self.assertIn('return false', setup)
 
     def test_an_unrecognised_state_sends_nothing_at_all(self):
         """The safety argument for the whole feature. In the alternate buffer
@@ -2099,44 +2127,11 @@ class KeypadVocabularyTests(unittest.TestCase):
             var c = bufferType();
             console.log(JSON.stringify([a, b, c]));'''), ['', '', ''])
 
-    def test_one_page_is_a_distance_a_thumb_actually_travels(self):
-        """It was half the terminal height: ~350px on an iPhone with the pad
-        collapsed, which is most of the screen. Nothing fired until you had
-        crossed it, so the gesture read as dead -- the headless run only
-        worked because it dragged 400px on purpose."""
-        self.assertEqual(self.run_js('''
-            host = { getBoundingClientRect: function () { return this.h; } };
-            var seen = [];
-            [800, 700, 320, 120].forEach(function (h) {
-              host.h = { height: h };
-              seen.push(Math.round(swipeStep()));
-            });
-            console.log(JSON.stringify(seen));'''), [200, 175, 80, 64])
-
-    def test_the_first_page_of_a_gesture_comes_cheap(self):
-        """A quarter of the terminal is fair for a *second* page and dead as
-        the price of any response at all: the readout from the phone this is
-        for showed a flick delivering 57px against a 167px threshold, so
-        nothing happened. Above tap slop, so no tap becomes a page."""
-        got = self.run_js('''
-            host = { getBoundingClientRect: function () { return {height: 668}; } };
-            swiped = false; var first = Math.round(stepNow());
-            swiped = true;  var rest = Math.round(stepNow());
-            // A terminal shorter than the cheap first page must not make the
-            // first page cost more than the ones after it.
-            host = { getBoundingClientRect: function () { return {height: 100}; } };
-            swiped = false; var tiny = Math.round(stepNow());
-            console.log(JSON.stringify([first, rest, tiny]));''')
-        self.assertEqual(got, [44, 167, 44])
-        self.assertGreater(got[0], 10, 'must not fire on a tap')
-        self.assertLessEqual(got[2], 64, 'never more than the full step')
-
-    # ── reading history is a state ────────────────────────────────────────
-
     def history(self, body):
         """The bar, with hist wired up and the terminal in tmux."""
         return self.run_js('''
             sent = [];
+            mouseOn = false;
             var shown = [];
             hist = new El('div');
             hist.hidden = true;
@@ -2158,15 +2153,15 @@ class KeypadVocabularyTests(unittest.TestCase):
         stays there through a swipe back to the bottom, across a detach, and
         for every keystroke after -- a typed `echoXYZ` produced nothing at
         all. The screen looks live and is not."""
-        sent, back, label = self.history('swipePage(true);')
-        self.assertEqual(sent, ['\x02\x1b[5~'])
+        sent, back, label = self.history('swipeBy(3);')
+        self.assertEqual(sent, ['\x02[', '\x1b[1;5A' * 3])
         self.assertTrue(back)
-        self.assertIn('页', label)              # the drag's own count first
+        self.assertIn('行', label)              # the drag's own count first
 
     def test_the_bar_is_the_way_back_to_live(self):
         """q is copy-mode's cancel in both key tables."""
         sent, back, label = self.history('''
-            swipePage(true); sent = []; leaveHistory();''')
+            swipeBy(3); sent = []; leaveHistory();''')
         self.assertEqual(sent, ['q'])
         self.assertFalse(back)
         self.assertEqual(label, '')
@@ -2177,23 +2172,29 @@ class KeypadVocabularyTests(unittest.TestCase):
         reading, so no sequence of taps can strand you in a mode that eats
         your keystrokes."""
         sent, back, _ = self.history('''
-            swipePage(true); sent = []; typed('l'); typed('s');''')
+            swipeBy(3); sent = []; typed('l'); typed('s');''')
         self.assertEqual(sent, ['q', 'l', 's'])
         self.assertFalse(back)
 
     def test_leaving_twice_does_not_send_q_twice(self):
         """A stray q reaches the shell as a character."""
         sent, _, _ = self.history('''
-            swipePage(true); sent = [];
+            swipeBy(3); sent = [];
             leaveHistory(); leaveHistory(); typed('x');''')
         self.assertEqual(sent, ['q', 'x'])
 
-    def test_a_swipe_down_from_live_claims_nothing(self):
-        """Paging down at the bottom is not entering history, and a bar that
-        appeared for it would be lying about where you are."""
-        sent, back, _ = self.history('swipePage(false);')
-        self.assertEqual(sent, ['\x1b[6~'])
+    def test_a_swipe_down_from_live_reaches_for_nothing(self):
+        """There is nothing below the bottom of the scrollback. Entering
+        copy-mode to look would put you in a mode you did not ask for, to be
+        shown the screen you were already on."""
+        sent, back, _ = self.history('swipeBy(-3);')
+        self.assertEqual(sent, [])
         self.assertFalse(back)
+
+    def test_a_swipe_down_inside_history_scrolls_back_toward_live(self):
+        sent, back, _ = self.history('swipeBy(3); sent = []; swipeBy(-2);')
+        self.assertEqual(sent, ['\x1b[1;5B' * 2])
+        self.assertTrue(back)
 
     def test_nothing_is_drawn_while_a_finger_is_down(self):
         """Safari iOS stops firing touch events for the rest of a gesture as
@@ -2232,11 +2233,21 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertIn('white-space: normal', rule)
         self.assertNotIn('nowrap', rule)
 
-    def test_the_readout_names_the_threshold_actually_in_force(self):
-        """It shows dy against a number the drag has to cross. Showing the
-        full step while the cheap first page is what applies would say the
-        gesture was 100px short when it was about to fire."""
-        self.assertIn('stepNow()', _extract(self.js, 'showDebug'))
+    def test_the_readout_names_the_unit_actually_in_force(self):
+        """dy is shown against the distance one line costs, which is what the
+        drag is now measured in."""
+        self.assertIn('lineHeight()', _extract(self.js, 'showDebug'))
+
+    def test_a_line_is_a_row_of_the_terminal(self):
+        """What makes this scrolling rather than paging: the content moves by
+        exactly as many rows as the finger crossed."""
+        self.assertEqual(self.run_js('''
+            term = { rows: 40 };
+            host = { getBoundingClientRect: function () { return {height: 800}; } };
+            var normal = lineHeight();
+            host = { getBoundingClientRect: function () { return {height: 0}; } };
+            var degenerate = lineHeight();
+            console.log(JSON.stringify([normal, degenerate]));'''), [20, 6])
 
     def test_the_readout_cannot_kill_the_gesture_it_reports_on(self):
         """textContent replaces an element's children, which is the exact
@@ -2262,14 +2273,20 @@ class KeypadVocabularyTests(unittest.TestCase):
             [True, True, False, False, False])
         # It reports what the branch table reads, not a restatement of it.
         readout = _extract(self.js, 'showDebug')
-        for value in ('bufferType()', 'published', 'swipeKind()', 'stepNow()'):
+        for value in ('bufferType()', 'published', 'swipeKind()', 'lineHeight()'):
             with self.subTest(value=value):
                 self.assertIn(value, readout)
 
-    def test_the_swipe_and_the_key_move_by_the_same_amount(self):
-        """A swipe that scrolled by some other unit than the PgUp button would
-        be two scroll speeds for one screen."""
-        self.assertIn('term.rows', _extract(self.js, 'swipePage'))
+    def test_the_content_follows_the_finger_row_for_row(self):
+        """Paging was chosen because `prefix PageUp` enters copy-mode and
+        scrolls in one keystroke, and that convenience is exactly why reading
+        back felt like jumping. C-Up is one line -- measured through
+        #{scroll_position}: five presses gave 5, three back gave 2, while one
+        PageUp jumped 41."""
+        body = _extract(self.js, 'swipeBy')
+        self.assertIn('\\x1b[1;5A', body)
+        self.assertIn('\\x1b[1;5B', body)
+        self.assertNotIn('\\x1b[5~\'', body.split("kind === 'keys'")[0])
 
     # ── getting out of the way ────────────────────────────────────────────
 

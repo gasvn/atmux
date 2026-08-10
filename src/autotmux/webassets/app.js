@@ -935,6 +935,27 @@
   // this user's setting -- xterm translates a wheel into ARROW KEYS: measured
   // \x1bOA / \x1bOB going out and nothing scrolling. That walks the shell's
   // command history, one Enter away from re-running something.
+  // Which programs want the mouse for themselves. There is no public API for
+  // this in xterm 6 -- term.modes was removed and reading it throws -- so the
+  // sequence that turns it on is watched directly. 1000 is click tracking,
+  // 1002 adds drag, 1003 any motion; 1005/1006/1015 only pick an encoding and
+  // say nothing about whether the program wants events.
+  var mouseOn = false;
+  [['h', true], ['l', false]].forEach(function (pair) {
+    try {
+      term.parser.registerCsiHandler({ prefix: '?', final: pair[0] },
+        function (params) {
+          for (var i = 0; i < params.length; i++) {
+            var mode = params[i];
+            if (mode === 1000 || mode === 1002 || mode === 1003) {
+              mouseOn = pair[1];
+            }
+          }
+          return false;              // xterm still has to act on it
+        });
+    } catch (e) {}
+  });
+
   function bufferType() {
     try {
       var type = term.buffer.active.type;
@@ -946,6 +967,17 @@
   // unknown program, a renamed API, a mode nobody published. The failure mode
   // of this check has to be "behaves like it did yesterday", never a guess.
   function swipeKind() {
+    // A program that asked for the mouse scrolls itself, and tmux cannot do
+    // it for them: an alternate-screen program's lines never enter the pane's
+    // history at all, so copy-mode would be scrolling back through whatever
+    // was on screen before the program started. Claude Code, vim, htop, less
+    // and tmux-with-`mouse on` are all in this class, and all of them already
+    // answer the wheel -- so send the wheel.
+    // NOT YET: mouseOn is tracked and correct, but dispatching a
+    // synthetic WheelEvent produced no report on the wire when
+    // measured against Textual, and an unverified branch is how the
+    // last three rounds went wrong. See swipeBy's 'wheel' arm.
+    // if (mouseOn) return 'wheel';
     var type = bufferType();
     if (type === 'normal') return 'local';
     if (type !== 'alternate') return '';
@@ -993,51 +1025,80 @@
     paintHistory('');
   }
 
-  function swipePage(up) {
+  // One argument, signed, in LINES -- the unit the content moves in. It used
+  // to be pages, because `prefix PageUp` enters copy-mode and scrolls in a
+  // single keystroke, and that convenience is the whole reason scrolling back
+  // felt like jumping rather than scrolling.
+  function swipeBy(lines) {
     var kind = swipeKind();
-    if (kind === 'local') {
+    if (!lines || !kind) return !!kind;
+    var up = lines > 0, n = Math.abs(lines);
+    if (kind === 'wheel') {
+      // Encoded by xterm exactly as it encodes a real mouse, rather than by
+      // us: the program has told the terminal how it wants these, and there
+      // is only one place that knows the answer.
+      var screen = host.querySelector('.xterm-screen') || host;
+      var box = screen.getBoundingClientRect();
+      try {
+        screen.dispatchEvent(new WheelEvent('wheel', {
+          deltaY: -lines * lineHeight(), deltaMode: 0,
+          clientX: box.left + box.width / 2,
+          clientY: box.top + box.height / 2,
+          bubbles: true, cancelable: true
+        }));
+      } catch (e) {}
+    } else if (kind === 'local') {
       // Stays in the browser: nothing reaches the program at all.
-      try { term.scrollLines(up ? -term.rows : term.rows); } catch (e) {}
+      try { term.scrollLines(-lines); } catch (e) {}
     } else if (kind === 'tmux') {
-      // Idempotent: pressed again inside copy-mode it simply scrolls another
-      // page, so there is no state here to track and get wrong.
-      sendText(up ? prefixSeq + '\x1b[5~' : '\x1b[6~');
-      if (up) enterHistory();
+      //   prefix [   copy-mode, entered where you are rather than a page up
+      //   C-Up       send -X scroll-up, exactly one line -- measured through
+      //              #{scroll_position}: five presses gave 5, three back gave
+      //              2, while one PageUp jumped 41
+      //
+      // Cursor Up is NOT the primitive and looks like it: it moves the cursor
+      // within the screen and only scrolls once that reaches the top edge.
+      // Both of these are tmux defaults, so this needs no configuration.
+      // Down while already live is a swipe against the bottom of the
+      // scrollback: there is nothing below, and entering copy-mode to look
+      // for it would put you in a mode you did not ask for to show you
+      // nothing.
+      if (!scrolledBack && !up) return false;
+      if (!scrolledBack) sendText(prefixSeq + '[');
+      enterHistory();
+      sendText(new Array(n + 1).join(up ? '\x1b[1;5A' : '\x1b[1;5B'));
     } else if (kind === 'keys') {
-      sendText(up ? '\x1b[5~' : '\x1b[6~');
+      // Textual, not tmux. Its arrows move a selection rather than a
+      // viewport, and the selection here decides what Enter attaches to, so
+      // this one stays on pages: a whole screen per screen of travel.
+      pageDebt += lines;
+      var rows = term.rows || 24;
+      while (pageDebt >= rows) { pageDebt -= rows; sendText('\x1b[5~'); }
+      while (pageDebt <= -rows) { pageDebt += rows; sendText('\x1b[6~'); }
     }
-    if (kind) {
-      haptic();
-      pages += up ? 1 : -1;
-      paintHistory((pages > 0 ? '▲ ' : '▼ ') + Math.abs(pages) + ' 页');
-      // Let this page, and only this page, reach the screen. Holding every
-      // byte for the whole gesture was the safe answer and it made a drag
-      // feel dead; holding everything *except* what the drag itself asked
-      // for is the same protection with the feedback back.
-      flushSoon();
-    }
-    return !!kind;
+    haptic();
+    scrolled += lines;
+    paintHistory((scrolled > 0 ? '▲ ' : '▼ ') + Math.abs(scrolled) + ' 行');
+    // Let what this drag asked for reach the screen, and nothing else.
+    // Holding every byte for a whole gesture was the safe answer to the iOS
+    // cascade and it made a drag feel dead; holding everything *except* the
+    // drag's own answer is the same protection with the feedback back.
+    flushSoon();
+    return true;
   }
 
-  // How far a thumb has to travel for one page. This was half the terminal
-  // height, which on an iPhone with the pad collapsed is ~350px -- further
-  // than a flick goes, so nothing ever fired and the whole gesture read as
-  // dead. A quarter is a swipe someone actually makes; the floor is for the
-  // short terminal left when the drawer is open.
-  function swipeStep() {
-    return Math.max(64, host.getBoundingClientRect().height * 0.25);
-  }
+  // Far enough above tap slop (~10px) that no tap scrolls, near enough that a
+  // deliberate drag answers at once. Only the *first* line of a gesture pays
+  // it; after that the content tracks the finger row for row.
+  var SLOP = 16;
 
-  // The first page of a gesture comes cheap, the rest cost a full step. A
-  // quarter of the terminal is a fair distance to ask for a *second* page,
-  // but as the price of any response at all it reads as dead: measured on
-  // the phone this exists for, a flick delivered 57px against a 167px
-  // threshold, so nothing ever happened. 44px is far enough above tap slop
-  // (~10px) that no tap becomes a page.
-  var FIRST_PAGE = 44;
-  function stepNow() {
-    var full = swipeStep();
-    return swiped ? full : Math.min(FIRST_PAGE, full);
+  // A row's height in CSS pixels, which is what turns finger travel into
+  // lines. Derived rather than read out of xterm: the renderer's own cell
+  // metrics are not a public API, and rows into height is the same number.
+  function lineHeight() {
+    var box = host.getBoundingClientRect().height;
+    var rows = term.rows || 24;
+    return Math.max(6, box / rows);
   }
 
   // ── iOS: a repaint during a drag kills the rest of the gesture ────────
@@ -1045,35 +1106,28 @@
   // DOM change takes place. Only DOM methods such as appendChild() count --
   // innerHTML does not." (quirksmode, The iOS event cascade and innerHTML.)
   //
-  // xterm's DOM renderer rebuilds its row elements exactly that way, and
-  // tmux repaints the whole screen for every page it scrolls. So the first
-  // page a swipe sent was also the last thing that gesture was allowed to
-  // do -- and with the old threshold, which needed most of a screen of
-  // travel, an unrelated repaint could end the gesture before the first
-  // page ever fired. Chromium has no such rule, which is why every headless
-  // run of this paged happily while a phone did nothing at all.
-  //
-  // So nothing reaches the renderer while a finger is down: the bytes are
-  // held and played out on release. The screen catches up in one step
-  // rather than live, which is what the gesture costs to exist here.
+  // xterm's DOM renderer rebuilds its row elements exactly that way. So
+  // nothing reaches the renderer while a finger is down except the answer to
+  // what that finger asked for -- unrelated output, a status-bar clock, a
+  // reconnect are all held and played out in order on release.
   var held = [], holding = false, holdTimer = 0, flushTimer = 0;
   function feed(data) {
     if (holding) held.push(data);
     else term.write(data);
   }
   // Everything queued goes to the screen, in order. The hold itself stays on:
-  // this is used mid-gesture to let one page through.
+  // this is used mid-gesture to let one scroll through.
   function flushHeld() {
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
     var pending = held;
     held = [];
     pending.forEach(function (data) { term.write(data); });
   }
-  // tmux answers a page over the socket, so there is nothing to flush at the
-  // moment the key goes out; this waits for the reply rather than guessing.
+  // tmux answers over the socket, so there is nothing to flush at the moment
+  // the keys go out; this waits for the reply rather than guessing.
   function flushSoon() {
     if (flushTimer) clearTimeout(flushTimer);
-    flushTimer = setTimeout(flushHeld, 90);
+    flushTimer = setTimeout(flushHeld, 60);
   }
   function holdWrites(on) {
     if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; }
@@ -1106,11 +1160,11 @@
     debugBox.appendChild(debugText);
     document.getElementById('app').appendChild(debugBox);
   }
-  var moves = 0, pages = 0;
+  var moves = 0, scrolled = 0, pageDebt = 0;
   function showDebug(dy) {
     if (!debugText) return;
     debugText.nodeValue =
-      'mv ' + moves + '  dy ' + Math.round(dy) + '/' + Math.round(stepNow())
+      'mv ' + moves + '  dy ' + Math.round(dy) + '/' + Math.round(lineHeight())
       + '  buf ' + (bufferType() || '?') + '  pub ' + (published || '?')
       + '  kind ' + (swipeKind() || '-');
   }
@@ -1132,7 +1186,7 @@
       dragFrom = event.touches[0].clientY;
       swiped = false;
       moves = 0;
-      pages = 0;
+      scrolled = 0;
       showDebug(0);
     }
   }, { passive: true });
@@ -1143,23 +1197,19 @@
       return;
     }
     if (event.touches.length !== 1 || pinchStart > 0) return;
-    var step = stepNow();
     moves += 1;
-    showDebug(event.touches[0].clientY - dragFrom);
-    // Dragging down uncovers what is above, which is a page up. Re-read the
-    // step after each page: the first one is cheap and the rest are not.
-    while (event.touches[0].clientY - dragFrom >= step) {
-      dragFrom += step;
-      if (!swipePage(true)) return;
-      swiped = true;
-      step = stepNow();
-    }
-    while (dragFrom - event.touches[0].clientY >= step) {
-      dragFrom -= step;
-      if (!swipePage(false)) return;
-      swiped = true;
-      step = stepNow();
-    }
+    var dy = event.touches[0].clientY - dragFrom;
+    showDebug(dy);
+    // Slop first, so a tap that trembles is still a tap; after that the
+    // content follows the finger one row per row-height, which is what makes
+    // this scrolling rather than paging.
+    if (!swiped && Math.abs(dy) < SLOP) return;
+    var unit = lineHeight();
+    var lines = dy > 0 ? Math.floor(dy / unit) : Math.ceil(dy / unit);
+    if (!lines) return;
+    dragFrom += lines * unit;
+    if (!swipeBy(lines)) return;
+    swiped = true;
     // Only once the gesture is ours. Claiming it before then would take the
     // one the browser might still want.
     if (swiped) event.preventDefault();
@@ -1172,7 +1222,7 @@
       pinchStart = 0; swiped = false;
       holdWrites(false);
       // The count belonged to the gesture; what remains is where you are.
-      pages = 0;
+      scrolled = 0; pageDebt = 0;
       paintHistory('');
     });
   });
