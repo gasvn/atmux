@@ -1039,6 +1039,13 @@
   function swipeBy(lines) {
     var kind = swipeKind();
     if (!lines || !kind) return !!kind;
+    // Content moves further than the finger, the way a wheel does. One row of
+    // thumb for one row of text is honest and reads as slow: a thumb crosses
+    // about 27 rows before it runs out of screen, while a wheel notch is a
+    // flick of one finger joint and moves three. Three is that ratio, and it
+    // is also what makes NOTCH below mean what it says -- one finger row
+    // becomes one notch, which is what a notch is worth in most programs.
+    lines *= GAIN;
     scrollSoon(lines);
     haptic();
     scrolled += lines;
@@ -1136,7 +1143,7 @@
     if (lines) emitScroll(lines);
   }
 
-  var NOTCH = 3, wheelDebt = 0;
+  var GAIN = 3, NOTCH = 3, wheelDebt = 0;
   function wheelReport(up) {
     var at = cellAt(), button = up ? 64 : 65;
     if (mouseSgr) {

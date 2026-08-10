@@ -1521,7 +1521,7 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
                'var held =', 'var SLOP =', 'var scrolledBack =',
-               'var mouseOn =', 'var NOTCH =', 'var lastX =',
+               'var mouseOn =', 'var GAIN =', 'var lastX =',
                'var owed =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var KEY_TARGET =',
@@ -2015,7 +2015,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         return self.run_js(f'''
             sent = [];
             scrolledBack = false;
-            mouseOn = false; wheelDebt = 0;
+            mouseOn = false; wheelDebt = 0; pageDebt = 0; owed = 0;
             published = {json.dumps(mode)};
             term = {{
               rows: 40,
@@ -2029,9 +2029,9 @@ class KeypadVocabularyTests(unittest.TestCase):
         """xterm holds that scrollback -- measured, Shift+PageUp moved the top
         row from 245 to 77 -- so this never reaches the wire at all."""
         self.assertEqual(self.swipe('normal', ''),
-                         ['local', True, ['scrollLines:-3']])
+                         ['local', True, ['scrollLines:-9']])
         self.assertEqual(self.swipe('normal', '', lines=-3),
-                         ['local', True, ['scrollLines:3']])
+                         ['local', True, ['scrollLines:9']])
 
     def test_tmux_is_asked_the_way_tmux_asks_itself(self):
         """prefix+PageUp is tmux's own default binding (copy-mode -u) and
@@ -2040,7 +2040,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         PageDown back, q returns to live."""
         self.assertEqual(self.swipe('alternate', 'external'),
                          ['tmux', True,
-                          ['\x02[', '\x1b[1;5A\x1b[1;5A\x1b[1;5A']])
+                          ['\x02[', '\x1b[1;5A' * 9]])
         # Down only means something once you are up in the history; from
         # live there is nothing below to reach for.
         self.assertEqual(self.run_js("""
@@ -2048,14 +2048,14 @@ class KeypadVocabularyTests(unittest.TestCase):
             term = { rows: 40, buffer: { active: { type: 'alternate' } } };
             swipeBy(4); payScroll(); sent = []; swipeBy(-2); payScroll();
             console.log(JSON.stringify(sent));"""),
-            ['\x1b[1;5B\x1b[1;5B'])
+            ['\x1b[1;5B' * 6])
 
     def test_the_dashboard_is_not_tmux_and_is_not_sent_a_prefix(self):
         """Textual would make its own sense of \\x02, and none of it is
         'scroll up'."""
         # A screen of travel, because Textual's arrows move the selection
         # that decides what Enter attaches to -- not a viewport.
-        self.assertEqual(self.swipe('alternate', 'app', lines=40),
+        self.assertEqual(self.swipe('alternate', 'app', lines=14),
                          ['keys', True, ['\x1b[5~']])
         self.assertEqual(self.swipe('alternate', 'app', lines=3),
                          ['keys', True, []])
@@ -2119,11 +2119,13 @@ class KeypadVocabularyTests(unittest.TestCase):
             host = { getBoundingClientRect: function () {
               return {left: 0, top: 0, width: 800, height: 400}; } };
             lastX = 0; lastY = 0;
-            swipeBy(2); payScroll(); var short = sent.length;   // under a notch: nothing yet
-            swipeBy(1); payScroll(); var reached = sent.length; // the remainder carries
-            swipeBy(6); payScroll(); var more = sent.length;
-            console.log(JSON.stringify([short, reached, more]));""")
-        self.assertEqual(got, [0, 1, 3])
+            swipeBy(1); payScroll(); var one = sent.length;
+            swipeBy(2); payScroll(); var three = sent.length;
+            console.log(JSON.stringify([one, three, NOTCH, GAIN]));""")
+        # One row of finger is GAIN lines is exactly one notch, which is what
+        # a notch is worth in most programs -- so the two cancel and the
+        # content keeps up with the thumb.
+        self.assertEqual(got, [1, 3, 3, 3])
 
     def test_wanting_the_mouse_and_spelling_it_are_read_apart(self):
         """xterm 6 removed term.modes and reading it throws, so DECSET is
@@ -2206,7 +2208,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         """The bar, with hist wired up and the terminal in tmux."""
         return self.run_js('''
             sent = [];
-            mouseOn = false;
+            mouseOn = false; wheelDebt = 0; pageDebt = 0; owed = 0;
             var shown = [];
             hist = new El('div');
             hist.hidden = true;
@@ -2229,7 +2231,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         for every keystroke after -- a typed `echoXYZ` produced nothing at
         all. The screen looks live and is not."""
         sent, back, label = self.history('swipeBy(3); payScroll();')
-        self.assertEqual(sent, ['\x02[', '\x1b[1;5A' * 3])
+        self.assertEqual(sent, ['\x02[', '\x1b[1;5A' * 9])
         self.assertTrue(back)
         self.assertIn('行', label)              # the drag's own count first
 
@@ -2268,7 +2270,7 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     def test_a_swipe_down_inside_history_scrolls_back_toward_live(self):
         sent, back, _ = self.history('swipeBy(3); payScroll(); sent = []; swipeBy(-2); payScroll();')
-        self.assertEqual(sent, ['\x1b[1;5B' * 2])
+        self.assertEqual(sent, ['\x1b[1;5B' * 6])
         self.assertTrue(back)
 
     def test_nothing_is_drawn_while_a_finger_is_down(self):
