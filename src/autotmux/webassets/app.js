@@ -463,22 +463,76 @@
   var keys = document.getElementById('keys');
   var sheet = document.getElementById('sheet');
   var sheetKeys = document.getElementById('sheetkeys');
+  var sheetTop = document.getElementById('sheettop');
   var nav = document.getElementById('nav');
   var pinRow = document.getElementById('pins');
-  var expander = document.getElementById('more');
+  var expander = document.getElementById('grab');
+  var grabCount = document.getElementById('grabcount');
 
-  // How much terminal the sheet may cover. Not a percentage: #app is sized to
-  // visualViewport, so the room actually available changes with the software
-  // keyboard and with rotation, and the only honest source for it is the
-  // terminal box itself. What is left over is deliberately a usable strip and
-  // not a sliver -- a sheet that covers the screen you are operating on is a
-  // modal, and this is a drawer.
-  var TERM_KEEP = 96;
-  function sizeSheet() {
-    if (!sheet || !expanded) return;
-    var room = host.getBoundingClientRect().height - TERM_KEEP;
-    sheet.style.maxHeight = Math.max(120, Math.round(room)) + 'px';
+  // ── how tall the drawer opens ─────────────────────────────────────────
+  // It used to open to every pixel it was allowed, which on a 390x844 phone
+  // left 96px of terminal -- about seven rows. Scrolling was already there as
+  // a fallback and did nothing, because nothing ever needed to scroll: the
+  // sheet simply took the screen.
+  //
+  // So it opens at four rows and scrolls, and the handle drags it to anything
+  // between one row and the whole allowance. Measured in rows rather than
+  // pixels because "four rows of keys" is what has to stay true when the key
+  // size changes -- in landscape a key is 40px and here it is 44.
+  var TERM_KEEP = 96;                  // the strip of terminal never covered
+  var SHEET_PEEK_ROWS = 4;
+  var SHEET_STATE = 'atmux.sheet';
+  var sheetHeight = 0;                 // remembered across opens; 0 = ask
+
+  function sheetRowHeight() {
+    for (var i = 0; i < sheetKeys.children.length; i++) {
+      var child = sheetKeys.children[i];
+      if (String(child.className).indexOf('krow') < 0) continue;
+      var box = child.getBoundingClientRect().height;
+      if (box > 0) return box + 5;     // + .krow margin-bottom
+    }
+    return 49;
   }
+
+  // The most it may ever cover. Not a percentage: #app is sized to
+  // visualViewport, so the room actually available changes with the software
+  // keyboard and with rotation, and the only honest source is the terminal
+  // box itself.
+  function sheetRoom() {
+    return Math.max(120,
+                    host.getBoundingClientRect().height - TERM_KEEP);
+  }
+
+  function sheetPeek() {
+    var top = sheetTop ? sheetTop.getBoundingClientRect().height : 0;
+    return Math.min(sheetRoom(),
+                    (top || 56) + SHEET_PEEK_ROWS * sheetRowHeight());
+  }
+
+  // The smallest the drawer is worth being: the toolbar and one row. Below
+  // this a drag is on its way to closed rather than aiming at a height.
+  function sheetFloor() {
+    return Math.min(sheetRoom(), 110);
+  }
+
+  function sizeSheet(px) {
+    if (!sheet) return;
+    if (!expanded) { sheet.style.height = ''; return; }
+    var want = px === undefined ? (sheetHeight || sheetPeek()) : px;
+    sheetHeight = Math.max(sheetFloor(),
+                           Math.min(sheetRoom(), Math.round(want)));
+    sheet.style.height = sheetHeight + 'px';
+    markSheetEnd();
+  }
+
+  function rememberSheet() {
+    try { localStorage.setItem(SHEET_STATE, String(sheetHeight)); } catch (e) {}
+  }
+  (function () {
+    var stored = 0;
+    try { stored = parseInt(localStorage.getItem(SHEET_STATE), 10); } catch (e) {}
+    if (stored > 0) sheetHeight = stored;
+  })();
 
   // The fade at the bottom edge says "there is more below". Once there is
   // not, it would be saying something false, so it comes off.
@@ -641,12 +695,27 @@
   // Yours, and therefore fixed: the whole point of keeping a key is that it
   // is in the same place every time, which a row inside the scrolling drawer
   // would not be.
+  // The same label the drawer puts over its sections. These two rows were
+  // pixel-for-pixel identical and meant entirely different things -- the keys
+  // you kept, and what this screen can do -- so the pad read as an arbitrary
+  // stack rather than as groups. Naming them in the drawer's own typography
+  // is also what makes opening the drawer continue the panel instead of
+  // starting a second one.
+  function band(into, text) {
+    var label = document.createElement('div');
+    label.className = 'ghead';
+    label.textContent = text;
+    into.appendChild(label);
+  }
+
   function renderPins(columns) {
     if (!pinRow) return;
     pinRow.textContent = '';
     var list = pinnedKeys();
     pinRow.style.display = list.length ? '' : 'none';
-    if (list.length) renderRows(pinRow, list, columns, 0);
+    if (!list.length) return;
+    band(pinRow, 'kept');
+    renderRows(pinRow, list, columns, 0);
   }
 
   function renderKeys() {
@@ -669,6 +738,14 @@
     keys.textContent = '';
     keys.classList.toggle('editing', editing);
     var head = current.length ? current : tmuxKeys();
+    // Always `screen`, never the name of what happens to be in it. Labelling
+    // it `tmux` when nothing had published put the word TMUX over this row and
+    // over the drawer's first section at the same time, naming two different
+    // things -- and the drawer's section held the very same five keys. What
+    // this row means is "what the screen in front of you can do", which stays
+    // true whether that screen belongs to the dashboard, to tmux or to a
+    // shell.
+    band(keys, 'screen');
     var drawn = Math.min(renderRows(keys, head, columns, ROWS_COLLAPSED),
                          head.length);
     var total = groups().reduce(function (n, group) {
@@ -694,7 +771,7 @@
         sizeSheet();
         markSheetEnd();
       } else {
-        sheet.style.maxHeight = '';
+        sizeSheet();
       }
     }
 
@@ -702,9 +779,17 @@
       // Always offered. There is always more than fits: the terminal's own
       // vocabulary does not depend on anything having been published, and a
       // hidden expander is what left a bare shell with three keys.
-      expander.textContent = expanded ? '⌃' : '⌄ ' + Math.max(total - drawn, 0);
+      //
+      // The count says what it counts. `⌄ 38` was a glyph and a bare number,
+      // and a number with no noun beside it is something you have to be told.
+      var more = Math.max(total - drawn, 0);
+      if (grabCount) {
+        grabCount.textContent = expanded ? 'close' : more + ' more keys';
+      }
+      expander.classList.toggle('open', expanded);
+      expander.setAttribute('aria-expanded', expanded ? 'true' : 'false');
       expander.setAttribute(
-        'aria-label', expanded ? 'fewer keys' : 'more keys');
+        'aria-label', expanded ? 'fewer keys' : more + ' more keys');
     }
     // Opening the sheet leaves this unchanged, which is the entire point of
     // it being a sheet: refit() resizes the pty, and tmux answers a resize by
@@ -874,13 +959,82 @@
     expanded = !expanded;
     if (!expanded && editing) setEditing(false);
     renderKeys();
+    sizeSheet();
   }
 
+  // ── the handle ────────────────────────────────────────────────────────
+  // Tap toggles, drag resizes. One control for both because they are the same
+  // question asked at different resolutions -- "show me more keys" and "show
+  // me this many more keys" -- and because a drawer that can only be all or
+  // nothing is what left seven rows of terminal on screen.
+  //
+  // Not pointerdown-to-fire like the fixed rows: this one has to know whether
+  // the finger moved before it can know what was meant.
+  var GRAB_SLOP = 6;
   keepFocus(expander);
-  if (expander) expander.addEventListener('click', function (event) {
-    event.preventDefault();
-    toggleDrawer();
-  });
+  if (expander) (function () {
+    var from = 0, startedAt = 0, moving = false, live = false;
+
+    function down(event) {
+      event.preventDefault();
+      live = true; moving = false;
+      startedAt = event.clientY;
+      // Nothing is changed yet, on purpose: a tap and a drag start
+      // identically, and opening here would make the tap path start from the
+      // drag's own floor rather than from the height a tap should give.
+      from = expanded ? (sheetHeight || sheetPeek()) : 0;
+    }
+
+    function moved(event) {
+      if (!live) return;
+      var dy = startedAt - event.clientY;        // up is taller
+      if (!moving) {
+        if (Math.abs(dy) < GRAB_SLOP) return;
+        moving = true;
+        expander.classList.add('dragging');
+        // Dragging up out of a closed pad opens it and grows from nothing, so
+        // the sheet comes out from under the finger.
+        if (!expanded) { expanded = true; renderKeys(); }
+      }
+      sizeSheet(from + dy);
+    }
+
+    function up(event) {
+      if (!live) return;
+      live = false;
+      expander.classList.remove('dragging');
+      if (!moving) { toggleDrawer(); haptic(); return; }
+      // Dragged shut: below the smallest useful drawer, the intent is closed
+      // rather than tiny.
+      if (sheetHeight <= sheetFloor() && startedAt < event.clientY) {
+        // Restored, not kept: the floor is where the gesture passed through
+        // on its way to closed, not a height anyone chose. Reopening should
+        // give back the one they did choose.
+        sheetHeight = from;
+        expanded = false;
+        if (editing) setEditing(false);
+        renderKeys();
+        sizeSheet();
+      } else {
+        rememberSheet();
+      }
+    }
+
+    function cancel() {
+      if (!live) return;
+      live = false; moving = false;
+      expander.classList.remove('dragging');
+    }
+
+    expander.addEventListener('pointerdown', down);
+    expander.addEventListener('pointermove', moved);
+    expander.addEventListener('pointerup', up);
+    expander.addEventListener('pointercancel', cancel);
+    expander.addEventListener('pointerleave', cancel);
+    expander.addEventListener('contextmenu', function (e) {
+      e.preventDefault();
+    });
+  })();
 
   keepFocus(editButton);
   if (editButton) editButton.addEventListener('click', function (event) {

@@ -41,6 +41,15 @@
       animation: none;
     }
   }
+  /* One material for the panel, named once. The drawer, the pinned headings
+     and the pad itself were three different dark greys, and stacking three
+     dark greys is how a single instrument reads as a pile of strips. */
+  :root {
+    --panel-top: #1b1b21;
+    --panel-mid: #141418;
+    --panel-bot: #101014;
+    --label: #9a9aa6;
+  }
   html, body {
     margin: 0; padding: 0; height: 100%; background: #121212;
     overscroll-behavior: none;          /* no rubber-banding over the terminal */
@@ -109,9 +118,8 @@
     /* Lit from the terminal's edge and falling off downward, with a hairline
        of light along the seam. Dark as a surface, not dark as an absence --
        which is the difference between a panel and a hole in the page. */
-    background:
-      linear-gradient(180deg, #1b1b21 0%, #141418 42%, #101014 100%);
-    border-top: 1px solid #000;
+    background: linear-gradient(180deg, var(--panel-top) 0%,
+                var(--panel-mid) 42%, var(--panel-bot) 100%);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055);
     padding-bottom: env(safe-area-inset-bottom);
     box-sizing: border-box;
@@ -234,13 +242,16 @@
        handing the rest of the swipe to the terminal behind it. */
     overscroll-behavior-y: contain;
     padding: 8px 7px 6px; box-sizing: border-box;
-    /* Flat, not the panel's gradient: the section headings pin to the top of
-       this box while it scrolls, and a heading can only sit invisibly on a
-       flat colour. Lifted off the terminal by its own shadow instead. */
-    background: #17171d;
-    border-top: 1px solid #000;
-    box-shadow: 0 -12px 28px rgba(0, 0, 0, .6),
-                inset 0 1px 0 rgba(255, 255, 255, .05);
+    /* The panel's own colour, not a second one. It had a flat #17171d of its
+       own so the pinned headings could sit on something opaque, and the
+       result was a visible seam wherever it met the pad -- two materials
+       stacked, which is most of why the whole thing read as strips rather
+       than as one surface. This is the top stop of the pad's gradient, so the
+       drawer looks like the panel continuing upward, which is what it is.
+       Depth comes from the shadow it casts on the terminal instead. */
+    background: var(--panel-top);
+    box-shadow: 0 -14px 30px rgba(0, 0, 0, .55),
+                inset 0 1px 0 rgba(255, 255, 255, 0.06);
   }
   /* Sixty-three keys do not fit, and the list used to be cut flat against the
      settings row -- which reads as damage rather than as "there is more". A
@@ -252,12 +263,28 @@
     mask-image: linear-gradient(to bottom, #000 0,
                 #000 calc(100% - 26px), transparent 100%);
   }
-  /* Raised from #75757f, which measured 3.96:1 against this panel -- under the
-     4.5:1 small text needs, on the only navigation a 63-key list has. */
+  /* One label, used everywhere something needs naming: the drawer's sections
+     and the two fixed rows alike. That is the point -- the pad had a pinned
+     row and a screen row that were pixel-for-pixel identical and meant
+     completely different things, and the drawer named its groups in a
+     typography that appeared nowhere else. Same rule for both, so opening the
+     drawer continues the page instead of starting a new one.
+
+     The hairline carries the eye across and does the grouping that a bare
+     word does not; #9a9aa6 rather than #75757f, which measured 3.96:1. */
   .ghead {
-    color: #9a9aa6; margin: 6px 2px 4px;
+    display: flex; align-items: center; gap: 7px;
+    color: var(--label); margin: 0 2px 3px;
     font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
     letter-spacing: .1em; text-transform: uppercase;
+  }
+  /* In the drawer they separate sections and want air above them. In the pad
+     each one sits directly on the row it names, and a label costs terminal:
+     two of them at the drawer's spacing was five rows of a phone screen. */
+  #sheet .ghead { margin-top: 6px; }
+  .ghead::after {
+    content: ''; flex: 1 1 auto; height: 1px;
+    background: rgba(255, 255, 255, 0.055);
   }
   .ghead:first-child { margin-top: 0; }
   /* Pinned, because once you are scrolling the section you are in has already
@@ -266,7 +293,7 @@
      flush against the edge, and opaque so the keys pass behind it. */
   #sheet .ghead {
     position: sticky; top: -8px; z-index: 2;
-    background: #17171d;
+    background: var(--panel-top);
     margin: 0 0 4px; padding: 10px 2px 5px;
   }
   #sheet .ghead:first-child { padding-top: 2px; }
@@ -299,6 +326,48 @@
                 inset 0 0 0 1px rgba(70, 211, 164, .55),
                 0 0 8px rgba(70, 211, 164, .12);
   }
+
+  /* ── the handle ───────────────────────────────────────────────────────
+     The seam between the drawer and the rows that never move, and the only
+     control that opens it. Tap toggles; drag sets whatever height you
+     actually want.
+
+     This replaces `⌄ 38` sitting in the settings row four buttons away from
+     `▾` -- two near-identical chevrons meaning "show more keys" and "hide the
+     keypad", which is the kind of pair you have to learn rather than read.
+     A drawer opens from its edge, so the edge is where the control goes, and
+     the count can sit beside it where it obviously belongs to it. */
+  #grab { display: none; }
+  body.touch #grab {
+    flex: 0 0 auto; display: flex;
+    align-items: center; justify-content: center; gap: 9px;
+    /* Short, but it spans the panel: the target is the full width of the
+       screen, which is far more than the 44px a button would get. */
+    /* It is the pad's own top edge now, and the pad already draws a hairline
+       of light there -- a border here would be a second one. */
+    width: 100%; height: 24px; padding: 0;
+    background: none; border: 0;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    /* The gesture is a resize; the browser must not read it as a scroll or a
+       text selection partway through. */
+    user-select: none; -webkit-user-select: none;
+  }
+  /* The grip itself. Wider and lit when the drawer is open, so the handle
+     says which state it is in without a second glyph to learn. */
+  #grab span {
+    display: block; width: 34px; height: 4px; border-radius: 2px;
+    background: #4a4a56;
+    transition: background 120ms ease-out, width 120ms ease-out;
+  }
+  #grab b {
+    font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .1em; text-transform: uppercase;
+    font-weight: 400; color: var(--label);
+  }
+  body.touch #grab.open span { width: 46px; background: #6f6f7e; }
+  body.touch #grab:active span { background: #8a8a99; }
+  body.touch #grab.dragging span { background: #46d3a4; }
   /* Fixed columns, never wrapping the row: flex-wrap stretched whichever key
      landed alone on the last line into a full-width button, which read as
      something important rather than as the leftover it was. A short last row
@@ -535,6 +604,14 @@
   <button id="hist" type="button" hidden
           aria-live="polite" aria-label="stop reading history"></button>
   <div id="pad">
+    <!-- The seam of the drawer, and the one control that opens it.
+         It used to be a `⌄ 38` button in the settings row, four buttons away
+         from `▾`, which is a near-identical chevron meaning something else
+         entirely -- and the number beside it explained nothing. A drawer
+         opens from its edge; that is what an edge looks like, and the same
+         handle drags to whatever height you actually want. -->
+    <button id="grab" aria-expanded="false"
+            aria-label="more keys"><span></span><b id="grabcount"></b></button>
     <!-- esc, the two modifiers, tab and the arrows. Fixed, in this order, and
          nothing below may reflow it: a key that moves because the far end
          published a different number of actions is a key you have to look for
@@ -565,16 +642,15 @@
            page is built to be installed to the home screen, where there is no
            browser chrome to fall back on. It sends the same thing that key
            does; the socket closing is what returns you. -->
-      <button id="back" aria-label="back to the session list">‹</button>
-      <!-- No pages. Pages are what put the layout key two taps deep behind a
-           tab nobody would open; a second axis of navigation would be that
-           same mistake wearing a different name. This opens the one drawer. -->
-      <button id="more" aria-label="more keys">⌄</button>
-      <!-- ☆ used to sit here and now lives at the top of the sheet. Seven
-           buttons at 44px plus gaps is 363px and an eighth does not fit on a
-           390px phone -- but the reason to move it rather than shrink the row
-           is that choosing which keys to keep is only meaningful while you
-           can see the keys, which is exactly when the sheet is open. -->
+      <button id="back" aria-label="back to the session list">‹ list</button>
+      <!-- Two controls used to live here that do not belong in a settings
+           row. `⌄ 38` opened the drawer -- a drawer opens from its edge, so
+           it is the handle above now. `☆` chose which keys to keep, which is
+           only meaningful while you can see the keys, so it is at the top of
+           the sheet. What is left is only things that change how the pad
+           behaves, which is what this row is for.
+           Six buttons, so each gets a word where a word is clearer than a
+           glyph -- there was never room for that at eight. -->
       <span class="spacer"></span>
       <button id="fontminus" aria-label="smaller">A−</button>
       <!-- Lit while the layout is choosing the size, which is the normal
@@ -582,7 +658,7 @@
       <button id="fontauto" aria-label="automatic size">A</button>
       <button id="fontplus" aria-label="larger">A+</button>
       <button id="kbd" aria-label="keyboard">⌨</button>
-      <button id="hide" aria-label="hide the keys">▾</button>
+      <button id="hide" aria-label="hide the keys">hide</button>
     </div>
   </div>
   <!-- The way back, and the only thing left when the pad is hidden. At the

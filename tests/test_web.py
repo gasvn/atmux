@@ -946,12 +946,24 @@ class TouchKeypadTests(unittest.TestCase):
 
         css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
 
+        # The palette is named once in :root and used by reference, which is
+        # the whole point -- three hand-picked dark greys is how one panel
+        # ends up looking like three. So the token has to be resolved before
+        # it can be measured.
+        tokens = dict(re.findall(r'(--[\w-]+): (#[0-9a-fA-F]{6});', css))
+
         def colour_of(selector):
             rule = re.search(re.escape(selector) + r' \{[^}]*\}', css)
             self.assertIsNotNone(rule, selector)
-            found = re.search(r'color: (#[0-9a-fA-F]{6})', rule.group(0))
+            found = re.search(r'color: (#[0-9a-fA-F]{6}|var\(--[\w-]+\))',
+                              rule.group(0))
             self.assertIsNotNone(found, f'{selector} sets no colour')
-            return found.group(1)
+            value = found.group(1)
+            if value.startswith('var('):
+                name = value[4:-1]
+                self.assertIn(name, tokens, f'{selector} uses undefined {name}')
+                return tokens[name]
+            return value
 
         # Backgrounds are the panel behind each: the sheet is flat #17171d so
         # a pinned heading can sit on it invisibly, and the grip is #141418.
@@ -1757,7 +1769,12 @@ var document = { createElement: function (t) { return new El(t); },
 
 // What the pad needs around it, and nothing more. Every one of these is a
 // thing the browser owns, not a thing the keypad decides.
-var keys = new El('div'), nav = new El('div'), expander = new El('button');
+var keys = new El('div'), nav = new El('div');
+// The drawer's edge, and the only control that opens it. `grabCount` is the
+// word beside the grip: `37 more keys` closed, `close` open -- it used to be
+// a bare `⌄ 38` four buttons away from a near-identical `▾`.
+var expander = new El('button'), grabCount = new El('b');
+var sheetTop = new El('div');
 var hist = new El('button');
 var pinRow = new El('div'), editButton = new El('button');
 // The pad, the terminal it sits under, and the sheet that covers that
@@ -1850,15 +1867,18 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
-                 'renderRows', 'recolumn', 'renderNav', 'renderPins',
+                 'renderRows', 'recolumn', 'renderNav', 'band', 'renderPins',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad',
-                 'sizeSheet', 'markSheetEnd')
+                 'sheetRowHeight', 'sheetRoom', 'sheetPeek', 'sheetFloor',
+                 'sizeSheet', 'rememberSheet', 'markSheetEnd')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
                'var held =', 'var SLOP =', 'var scrolledBack =',
                'var mouseOn =', 'var GAIN =', 'var lastX =',
                'var owed =', 'var NAV_PER_ROW =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var TERM_KEEP =', 'var navColumns =',
+               'var SHEET_PEEK_ROWS =', 'var SHEET_STATE =',
+               'var sheetHeight =', 'var GRAB_SLOP =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
                'var prefixSeq =', 'var PINS =',
                'var DEFAULT_PINS =', 'var pins =',
@@ -2182,7 +2202,7 @@ class KeypadVocabularyTests(unittest.TestCase):
                 return c._cls.krow; }}).length,
               row: drawn(keys, []),
               open: !!sheet._cls.open,
-              more: expander.textContent }}));''')
+              more: grabCount.textContent }}));''')
 
     def test_a_closed_drawer_shows_the_apps_own_keys(self):
         """What you can do on the screen in front of you, two rows of it --
@@ -2219,15 +2239,22 @@ class KeypadVocabularyTests(unittest.TestCase):
         """It used to hide itself when the published list fitted, which in a
         bare shell -- where nothing is published at all -- left the pad at
         three keys and no way to reach any others."""
-        self.assertTrue(self.render()['more'].startswith('⌄'))
-        self.assertNotEqual(self.render()['more'], '⌄ 0')
+        self.assertTrue(self.render()['more'].endswith('more keys'))
+        self.assertFalse(self.render()['more'].startswith('0 '))
 
-    def test_the_count_on_the_expander_is_what_expanding_would_add(self):
+    def test_the_count_says_what_it_counts(self):
+        """`⌄ 38` was a chevron and a bare number sitting four buttons away
+        from `▾`, a near-identical chevron meaning "hide the keypad". A number
+        with no noun beside it is something you have to be told."""
         published = [{'k': 'z', 'l': 'Layout'}]
         closed = self.render(published)
         opened = self.render(published, expanded=True)
-        self.assertEqual(int(closed['more'].split()[1]),
+        self.assertEqual(int(closed['more'].split()[0]),
                          len(opened['keys']) - len(closed['keys']))
+        self.assertIn('more keys', closed['more'])
+        # And it says what tapping does once it is open, rather than showing
+        # the same chevron upside down.
+        self.assertEqual(opened['more'], 'close')
 
     # ── how many across ───────────────────────────────────────────────────
 
@@ -2334,19 +2361,70 @@ class KeypadVocabularyTests(unittest.TestCase):
               [fits - settled, narrow - pad.getBoundingClientRect().height]));
             '''), [1, 44])
 
-    def test_the_sheet_is_capped_by_the_room_there_actually_is(self):
+    def test_the_drawer_opens_at_four_rows_rather_than_at_every_pixel(self):
+        """The one the phone actually complained about. It opened to the whole
+        allowance, which on a 390x844 screen left 96px of terminal -- about
+        seven rows. Scrolling was already there and did nothing, because
+        nothing ever needed to scroll: the sheet simply took the screen.
+
+        Measured after, at 390x844: 253px open, 261px of terminal still
+        visible, twenty-three rows.
+        """
+        self.assertEqual(self.run_js('''
+            expanded = true; sheetHeight = 0;
+            host._height = 600;
+            sizeSheet();
+            console.log(JSON.stringify(
+              [sheet.style.height, sheetPeek(), sheetRoom()]));'''),
+            ['252px', 252, 504])
+
+    def test_the_cap_is_the_room_there_actually_is(self):
         """Not a percentage: #app is sized to visualViewport, so the room
         changes with the software keyboard and with rotation. And what is left
         over is a usable strip on purpose -- a sheet that covers the screen you
         are operating on is a modal, and this is a drawer."""
         self.assertEqual(self.run_js('''
             expanded = true;
-            host._height = 600; sizeSheet();
-            var tall = sheet.style.maxHeight;
-            host._height = 200; sizeSheet();
-            var short = sheet.style.maxHeight;
+            host._height = 600; sizeSheet(99999);
+            var tall = sheet.style.height;
+            host._height = 200; sizeSheet(99999);
+            var short = sheet.style.height;
             console.log(JSON.stringify([tall, short, TERM_KEEP]));'''),
             ['504px', '120px', 96])
+
+    def test_the_drawer_can_be_dragged_to_a_height_and_remembers_it(self):
+        """Four rows is a starting point, not a decision. Somebody reading a
+        log wants it small; somebody hunting for a key wants it large, and
+        picking one number for both is what a handle avoids having to do."""
+        self.assertEqual(self.run_js('''
+            expanded = true; host._height = 600;
+            sizeSheet(); var opened = sheetHeight;
+            sizeSheet(380); rememberSheet();
+            var dragged = sheetHeight;
+            sheetHeight = 0;                    // as if the page reloaded
+            var stored = parseInt(store[SHEET_STATE], 10);
+            sheetHeight = stored; sizeSheet();
+            console.log(JSON.stringify([opened, dragged, sheetHeight]));'''),
+            [252, 380, 380])
+
+    def test_a_drag_cannot_shrink_it_past_being_useful_or_grow_it_past_the_room(
+            self):
+        self.assertEqual(self.run_js('''
+            expanded = true; host._height = 600;
+            sizeSheet(-500); var floor = sheetHeight;
+            sizeSheet(99999); var ceiling = sheetHeight;
+            console.log(JSON.stringify(
+              [floor, ceiling, sheetFloor(), sheetRoom()]));'''),
+            [110, 504, 110, 504])
+
+    def test_a_closed_drawer_has_no_height_at_all(self):
+        """Not a zero-height open one: it is out of the layout entirely, which
+        is what keeps the terminal's rows the same."""
+        self.assertEqual(self.run_js('''
+            expanded = true; host._height = 600; sizeSheet();
+            expanded = false; sizeSheet();
+            console.log(JSON.stringify(
+              [sheet.style.height, !!sheet._cls.open]));'''), ['', False])
 
     def test_the_fade_comes_off_at_the_end_of_the_list(self):
         """It says "there is more below". Once there is not, it would be
@@ -3097,13 +3175,31 @@ class KeypadVocabularyTests(unittest.TestCase):
         """
         controls = re.findall(r'<button id="(\w+)"', self.html)
         self.assertEqual(controls,
-                         ['hist', 'edit', 'back', 'more', 'fontminus',
+                         ['hist', 'grab', 'edit', 'back', 'fontminus',
                           'fontauto', 'fontplus', 'kbd', 'hide', 'grip'])
         row = self.html[self.html.index('<div id="tabs">'):]
         row = row[:row.index('</div>')]
         self.assertEqual(re.findall(r'<button id="(\w+)"', row),
-                         ['back', 'more', 'fontminus', 'fontauto', 'fontplus',
+                         ['back', 'fontminus', 'fontauto', 'fontplus',
                           'kbd', 'hide'])
+        # Six, and each of the two that carry a verb gets a word. There was
+        # never room for that at eight, which is why `‹` and `▾` were bare
+        # glyphs -- and `▾` sat four buttons from `⌄`, which meant something
+        # else entirely.
+        self.assertIn('>‹ list</button>', self.html)
+        self.assertIn('>hide</button>', self.html)
+
+    def test_the_drawer_opens_from_its_own_edge(self):
+        """It used to open from a button in the settings row, at the far end
+        of the pad from the drawer itself. A drawer opens from its edge, and
+        putting the control there is also what removed the pair of chevrons --
+        `⌄` for more keys and `▾` for hide the keypad -- from one row."""
+        pad = self.html[self.html.index('<div id="pad">'):]
+        order = re.findall(r'<(?:div|button) id="(\w+)"', pad)[1:]   # skip #pad
+        self.assertEqual(order[0], 'grab',
+                         f'the handle is not the pad\'s top edge: {order}')
+        self.assertLess(order.index('grab'), order.index('nav'))
+        self.assertLess(order.index('grab'), order.index('tabs'))
 
     def test_a_rotation_redraws_only_when_the_count_actually_changed(self):
         """Rebuilding the pad on every resize would drop a held key and clear
