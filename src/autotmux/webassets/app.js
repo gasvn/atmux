@@ -523,13 +523,38 @@
     return Math.min(sheetRoom(), 110);
   }
 
+  // ── what the drawer covers ────────────────────────────────────────────
+  // It grows upward out of the pad, so what it covers is the bottom of the
+  // terminal -- the prompt, the newest output, tmux's own status line. That
+  // is the worst possible choice of rows to hide: you open the keys in order
+  // to press one, and cannot see what pressing it did.
+  //
+  // The alternative is to make the terminal shorter, which resizes the pty
+  // and makes tmux reflow and repaint everything -- the jolt this drawer was
+  // made a sheet to avoid in the first place.
+  //
+  // So neither: the terminal keeps every row it has, and slides up by exactly
+  // as much as the drawer covers. The rows that leave are the oldest ones,
+  // off the top, and the prompt sits directly above the drawer where you can
+  // watch it. A transform composites, so this costs no layout and no repaint
+  // and follows the handle continuously while it is dragged.
+  function shiftTerminal(px) {
+    if (!host) return;
+    host.style.transform = px > 0 ? 'translateY(' + -Math.round(px) + 'px)' : '';
+  }
+
   function sizeSheet(px) {
     if (!sheet) return;
-    if (!expanded) { sheet.style.height = ''; return; }
+    if (!expanded) {
+      sheet.style.height = '';
+      shiftTerminal(0);
+      return;
+    }
     var want = px === undefined ? (sheetHeight || sheetPeek()) : px;
     sheetHeight = Math.max(sheetFloor(),
                            Math.min(sheetRoom(), Math.round(want)));
     sheet.style.height = sheetHeight + 'px';
+    shiftTerminal(sheetHeight);
     markSheetEnd();
   }
 

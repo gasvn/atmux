@@ -1889,6 +1889,7 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'firstRow',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad',
                  'sheetRowHeight', 'sheetRoom', 'sheetPeek', 'sheetFloor',
+                 'shiftTerminal',
                  'sizeSheet', 'rememberSheet', 'markSheetEnd')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
                'var held =', 'var SLOP =', 'var scrolledBack =',
@@ -2410,6 +2411,42 @@ class KeypadVocabularyTests(unittest.TestCase):
             var short = sheet.style.height;
             console.log(JSON.stringify([tall, short, TERM_KEEP]));'''),
             ['504px', '120px', 96])
+
+    def test_the_drawer_never_covers_the_line_you_are_working_on(self):
+        """It grows upward out of the pad, so what it covers is the bottom of
+        the terminal -- the prompt, the newest output, tmux's own status line.
+        That is the worst possible choice of rows to hide: you open the keys
+        in order to press one, and cannot see what pressing it did.
+
+        Making the terminal shorter instead resizes the pty and makes tmux
+        reflow and repaint everything, which is the jolt this drawer was made
+        a sheet to avoid. So neither: it keeps every row and slides up by
+        exactly what the drawer covers. The rows that leave go off the top,
+        oldest first.
+
+        Measured at 390x844 with the drawer open: the terminal is shifted
+        -234px, tmux's status line ends at y=276, and the drawer starts at
+        y=280 -- four pixels clear.
+        """
+        self.assertEqual(self.run_js('''
+            expanded = true; host._height = 600; sheetHeight = 0;
+            sizeSheet();
+            var open = [sheetHeight, host.style.transform];
+            expanded = false; sizeSheet();
+            console.log(JSON.stringify([open, host.style.transform]));'''),
+            [[252, 'translateY(-252px)'], ''])
+
+    def test_dragging_the_drawer_taller_moves_the_terminal_with_it(self):
+        """Continuously, because the transform composites: the content
+        follows the handle rather than jumping when it is let go."""
+        self.assertEqual(self.run_js('''
+            expanded = true; host._height = 600;
+            sizeSheet(150); var a = host.style.transform;
+            sizeSheet(300); var b = host.style.transform;
+            sizeSheet(99999); var c = host.style.transform;
+            console.log(JSON.stringify([a, b, c, sheetRoom()]));'''),
+            ['translateY(-150px)', 'translateY(-300px)',
+             'translateY(-504px)', 504])
 
     def test_the_drawer_can_be_dragged_to_a_height_and_remembers_it(self):
         """Four rows is a starting point, not a decision. Somebody reading a
