@@ -52,6 +52,7 @@
   var host = document.getElementById('term');
   term.open(host);
   var hist = document.getElementById('hist');
+  var buildLine = document.getElementById('buildline');
 
   var textarea = host.querySelector('textarea');
 
@@ -595,8 +596,25 @@
   // box keeps its natural height inside it.
   function sheetContent() {
     if (!sheetKeys) return 0;
-    // + #sheet's own padding, 8 above and 6 below.
-    return Math.ceil(sheetKeys.getBoundingClientRect().height) + 14;
+    var rows = Math.ceil(sheetKeys.getBoundingClientRect().height);
+    // Zero means the keys have not been laid out yet, which is not the same
+    // as a drawer with nothing in it -- and the caller has to be able to tell
+    // the difference, because capping the drawer at an unmeasured content
+    // height opens it at nothing. Said here, rather than left for the caller
+    // to infer from a suspiciously small number: it used to infer it, and
+    // adding one fixed-height line below the keys was enough to carry an
+    // empty drawer over the threshold and open it two rows tall.
+    if (!rows) return 0;
+    // + #sheet's own padding, 8 above and 6 below, and the build line under
+    // the keys. Small, but it has to be counted: this number is what stops
+    // the drawer opening taller than it has anything to show, so anything
+    // left out of it lands just under the fold of a drawer that reports
+    // itself as exactly full.
+    var height = rows + 14;
+    if (buildLine) {
+      height += Math.ceil(buildLine.getBoundingClientRect().height);
+    }
+    return height;
   }
 
   function sheetPeek() {
@@ -2091,8 +2109,58 @@
   window.addEventListener('scroll', function () {
     if (vv && vv.offsetTop === 0 && window.scrollY !== 0) window.scrollTo(0, 0);
   });
+  // ── which build this is ─────────────────────────────────────────────────
+  // This page declares apple-mobile-web-app-capable, so on a phone it is a
+  // home-screen app, and iOS resumes one of those from a snapshot rather than
+  // fetching it again. A deploy can land, be served correctly, and never
+  // reach the screen -- and nothing on the page said which of the two had
+  // happened, so "did you deploy it?" and "yes, I checked the bytes on the
+  // wire" were both true and neither was an answer.
+  var buildMeta = document.querySelector('meta[name="atmux-build"]');
+  var MY_BUILD = buildMeta ? buildMeta.content : '';
+  var newBuild = document.getElementById('newbuild');
+
+  if (buildLine) buildLine.textContent = MY_BUILD ? 'build ' + MY_BUILD : '';
+
+  function checkBuild() {
+    if (!MY_BUILD || !newBuild) return;
+    // `../api/build`, not `api/build`: this page is at /console/ and the API
+    // is beside it, not under it. Relative either way -- whatever prefix
+    // `tailscale serve --set-path` adds is not ours to know.
+    fetch(new URL('../api/build', location.href).toString(),
+          { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data || !data.build || data.build === MY_BUILD) return;
+        newBuild.hidden = false;
+        newBuild.textContent = 'newer build — tap to load  ('
+                             + MY_BUILD + ' → ' + data.build + ')';
+        if (buildLine) {
+          buildLine.textContent = 'build ' + MY_BUILD + ' · server '
+                                + data.build;
+        }
+      })
+      // Offline is not news here: the socket already says so, louder.
+      .catch(function () {});
+  }
+
+  if (newBuild) {
+    newBuild.addEventListener('click', function () {
+      newBuild.textContent = 'loading…';
+      // Reconnecting to a tmux session is what this page does on every load,
+      // so a reload costs nothing that was not already reattachable.
+      location.reload();
+    });
+  }
+
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { refit(); if (ws && ws.readyState > 1) connect(); }
+    if (!document.hidden) {
+      refit();
+      if (ws && ws.readyState > 1) connect();
+      // Coming back to the foreground is exactly when a stale snapshot
+      // returns, so it is exactly when this is worth asking.
+      checkBuild();
+    }
   });
   window.addEventListener('beforeunload', function () { closed = true; });
 
@@ -2111,5 +2179,6 @@
 
   if (boot) boot.style.display = 'none';
   connect();
+  checkBuild();
   term.focus();
 })();

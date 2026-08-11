@@ -169,6 +169,43 @@
       queueBody.textContent = text;
       queueTitle.textContent = q.updated ? 'queue · ' + q.updated : 'queue';
     }
+
+    checkBuild(data.build);
+  }
+
+  // ── which build this is ─────────────────────────────────────────────────
+  // Both pages declare apple-mobile-web-app-capable, so on a phone they are
+  // home-screen apps, and iOS resumes one of those from a snapshot rather
+  // than fetching it again. A deploy can land, be served correctly, and never
+  // reach the screen -- with nothing on the page to say which of the two it
+  // is. That is the failure this reports: not an error, just an age.
+  var buildBar = document.getElementById('build');
+  var updateBtn = document.getElementById('update');
+  var meta = document.querySelector('meta[name="atmux-build"]');
+  var MINE = meta ? meta.content : '';
+
+  if (buildBar) buildBar.textContent = MINE ? 'build ' + MINE : '';
+
+  function checkBuild(theirs) {
+    if (!updateBtn || !MINE || !theirs) return;
+    var stale = theirs !== MINE;
+    updateBtn.hidden = !stale;
+    if (stale) {
+      updateBtn.textContent = 'a newer build is on the server — tap to load '
+                            + 'it  (' + MINE + ' → ' + theirs + ')';
+      if (buildBar) buildBar.textContent = 'build ' + MINE + ' · server '
+                                         + theirs;
+    }
+  }
+
+  if (updateBtn) {
+    updateBtn.addEventListener('click', function () {
+      updateBtn.textContent = 'loading…';
+      // Plain reload, deliberately: our own assets go out `no-store`, so
+      // there is no cache entry to defeat -- the copy being replaced is the
+      // running document, not something a header could have prevented.
+      location.reload();
+    });
   }
 
   function poll() {

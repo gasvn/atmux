@@ -311,6 +311,51 @@ def _layout_meta() -> str:
 _VOLATILE_ASSETS = frozenset({'index.html', 'app.js', 'manifest.json',
                               'dash.html', 'dash.js'})
 
+# What the reader is actually running.
+#
+# Both pages declare apple-mobile-web-app-capable, so on a phone this is a
+# home-screen app, and iOS resumes one of those from a snapshot rather than
+# fetching it again. A deploy can therefore land, be served correctly, and be
+# invisible: the page in front of the reader is days old and nothing on it
+# says so. Both halves of "did you deploy it?" / "yes, I checked the bytes on
+# the wire" were true at once, and neither answered the question.
+#
+# Named by the bytes of our own assets, not by a version string: the question
+# is what the page is made of. An rsync onto a running server changes this; a
+# release that touches nothing the browser loads does not.
+_BUILD_SLOT = '<!--build-->'
+_build_seen: list = []       # at most one (stat key, id) pair
+
+
+def build_id() -> str:
+    key = []
+    for name in sorted(_VOLATILE_ASSETS):
+        try:
+            info = os.stat(os.path.join(ASSETS, name))
+            key.append((name, info.st_mtime_ns, info.st_size))
+        except OSError:
+            key.append((name, 0, -1))
+    stat_key = tuple(key)
+    # Re-read the files only when one of them has moved. On a live server
+    # that means once per deploy, not once per request.
+    if _build_seen and _build_seen[0][0] == stat_key:
+        return _build_seen[0][1]
+    digest = hashlib.sha256()
+    for name in sorted(_VOLATILE_ASSETS):
+        digest.update(name.encode('ascii') + b'\0')
+        try:
+            with open(os.path.join(ASSETS, name), 'rb') as handle:
+                digest.update(handle.read())
+        except OSError:
+            digest.update(b'missing')
+    found = digest.hexdigest()[:7]
+    _build_seen[:] = [(stat_key, found)]
+    return found
+
+
+def _build_meta() -> str:
+    return f'<meta name="atmux-build" content="{build_id()}">'
+
 # Where the terminal lives now that the root is the dashboard. Trailing slash
 # so every asset the page asks for resolves under it.
 CONSOLE = '/console/'
@@ -368,6 +413,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._websocket()
         elif path == '/api/state':
             self._state()
+        elif path == '/api/build':
+            # The console has no poll to carry this, and asking over the
+            # socket would tie "is my page current" to a connection that
+            # being out of date can itself break.
+            self._bytes(('{"build":"%s"}\n' % build_id()).encode('ascii'),
+                        _ASSET_TYPES['.json'])
         elif path in ('/', '/index.html'):
             # The dashboard, not the terminal. Reading a list is what a phone
             # is here for; the terminal is for the one thing that genuinely
@@ -404,10 +455,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """
         source = self.server.state
         if source is None:
-            self._bytes(b'{"error":"no state source"}\n',
-                        _ASSET_TYPES['.json'])
+            # Still stamped. The build a page is running is a fact about the
+            # page, not about the session list -- tying the two together
+            # would mean a broken state source also quietly disables the one
+            # notice that tells you the page itself is out of date.
+            self._bytes(
+                ('{"error":"no state source","build":"%s"}\n'
+                 % build_id()).encode('ascii'), _ASSET_TYPES['.json'])
             return
-        body = json.dumps(source.snapshot(), ensure_ascii=False)
+        # Carried on the poll the dashboard already runs, rather than as a
+        # second request beside it: this is one short string, and the page
+        # that most needs to notice a deploy is the one asking every 5s.
+        payload = dict(source.snapshot(), build=build_id())
+        body = json.dumps(payload, ensure_ascii=False)
         self._bytes(body.encode('utf-8'), _ASSET_TYPES['.json'])
 
     def _asset(self, name: str) -> None:
@@ -432,6 +492,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = body.replace(
                 _BOOTSTRAP_SLOT.encode('ascii'),
                 f'<script>{BOOTSTRAP_JS}</script>'.encode('utf-8'))
+            # Stamped into the page itself, so what the page reports is what
+            # the page is -- a number the client fetched separately would go
+            # stale in exactly the case this exists to catch.
+            body = body.replace(_BUILD_SLOT.encode('ascii'),
+                                _build_meta().encode('utf-8'))
         # Only the console has a character grid to fit.
         if name == 'index.html':
             body = body.replace(_LAYOUT_SLOT.encode('ascii'),

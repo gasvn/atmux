@@ -674,6 +674,205 @@ class HomeScreenTests(_ServedFixture):
         self.assertIn('prefers-reduced-motion', block)
 
 
+class BuildStampTests(_ServedFixture):
+    """Which build the reader is actually running.
+
+    Both pages declare apple-mobile-web-app-capable, so on a phone they are
+    home-screen apps, and iOS resumes one of those from a snapshot rather than
+    fetching it. A deploy landed, was served correctly -- verified byte for
+    byte through the tailnet URL the phone uses, `no-store` and all -- and the
+    screen did not change, because the screen was days old and said nothing
+    about it. "Did you deploy it?" and "yes, I checked the bytes on the wire"
+    were true at the same time and neither one answered the question.
+
+    So the page carries its own name now, and asks.
+    """
+
+    def test_both_pages_say_which_build_they_are(self):
+        for path in ('/', web.CONSOLE):
+            with self.subTest(page=path):
+                _head, body = self.get(path)
+                page = body.decode('utf-8')
+                found = re.search(
+                    r'<meta name="atmux-build" content="([^"]+)">', page)
+                self.assertTrue(found, 'the page cannot name itself')
+                self.assertTrue(found.group(1).strip())
+
+    def test_the_slot_is_filled_rather_than_shipped(self):
+        """A page still carrying the comment is a page whose stamp silently
+        did nothing -- which is the exact failure this exists to catch."""
+        for path in ('/', web.CONSOLE):
+            with self.subTest(page=path):
+                _head, body = self.get(path)
+                self.assertNotIn(web._BUILD_SLOT.encode('ascii'), body)
+
+    def test_the_page_and_the_server_agree_on_the_name(self):
+        """The whole mechanism is a comparison. If the two sides derive it
+        differently, every load reports an update that reloading never fixes:
+        an infinite `tap to load` that is worse than no notice at all."""
+        _head, body = self.get(web.CONSOLE)
+        page = re.search(r'<meta name="atmux-build" content="([^"]+)">',
+                         body.decode('utf-8')).group(1)
+        _head, served = self.get('/api/build')
+        self.assertEqual(json.loads(served)['build'], page)
+
+    def test_the_dashboard_poll_already_carries_it(self):
+        """The page that most needs to notice a deploy asks every five
+        seconds anyway. A second request beside it, on the same timer, for
+        seven bytes, would be traffic for nothing."""
+        _head, body = self.get('/api/state')
+        state = json.loads(body)
+        self.assertIn('build', state)
+        _head, served = self.get('/api/build')
+        self.assertEqual(state['build'], json.loads(served)['build'])
+
+    def test_the_answer_is_never_cached(self):
+        """A cached freshness check is a contradiction: it would go stale in
+        exactly the case it exists to report."""
+        head, _ = self.get('/api/build')
+        self.assertIn('no-store', head)
+        self.assertNotIn('max-age', head)
+
+    def test_it_names_the_bytes_and_not_the_version(self):
+        """An rsync onto a running server is how this actually gets deployed,
+        and it does not touch the package version. Naming the build after a
+        version string would leave the one deployment path that matters
+        reporting no change at all -- which is the bug."""
+        import shutil
+        import tempfile
+
+        original = web.ASSETS
+        seen = list(web._build_seen)
+        room = tempfile.mkdtemp()
+        try:
+            for name in web._VOLATILE_ASSETS:
+                with open(os.path.join(room, name), 'w') as handle:
+                    handle.write('first')
+            web.ASSETS = room
+            web._build_seen.clear()
+            before = web.build_id()
+
+            web._build_seen.clear()
+            self.assertEqual(web.build_id(), before,
+                             'the same bytes got two names')
+
+            with open(os.path.join(room, 'app.js'), 'w') as handle:
+                handle.write('second, and a different length')
+            web._build_seen.clear()
+            self.assertNotEqual(web.build_id(), before,
+                                'a changed asset went unnoticed')
+        finally:
+            web.ASSETS = original
+            web._build_seen[:] = seen
+            shutil.rmtree(room, ignore_errors=True)
+
+    def test_a_missing_asset_is_a_name_rather_than_a_crash(self):
+        """This runs on the request path of every page load. Whatever a
+        half-finished rsync leaves behind, the page still has to serve."""
+        import shutil
+        import tempfile
+
+        original = web.ASSETS
+        seen = list(web._build_seen)
+        room = tempfile.mkdtemp()
+        try:
+            web.ASSETS = room                      # nothing in it at all
+            web._build_seen.clear()
+            self.assertTrue(web.build_id())
+        finally:
+            web.ASSETS = original
+            web._build_seen[:] = seen
+            shutil.rmtree(room, ignore_errors=True)
+
+    def test_the_console_asks_beside_itself_and_not_under_itself(self):
+        """The console is at /console/ and the api is its sibling. `api/build`
+        would resolve to /console/api/build, which is an asset name, which is
+        a 404 -- and a check that always fails quietly is a check that is not
+        running. Relative, because the prefix `tailscale serve --set-path`
+        adds is not something this page can know."""
+        _head, script = self.get('/console/app.js')
+        source = script.decode('utf-8')
+        self.assertIn("'../api/build'", source)
+        _head, body = self.get('/api/build')
+        self.assertTrue(json.loads(body)['build'])
+
+    def test_the_notice_offers_the_one_action_that_fixes_it(self):
+        """A notice you cannot act on is a worse version of no notice."""
+        for path, ident in (('/', 'update'), (web.CONSOLE, 'newbuild')):
+            with self.subTest(page=path):
+                _head, body = self.get(path)
+                page = body.decode('utf-8')
+                self.assertIn(f'id="{ident}"', page)
+                self.assertIn('hidden', page[page.index(f'id="{ident}"'):
+                                             page.index(f'id="{ident}"') + 200])
+        for asset in ('/console/app.js', '/dash.js'):
+            with self.subTest(script=asset):
+                _head, script = self.get(asset)
+                self.assertIn('location.reload()', script.decode('utf-8'))
+
+    def test_the_console_asks_again_every_time_it_comes_back(self):
+        """Resuming from a snapshot is the moment a stale page reappears, so
+        it is the moment worth asking. Checking only at load would never fire
+        on the one path that produces the problem."""
+        source = self.get('/console/app.js')[1].decode('utf-8')
+        handler = _extract(source, 'checkBuild')
+        self.assertIn('api/build', handler)
+        visible = source[source.index("addEventListener('visibilitychange'"):]
+        self.assertIn('checkBuild()', visible[:400])
+
+    def test_the_notice_overlays_the_terminal_instead_of_resizing_it(self):
+        """Every row of this layout is a row the terminal does not get, and a
+        notice that reflowed the pty to announce itself would be a worse bug
+        than the one it reports. Measured at 390x844: the bar appears, the
+        terminal stays 495px and 45 rows.
+        """
+        _head, body = self.get(web.CONSOLE)
+        css = re.sub(r'/\*.*?\*/', '', body.decode('utf-8'), flags=re.S)
+        block = re.search(r'#overlays \{(.*?)\}', css, re.S).group(1)
+        self.assertIn('position: absolute', block)
+        # The empty strip must not eat the gesture that reads the scrollback.
+        self.assertIn('pointer-events: none', block)
+        self.assertIn('#overlays > button { pointer-events: auto; }', css)
+
+    def test_two_things_talking_at_once_stack_rather_than_hide_each_other(self):
+        """Both are plausible together: you scroll up to read something, the
+        app goes to the background, and it comes back with a deploy waiting.
+        Pinned separately to top: 0 they were exactly on top of each other,
+        and the one underneath -- always the newer of the two -- was simply
+        never seen.
+
+        Measured with both showing: history 0-35, the build notice 35-69, and
+        the terminal still 495px of 45 rows.
+        """
+        _head, body = self.get(web.CONSOLE)
+        page = body.decode('utf-8')
+        wrap = page[page.index('<div id="overlays">'):]
+        wrap = wrap[:wrap.index('</div>')]
+        self.assertEqual(re.findall(r'<button id="(\w+)"', wrap),
+                         ['hist', 'newbuild'])
+        css = re.sub(r'/\*.*?\*/', '', page, flags=re.S)
+        for ident in ('#hist', '#newbuild'):
+            with self.subTest(bar=ident):
+                block = re.search(re.escape(ident) + r' \{(.*?)\}',
+                                  css, re.S).group(1)
+                self.assertNotIn('position: absolute', block,
+                                 'pinned to the top again, so it stacks on '
+                                 'the other one instead of under it')
+                self.assertIn('display: block', block)
+                # A hidden bar has to take no space, or one that never fires
+                # still costs the terminal a row.
+                self.assertIn(ident + '[hidden] { display: none; }', css)
+
+    def test_the_quiet_stamp_costs_the_terminal_nothing(self):
+        """It sits in the drawer's own scroll. Anywhere else on this page is
+        a row of a layout whose whole point is that the terminal gets what is
+        left over."""
+        _head, body = self.get(web.CONSOLE)
+        page = body.decode('utf-8')
+        sheet = page[page.index('<div id="sheet">'):page.index('id="grab"')]
+        self.assertIn('id="buildline"', sheet)
+
+
 class WebsocketBridgeTests(_ServedFixture):
     def test_the_upgrade_completes_and_proves_it_read_the_key(self):
         sock, key, head = self._open()
@@ -1794,6 +1993,12 @@ var pinRow = new El('div'), editButton = new El('button');
 // resized, and the whole point of the sheet is that opening it does not.
 var pad = new El('div'), host = new El('div');
 var sheet = new El('div'), sheetKeys = new El('div');
+// The last line of the drawer's own scroll: which build this page is. Height,
+// not a stub of zero -- it is counted into the drawer's content precisely so
+// that it cannot end up just under the fold of a drawer reporting itself as
+// exactly full.
+var buildLine = new El('div');
+buildLine._height = 28;
 // The pad's height is the rows it lays out, which is the thing the page reads
 // it for: whether that number changed is what decides whether the pty gets
 // resized. Modelled rather than stubbed at a constant, because a constant
@@ -2539,6 +2744,9 @@ class KeypadVocabularyTests(unittest.TestCase):
         Measured after, at 820x1180: 431px, 37% of the screen, all forty-two
         keys on show, and the terminal still does not move. The phone is
         unchanged.
+
+        300 of keys, 14 of the sheet's own padding, and 28 for the build line
+        under them -- everything the drawer holds, and nothing it does not.
         """
         self.assertEqual(self.run_js(
             self.SETUP
@@ -2547,7 +2755,24 @@ class KeypadVocabularyTests(unittest.TestCase):
             + 'expanded = true; sheetHeight = 0; sizeSheet();'
             + 'console.log(JSON.stringify('
             + '  [sheetContent(), Math.round(freeSpace()), sheetHeight]));'),
-            [314, 702, 314])
+            [342, 702, 342])
+
+    def test_an_unmeasured_list_is_not_a_short_one(self):
+        """Zero rows means the keys have not been laid out yet, which is not
+        the same as a drawer with nothing to show -- and capping the drawer at
+        an unmeasured content height opens it at nothing.
+
+        The caller used to tell the two apart by the number being small, which
+        held only while nothing else sat under the keys. Adding one 28px line
+        was enough to carry an empty drawer past the threshold and open it two
+        rows tall on a screen with room for ten -- the exact symptom, from a
+        new cause, that this whole section exists to have fixed.
+        """
+        self.assertEqual(self.sizing(
+            'sheetKeys._height = 0;'                 # nothing rendered yet
+            'sizeSheet();'
+            'console.log(JSON.stringify([sheetContent(), sheetHeight]));'),
+            [0, 255])
 
     def test_selecting_text_is_a_mode_and_undoes_exactly_what_blocks_it(self):
         """Two rules stop a finger selecting anything, and both are
@@ -3445,11 +3670,14 @@ class KeypadVocabularyTests(unittest.TestCase):
         keep is only meaningful while you can see the keys, which is when the
         sheet is open. So it moved into the sheet.
         """
+        # Every button on the page, in order. `hist` and `newbuild` are the
+        # two that overlay the terminal rather than taking a row of the
+        # layout, which is why neither costs the settings row a slot.
         controls = re.findall(r'<button id="(\w+)"', self.html)
         self.assertEqual(controls,
-                         ['hist', 'edit', 'grab', 'back', 'fontminus',
-                          'fontauto', 'fontplus', 'kbd', 'sel', 'hide',
-                          'grip'])
+                         ['hist', 'newbuild', 'edit', 'grab', 'back',
+                          'fontminus', 'fontauto', 'fontplus', 'kbd', 'sel',
+                          'hide', 'grip'])
         row = self.html[self.html.index('<div id="tabs">'):]
         row = row[:row.index('</div>')]
         self.assertEqual(re.findall(r'<button id="(\w+)"', row),

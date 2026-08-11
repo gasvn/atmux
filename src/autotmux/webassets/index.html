@@ -21,6 +21,11 @@
 <!-- The widths the dashboard has layouts for, filled in by the server from
      config.LAYOUT_WIDTHS. app.js sizes the font to land on one of them. -->
 <!--layout-->
+<!-- Which build this page is, stamped in by the server. On a phone this is a
+     home-screen app, and iOS resumes one from a snapshot instead of fetching
+     it, so a page can be days behind a correctly-served deploy and say
+     nothing. app.js compares this against the server on every foreground. -->
+<!--build-->
 <!--bootstrap-->
 <style>
   /* The one navigation this app has -- tap a session on the list, land in it
@@ -145,9 +150,23 @@
      the moment it appeared, and giving the terminal a different number of
      rows mid-swipe makes tmux reflow and repaint the whole screen -- a jolt
      on every gesture. #app is position:fixed, so this anchors to it. */
-  #hist {
+  /* The two things that overlay the terminal instead of taking a row of the
+     layout. Stacked in a column rather than each pinned to top: 0 -- they
+     were, and the second one to appear simply covered the first. Both are
+     plausible at once: you scroll up to read something, the app goes to the
+     background, and it comes back with a deploy waiting.
+     A hidden one takes no space, so with one showing this is exactly what a
+     single pinned bar was. */
+  #overlays {
     position: absolute; top: 0; left: 0; right: 0; z-index: 15;
-    text-align: center; padding: 9px 8px;
+    /* The container spans the terminal; only the bars in it may be touched.
+       Without this, an empty overlay strip would swallow every tap on the
+       top of the terminal -- including the drag that reads the scrollback. */
+    pointer-events: none;
+  }
+  #overlays > button { pointer-events: auto; }
+  #hist {
+    display: block; text-align: center; padding: 9px 8px;
     font: 13px/1.2 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
     color: #f0d9a0; background: #3a3020;
     /* A button now, so the defaults have to be undone rather than inherited. */
@@ -158,6 +177,30 @@
   }
   #hist:active { background: #4a3d28; }
   #hist[hidden] { display: none; }
+  /* A deploy landed and this page is still the old one. Overlaid like #hist
+     and for the same reason -- there is no row of the layout to spare here,
+     and the terminal must not resize to make room for a notice. Under it in
+     the stack, because where you are in the scrollback is the more urgent of
+     the two.
+     Blue, not the amber of #hist: nothing is wrong, something is available. */
+  #newbuild {
+    display: block; text-align: center; padding: 9px 8px;
+    font: 13px/1.2 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    color: #bcd8f5; background: #1b2c3e;
+    border: 0; border-bottom: 1px solid #2c4763; width: 100%;
+    -webkit-appearance: none; appearance: none;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none; -webkit-user-select: none; touch-action: none;
+  }
+  #newbuild:active { background: #24384e; }
+  #newbuild[hidden] { display: none; }
+  /* The quiet half. Last line of the drawer's own scroll, so it costs the
+     terminal nothing and is found by the one gesture that reaches it. */
+  #buildline {
+    padding: 10px 4px calc(6px + env(safe-area-inset-bottom));
+    color: var(--label); font-size: 11px; text-align: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
   /* Anyone who has asked the system for less motion gets the states without
      the travel. The states are the information; the movement is manners. */
   @media (prefers-reduced-motion: reduce) {
@@ -665,8 +708,15 @@
        reader never mentioned -- while every key around it carried an
        aria-label. aria-live is polite rather than assertive because it also
        updates on every frame of a drag. -->
-  <button id="hist" type="button" hidden
-          aria-live="polite" aria-label="stop reading history"></button>
+  <!-- Everything that speaks over the terminal, in one column so that two of
+       them showing at once stack instead of hiding each other. -->
+  <div id="overlays">
+    <button id="hist" type="button" hidden
+            aria-live="polite" aria-label="stop reading history"></button>
+    <!-- Shown only when the server is serving a build this page is not. -->
+    <button id="newbuild" type="button" hidden
+            aria-live="polite" aria-label="load the newer build"></button>
+  </div>
   <div id="pad">
     <!-- esc, the two modifiers, tab and the arrows. Fixed, in this order, and
          nothing below may reflow it: a key that moves because the far end
@@ -690,6 +740,9 @@
       <button id="edit" aria-label="choose which keys to keep"
               hidden>☆ keep</button>
       <div id="sheetkeys"></div>
+      <!-- Which build this is. Inside the drawer's scroll on purpose: it is
+           a thing you look up, not a thing you read. -->
+      <div id="buildline"></div>
     </div>
     <!-- The seam of the drawer, and the one control that opens it.
          It used to be a `⌄ 38` button in the settings row, four buttons away

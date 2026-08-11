@@ -18,6 +18,10 @@
      puts the trailing slash back, and every href below is resolved against
      the address the browser actually asked for. -->
 <!--bootstrap-->
+<!-- Which build this page is. The five-second poll already carries the
+     server's, so this page can notice a deploy without asking anything
+     extra -- see dash.js. -->
+<!--build-->
 <style>
   /* A list, not a terminal. Everything the console had to fight for -- a
      layout that fits, text that wraps, rows you can touch, a keyboard that
@@ -164,6 +168,25 @@
     margin: 10px 14px; padding: 10px 12px; border-radius: 8px;
     background: #2a1a1a; color: #f0a0a0; font-size: 13px;
   }
+  /* A deploy landed while this page was open, or while it was a home-screen
+     app iOS had put to sleep. Under the header rather than in the footer: at
+     the bottom of a long list it would be a notice nobody is looking at. */
+  #update {
+    display: block; width: calc(100% - 28px); margin: 10px 14px;
+    padding: 11px 12px; border: 1px solid #1f4a6d; border-radius: 8px;
+    background: #16283a; color: var(--accent); font: inherit;
+    font-size: 14px; text-align: left; -webkit-appearance: none;
+  }
+  #update:active { background: #1c3348; }
+  #update[hidden] { display: none; }
+  /* The quiet half: what this page is, when it is already current. Small,
+     last, and never in the way -- but there, so "did it update?" has an
+     answer you can read instead of a deploy you have to take on faith. */
+  #build {
+    margin: 22px 14px calc(18px + env(safe-area-inset-bottom));
+    color: var(--dim); font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
   @media (prefers-color-scheme: light) {
     /* Deliberately none: this is a dashboard for a dark terminal workflow
        and it sits beside a terminal. One look, chosen. */
@@ -181,11 +204,17 @@
      is announced rather than only drawn. -->
 <div id="pull" role="status"></div>
 <div id="err" class="err" hidden></div>
+<!-- Shown only when the server is serving a build this page is not. A button
+     because the fix is one tap, and a tap is the whole point: the reason this
+     exists is that reloading a home-screen app is otherwise a gesture most
+     people do not know they need. -->
+<button id="update" type="button" hidden></button>
 <ul id="list"></ul>
 <section id="queue" hidden>
   <h2 id="queue-title">queue</h2>
   <pre id="queue-body"></pre>
 </section>
+<footer id="build"></footer>
 <script src="dash.js"></script>
 </body>
 </html>
