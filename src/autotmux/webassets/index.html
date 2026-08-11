@@ -80,6 +80,11 @@
   }
   #term {
     flex: 1 1 auto; min-height: 0;
+    /* So the selecting layer can be laid over exactly this box. Absolute
+       against #app instead would cover the pad as well, and against the
+       viewport it would have to be told where the terminal is -- which
+       changes with the software keyboard, the drawer and the font. */
+    position: relative;
     /* No padding at all. A terminal is a grid of whole cells, so its size is
        quantised and something is always left over; padding adds to that
        leftover without buying anything. app.js sizes the terminal to exactly
@@ -270,14 +275,62 @@
      Both are undone here and nowhere else, because both are load-bearing the
      rest of the time: without them a drag over the terminal cannot page the
      scrollback at all. */
-  body.selecting #term { touch-action: auto; }
-  body.selecting .xterm,
-  body.selecting .xterm .xterm-screen,
-  body.selecting .xterm-rows,
-  body.selecting .xterm-rows * {
-    user-select: text !important;
-    -webkit-user-select: text !important;
-    -webkit-touch-callout: default !important;
+  /* Not xterm's own rows. Touch selection over them does not work on iOS
+     with any renderer -- DOM, canvas or WebGL alike (xtermjs/xterm.js#3727,
+     still open) -- so lifting the two rules that block it was necessary and
+     was never going to be sufficient, and was not: measured on this page,
+     user-select went none -> text all the way down to the span and a real
+     long press still selected nothing. There was a third thing holding it,
+     xterm's offscreen helper textarea keeps the caret, and past that there
+     is however much of the upstream bug is left. That is not a stack worth
+     fighting one layer at a time.
+     So this does not use xterm at all. `copy` lays the same text out as an
+     ordinary <pre>, which every browser has known how to long-press, select
+     and copy for twenty years. It reaches further than the screen too: the
+     scrollback is in there, so a line that has already scrolled past can
+     still be selected -- which the terminal itself could never offer. */
+  #selview {
+    position: absolute; inset: 0; z-index: 4;
+    display: flex; flex-direction: column;
+    background: #101014;
+  }
+  #selview[hidden] { display: none; }
+  #selbar {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+    padding: 7px 9px; background: var(--panel-top);
+    border-bottom: 1px solid #2a2a32;
+    /* The one part of this layer that must NOT be selectable. A drag that
+       starts a little high otherwise picks up the instructions along with
+       the line you were after, and pastes them into whatever you paste into
+       -- measured: a drag aimed at a row of output returned "press and hold
+       to select". */
+    user-select: none; -webkit-user-select: none;
+  }
+  #selhint {
+    flex: 1 1 auto; min-width: 0; color: var(--label); font-size: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  }
+  #selbar button {
+    flex: 0 0 auto; min-height: 36px; padding: 0 14px;
+    border: 1px solid #34343e; border-radius: 9px;
+    background: #24242c; color: #e6e6ea; font-size: 13px;
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    -webkit-appearance: none; appearance: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #selbar button:active { background: #30303a; }
+  #seltext {
+    flex: 1 1 auto; margin: 0; overflow: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 6px 10px calc(6px + env(safe-area-inset-bottom));
+    color: #d8d8dc; white-space: pre;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    /* Everything a terminal has to switch off in order to be a terminal.
+       This is not a terminal, so it switches all of it back on -- including
+       the pan, which is how the browser scrolls this natively. */
+    user-select: text; -webkit-user-select: text;
+    -webkit-touch-callout: default;
+    touch-action: auto;
   }
   /* Says which mode the terminal is in without covering anything: the pad is
      the only thing that changes colour, and it is not what you are reading. */
@@ -583,10 +636,25 @@
   .key { position: relative; }
   #tabs {
     flex: 0 0 auto;
-    /* Seven controls at 44 plus a word on two of them is 382px of a 390px
+    /* Seven controls at 44 plus a word on two of them is 385px of a 390px
        phone once the gap comes down to 5. Measured, because eight at these
-       sizes does not fit and the one that does not fit goes off the edge. */
+       sizes does not fit and the one that does not fit goes off the edge.
+       Measured again at 375: 370. And at 320, where every one of them is
+       clamped to the 44px floor and the labels stop mattering: 348 of 320,
+       so `hide` -- the way out of the pad -- sat 28px past the edge with no
+       way to reach it. Seven 44px targets and six gaps cannot fit 320 by any
+       arrangement, so the only honest answers are a smaller target or a
+       second row, and 44 is the floor for a reason.
+       Not `flex-wrap: wrap` outright: wrapping is decided on the base width,
+       before shrinking, so a plain wrap sent 375 onto two rows as well --
+       where the row fits perfectly well once `back` gives up four pixels.
+       Measured: 375 went from 370-of-375 on one row to two. So the wrap is
+       held behind the width where shrinking has actually run out. 7x44 plus
+       six 5px gaps plus 10 of padding is 348, and that is the number. */
     display: flex; gap: 5px; padding: 0 5px 6px; align-items: center;
+  }
+  @media (max-width: 347px) {
+    #tabs { flex-wrap: wrap; }
   }
   /* Settings, not keys: these change how the pad behaves rather than typing
      anything, so they are cut INTO the panel where the caps sit ON it. Same
@@ -684,7 +752,20 @@
 </head>
 <body>
 <div id="app">
-  <div id="term"></div>
+  <div id="term">
+    <!-- The selecting layer. Empty and hidden until `copy` is tapped, and
+         filled from the terminal buffer at that moment: a snapshot is what
+         you want to select from, since text that reflows under a long press
+         is text you cannot get hold of. -->
+    <div id="selview" hidden>
+      <div id="selbar">
+        <span id="selhint">press and hold to select</span>
+        <button id="selpaste" type="button">paste</button>
+        <button id="seldone" type="button">done</button>
+      </div>
+      <pre id="seltext"></pre>
+    </div>
+  </div>
   <!-- Two sources, and the split is the design. What the *app* can do is
        published by the app (keypad.py, OSC 7710) and never written here,
        because a copy is only correct on the day it is written. What a
@@ -778,7 +859,12 @@
            mean select this text. It cannot mean both, so which one is a mode
            and it is here rather than guessed at from how long a finger
            rested. -->
-      <button id="sel" aria-label="select text to copy">sel</button>
+      <!-- `copy`, not `sel`. The word people look for when they want this is
+           copy, and a two-letter abbreviation of a thing nobody found is a
+           thing nobody finds twice. Paste lives inside it, because the layer
+           that can be selected from is also the only place with anything to
+           paste into. -->
+      <button id="sel" aria-label="copy and paste text">copy</button>
       <button id="hide" aria-label="hide the keys">hide</button>
     </div>
   </div>

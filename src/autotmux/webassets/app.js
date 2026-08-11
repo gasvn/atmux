@@ -1512,16 +1512,54 @@
   // two and stands the terminal's own handlers down while it does.
   var selecting = false;
   var selButton = document.getElementById('sel');
+  var selView = document.getElementById('selview');
+  var selText = document.getElementById('seltext');
+  var selHint = document.getElementById('selhint');
+
+  // Everything the terminal is holding, scrollback first. buffer.active runs
+  // from the oldest retained line to the bottom of the screen, so this is
+  // strictly more than the terminal can show -- and being able to select a
+  // line that has already scrolled past is the part people actually want.
+  function bufferText() {
+    var buf = term.buffer.active;
+    var out = [];
+    for (var i = 0; i < buf.length; i++) {
+      var line = buf.getLine(i);
+      out.push(line ? line.translateToString(true) : '');
+    }
+    // The unwritten tail of the screen is not content; it is just the part
+    // of the grid nothing has been printed on.
+    while (out.length && !out[out.length - 1]) out.pop();
+    return out.join('\n');
+  }
+
   function setSelecting(on) {
     selecting = !!on;
     document.body.classList.toggle('selecting', selecting);
     if (selButton) selButton.classList.toggle('on', selecting);
+    if (!selView) return;
     if (selecting) {
-      // Reading is over: a selection made in copy-mode would be a selection
-      // of a screen that is not live and cannot be typed into afterwards.
+      // Reading is over: a selection made in copy-mode would be of a screen
+      // that is not live and cannot be typed into afterwards.
       if (scrolledBack) leaveHistory();
-      say('press and hold to select · sel to stop', true);
+      selText.textContent = bufferText();
+      // Same size as the terminal it is standing in for, so the columns line
+      // up and a selection looks like the thing being selected.
+      selText.style.fontSize = term.options.fontSize + 'px';
+      selView.hidden = false;
+      // The caret must be nowhere. xterm parks an offscreen textarea and
+      // keeps it focused so the software keyboard has something to type
+      // into, and a focused editable is what a long press reaches for before
+      // it reaches for the text under the finger.
+      try {
+        var box = host.querySelector('textarea');
+        if (box) box.blur();
+      } catch (e) {}
+      // Where you were, which is the live end.
+      selText.scrollTop = selText.scrollHeight;
+      if (selHint) selHint.textContent = 'press and hold to select';
     } else {
+      selView.hidden = true;
       try {
         var sel = window.getSelection && window.getSelection();
         if (sel) sel.removeAllRanges();
@@ -1530,6 +1568,42 @@
       term.focus();
     }
   }
+
+  // Paste, which the terminal could never offer at all: there is nothing on
+  // this page a long press can paste *into*, because the only editable is
+  // offscreen and one cell wide. Reading the clipboard is the only way in,
+  // and it is a deliberate act -- Safari puts its own confirmation in front
+  // of it, which is the right amount of friction for something that types
+  // into a shell.
+  function pasteFromClipboard() {
+    if (!navigator.clipboard || !navigator.clipboard.readText) {
+      if (selHint) selHint.textContent = 'this browser will not hand over '
+                                       + 'the clipboard';
+      return;
+    }
+    navigator.clipboard.readText().then(function (text) {
+      if (!text) {
+        if (selHint) selHint.textContent = 'the clipboard is empty';
+        return;
+      }
+      setSelecting(false);
+      sendText(text);
+    }).catch(function () {
+      if (selHint) selHint.textContent = 'paste was refused — tap paste '
+                                       + 'again and allow it';
+    });
+  }
+
+  var selPaste = document.getElementById('selpaste');
+  var selDone = document.getElementById('seldone');
+  if (selPaste) selPaste.addEventListener('click', function (event) {
+    event.preventDefault();
+    pasteFromClipboard();
+  });
+  if (selDone) selDone.addEventListener('click', function (event) {
+    event.preventDefault();
+    setSelecting(false);
+  });
   keepFocus(selButton);
   if (selButton) selButton.addEventListener('click', function (event) {
     event.preventDefault();

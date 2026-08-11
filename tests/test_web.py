@@ -1203,12 +1203,32 @@ class TouchKeypadTests(unittest.TestCase):
         """flex-wrap stretched whichever key landed alone on the last line
         into a full-width button, which read as something important rather
         than as the leftover it was -- and the one it did that to was `q`,
-        which quits."""
+        which quits.
+
+        The fault is wrapping *a row whose children grow*, not wrapping. It
+        was written as "no flex-wrap anywhere", which is a bigger rule than
+        the reason for it, and it made the settings row -- where nothing
+        grows -- unable to rescue a 320px phone from losing `hide` off the
+        right edge. So it is stated as what it means: keys never wrap, and
+        anything that does wrap has nothing in it that can stretch.
+        """
         self.assertNotIn('.krow.wrap', self.html)
         # Comments may still explain why; the declaration must be gone.
         css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
-        self.assertNotIn('flex-wrap', css)
         self.assertRegex(css, r'\.krow \.key \{[^}]*flex: 1 1 0')
+        krow = re.search(r'\.krow \{(.*?)\}', css, re.S).group(1)
+        self.assertNotIn('flex-wrap', krow, 'the key rows may never wrap')
+        # Whatever else wraps must not be able to stretch a lone leftover.
+        for block in re.findall(r'([#.][\w-]+) \{([^}]*flex-wrap: wrap[^}]*)\}',
+                                css):
+            name = block[0]
+            with self.subTest(wraps=name):
+                self.assertNotIn('.krow', name)
+                kids = re.search(re.escape(name) + r' \w+ \{(.*?)\}', css,
+                                 re.S)
+                if kids:
+                    self.assertNotIn('flex: 1 1', kids.group(1),
+                                     f'{name} wraps and its children grow')
 
 
     def test_detach_moved_to_the_side_that_can_offer_it_all_the_time(self):
@@ -2787,16 +2807,99 @@ class KeypadVocabularyTests(unittest.TestCase):
         inferred from how long a finger rested: guessing costs a page of
         scrollback every time it guesses wrong, and there is no way to tell
         the reader what it guessed.
+
+        This does not try to make xterm's rows selectable. That was the first
+        attempt: lift the two blocking rules and stand the gesture handlers
+        down. Measured afterwards on this page, user-select really did go
+        none -> text the whole way down to the span and touch-action none ->
+        auto -- and a real long press still selected nothing, because xterm
+        also parks a focused offscreen textarea in front of the gesture, and
+        because touch selection over xterm does not work on iOS with any
+        renderer at all (xtermjs/xterm.js#3727, open). A stack like that is
+        not worth fighting one layer at a time.
+
+        So `copy` lays the same text out as an ordinary <pre> over the
+        terminal. Nothing about it is clever, which is the point: a <pre> is
+        the construct every browser has known how to long-press, select and
+        copy since long before this one existed.
         """
         css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
-        self.assertIn('body.selecting #term { touch-action: auto; }', css)
-        block = re.search(r'body\.selecting \.xterm,(.*?)\}', css, re.S)
-        self.assertIsNotNone(block, 'nothing re-enables user-select')
-        self.assertIn('user-select: text !important', block.group(0))
-        self.assertIn('-webkit-touch-callout: default', block.group(0))
+        block = re.search(r'#seltext \{(.*?)\}', css, re.S)
+        self.assertIsNotNone(block, 'there is no selectable layer')
+        body = block.group(1)
+        for rule in ('user-select: text', '-webkit-user-select: text',
+                     '-webkit-touch-callout: default', 'touch-action: auto',
+                     'white-space: pre'):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, body)
         # And the terminal's own gesture handlers stand down while it is on,
         # or the first drag pages the scrollback out from under the selection.
         self.assertEqual(self.js.count('if (selecting) return;'), 3)
+
+    def test_the_selectable_layer_holds_more_than_the_screen_does(self):
+        """buffer.active starts at the oldest retained line, not at the top of
+        the screen -- so what you can select from includes the scrollback,
+        which is the part the terminal itself could never offer a finger."""
+        source = _extract(self.js, 'bufferText')
+        self.assertIn('term.buffer.active', source)
+        self.assertIn('translateToString', source)
+        # From 0, not from baseY: starting at the viewport would leave the
+        # scrollback out and this would only ever be the visible screen.
+        self.assertIn('i = 0', source.replace(' ', ' '))
+        self.assertNotIn('baseY', source)
+
+    def test_nothing_else_holds_the_caret_while_selecting(self):
+        """xterm parks a 6x11 textarea at opacity 0 behind the screen and
+        keeps it focused so the software keyboard has somewhere to type. A
+        focused editable is what a long press reaches for before it reaches
+        for the text under the finger, and it stayed focused through the
+        whole of the first attempt -- measured, in both modes."""
+        toggle = _extract(self.js, 'setSelecting')
+        self.assertIn('blur()', toggle)
+        self.assertIn('textarea', toggle)
+
+    def test_the_instructions_are_not_part_of_what_you_are_selecting(self):
+        """Measured: a drag aimed at a line of output came back with 'press
+        and hold to select', because the bar above it was ordinary selectable
+        text sitting in the same layer."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        bar = re.search(r'#selbar \{(.*?)\}', css, re.S).group(1)
+        self.assertIn('user-select: none', bar)
+        self.assertIn('-webkit-user-select: none', bar)
+
+    def test_paste_is_offered_because_nothing_can_be_pasted_into(self):
+        """The only editable on this page is xterm's offscreen helper, one
+        cell wide and behind the screen. There is nowhere for a long press to
+        paste, so the clipboard has to be read directly -- and that is the
+        one clipboard call that needs a real gesture behind it, which is why
+        it hangs off a button rather than happening on open."""
+        source = _extract(self.js, 'pasteFromClipboard')
+        self.assertIn('navigator.clipboard', source)
+        self.assertIn('readText', source)
+        self.assertIn('sendText', source)
+        # A browser that refuses must say so rather than look broken.
+        self.assertIn('catch', source)
+        page = self.html
+        self.assertIn('id="selpaste"', page)
+
+    def test_the_controls_still_fit_the_narrowest_phone(self):
+        """Seven 44px targets and six 5px gaps in 10px of padding is 348, and
+        no arrangement makes that fit 320 -- so on a 320 phone `hide`, which
+        is the way out of the pad, sat 28px past the right edge with nothing
+        able to reach it. It predates the layer this commit is about.
+
+        Measured after: 430/390/375/360 one row and never over; 348 exactly
+        348 of 348; 347 and 320 on two rows with nothing off the edge.
+        """
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        row = re.search(r'#tabs \{(.*?)\}', css, re.S).group(1)
+        # Not an unconditional wrap: wrapping is decided before shrinking, so
+        # a plain `flex-wrap: wrap` puts 375 on two rows for four pixels.
+        self.assertNotIn('flex-wrap: wrap', row)
+        guard = re.search(r'@media \(max-width: (\d+)px\) \{\s*'
+                          r'#tabs \{ flex-wrap: wrap; \}', css)
+        self.assertIsNotNone(guard, 'nothing rescues the narrowest phone')
+        self.assertEqual(int(guard.group(1)), 347)
 
     def test_leaving_selection_mode_puts_the_terminal_back(self):
         """A selection left behind is a selection the next tap extends."""
@@ -3670,14 +3773,15 @@ class KeypadVocabularyTests(unittest.TestCase):
         keep is only meaningful while you can see the keys, which is when the
         sheet is open. So it moved into the sheet.
         """
-        # Every button on the page, in order. `hist` and `newbuild` are the
-        # two that overlay the terminal rather than taking a row of the
-        # layout, which is why neither costs the settings row a slot.
+        # Every button on the page, in order. The first three cost the
+        # settings row nothing: `selpaste` and `seldone` live inside the
+        # selecting layer and only exist while it is open, and `hist` and
+        # `newbuild` overlay the terminal rather than taking a row.
         controls = re.findall(r'<button id="(\w+)"', self.html)
         self.assertEqual(controls,
-                         ['hist', 'newbuild', 'edit', 'grab', 'back',
-                          'fontminus', 'fontauto', 'fontplus', 'kbd', 'sel',
-                          'hide', 'grip'])
+                         ['selpaste', 'seldone', 'hist', 'newbuild', 'edit',
+                          'grab', 'back', 'fontminus', 'fontauto', 'fontplus',
+                          'kbd', 'sel', 'hide', 'grip'])
         row = self.html[self.html.index('<div id="tabs">'):]
         row = row[:row.index('</div>')]
         self.assertEqual(re.findall(r'<button id="(\w+)"', row),
