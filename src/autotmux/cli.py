@@ -3365,19 +3365,31 @@ class AutotmuxApp(App):
            table silently clipped LOAD and STATUS off the right edge. */
         width: 56%;
         height: 100%;
-        border-right: solid $primary;
     }
-    /* Layout modes (`z`). The divider goes with the pane it divides from:
+    /* Layout modes (`z`). The divider belongs to the preview, not the table:
        a rule down the right edge of a full-width table is a frame, not a
-       separator, and reads as clipped content. */
+       separator, and reads as clipped content. Owned by the pane that only
+       exists when there is something to divide, it simply leaves with it --
+       and it is also where this pane says whether it has the keyboard, which
+       is a thing it must say without costing a column to say it. */
     #left_pane.-full {
         width: 100%;
-        border-right: none;
     }
     #right_pane_scroll {
         width: 44%;
         background: $surface;
         padding: 0 1;
+        border-left: solid $primary;
+    }
+    /* Which pane the arrow keys are steering. Both rules are one cell wide,
+       so lighting one up never reflows anything -- the alternative, a border
+       that appears on focus, moves every column beside it at the moment the
+       reader is looking for where they just went. */
+    #right_pane_scroll:focus {
+        border-left: thick $accent;
+    }
+    #jobs_scroll:focus {
+        border-top: thick $accent;
     }
     #right_pane {
         width: 100%;
@@ -3427,6 +3439,23 @@ class AutotmuxApp(App):
         # buys the footer the room for `z`, which has nowhere else to appear.
         Binding("j", "toggle_jobs_view", "Jobs panel", show=False),
         Binding("z", "cycle_layout", "Layout"),
+        # Which pane the arrows steer. Tab is Textual's own, bound again here
+        # only so the footer says so: a pane you cannot reach is the same as a
+        # pane that is not there, and for the preview and the queue that was
+        # literally true over SSH, where mouse reporting is off.
+        # priority, because Screen binds tab -> app.focus_next itself with
+        # show=False, and the screen is asked before the app -- so an
+        # unprioritised copy here would never fire and, more to the point,
+        # never appear in the footer. The action is the same one Textual's own
+        # binding calls and it acts on the *active* screen, so a modal with an
+        # Input still tabs between its own fields exactly as before.
+        Binding("tab", "focus_next", "Panes", priority=True),
+        Binding("shift+tab", "focus_previous", "Panes", show=False,
+                priority=True),
+        Binding("escape", "focus_table", "Back to sessions", show=False),
+        Binding("1", "focus_pane('table')", "Sessions pane", show=False),
+        Binding("2", "focus_pane('preview')", "Preview pane", show=False),
+        Binding("3", "focus_pane('jobs')", "Jobs pane", show=False),
         Binding("w", "web_dashboard", "Web", show=False),
         Binding("g", "manage_connections", "Clusters"),
         Binding("e", "edit_note", "Note", show=False),
@@ -3452,7 +3481,10 @@ class AutotmuxApp(App):
     HELP_SECTIONS = [
         ("Connect", [
             ("Enter", "Attach to an existing session", "survives"),
-            ("click", "Same as Enter, in one action", "survives"),
+            # Named honestly: mouse reporting is off by default over SSH, so
+            # on the connection most people read this over, this row was
+            # advertising a way in that does nothing. `--mouse` turns it on.
+            ("click", "Same as Enter (mouse is off over SSH)", "survives"),
             ("o", "Attach in a separate window, keeping this table", "survives"),
             ("s", "Plain SSH shell on that node", "dies on exit"),
             ("t", "Local tmux on this machine", "survives"),
@@ -3465,6 +3497,18 @@ class AutotmuxApp(App):
         ("Allocation", [
             ("k", "Resubmit the batch script before walltime", "batch only"),
             ("j", "Bottom panel: running / queued jobs", "all jobs"),
+        ]),
+        # Its own section because it is its own idea, and the one people
+        # arrive without: the panes beside the table hold more than they show,
+        # and until now nothing but a mouse could reach the rest -- which over
+        # SSH, where mouse reporting is off, meant nothing at all.
+        ("Panes", [
+            ("tab", "Move the keyboard to the next pane", "lights up"),
+            ("shift+tab", "The same, backwards", "wraps"),
+            ("1", "The session list", "arrows select"),
+            ("2", "The preview", "arrows scroll"),
+            ("3", "The job queue", "← → too"),
+            ("escape", "Back to the session list", "from any pane"),
         ]),
         ("View", [
             ("z", "Cycle layout: split → wide → table → jobs", "remembered"),
@@ -4473,10 +4517,10 @@ class AutotmuxApp(App):
             state = {}
         if self.jobs_view_mode == 'pending':
             text = str(state.get('squeue_pending', '') or '')
-            title = '── PENDING JOBS (squeue --start)  [j: switch view] ──'
+            title = '── PENDING JOBS (squeue --start)  [j: switch · 3: scroll] ──'
         else:
             text = str(state.get('squeue_long', '') or '')
-            title = '── ALL JOBS (squeue -l)  [j: switch view] ──'
+            title = '── ALL JOBS (squeue -l)  [j: switch · 3: scroll] ──'
         text = _dedent_block(text)
         if not text.strip():
             text = '(no squeue data yet — daemon may still be starting)'
@@ -4587,6 +4631,10 @@ class AutotmuxApp(App):
         preview = self.query_one('#right_pane_scroll')
         jobs = self.query_one('#jobs_scroll')
         was_previewing = bool(preview.display)
+        # Captured before anything is shown or hidden: "the table arrived" is
+        # a transition, and after the assignments below there is nothing left
+        # to compare against.
+        was_table = bool(table.display)
         # Not a mode of its own: `z` still cycles the same four, and split
         # simply looks like wide until there is room. A narrow terminal is a
         # property of the screen, not a choice to be remembered.
@@ -4600,16 +4648,46 @@ class AutotmuxApp(App):
         table.set_class(not show_preview, '-full')
         jobs.display = spec['jobs']
         jobs.set_class(spec['expand_jobs'], '-full')
+        table_arrived = bool(spec['table']) and not was_table
 
         # Focus follows what is visible, or the arrow keys steer a widget
-        # nobody can see. The queue becomes focusable only while it *is* the
-        # screen; otherwise a stray Tab would scroll it instead of moving the
-        # session cursor -- the same trap #right_pane_scroll was taken out of.
-        jobs.can_focus = bool(spec['expand_jobs'])
-        if spec['table'] and getattr(self, 'table', None) is not None:
-            self.table.focus()
-        elif spec['expand_jobs']:
-            jobs.focus()
+        # nobody can see.
+        #
+        # Both scrollers were taken out of the focus chain to stop a stray Tab
+        # or click landing there and leaving the arrow keys scrolling a
+        # preview while the reader was trying to move the session cursor. That
+        # fixed the wrong half: it made the panes unreachable instead of
+        # making the focus visible. Over SSH mouse reporting is off by default
+        # -- which is what this tool is for -- so the wheel was not a fallback
+        # either, and the preview and the queue simply could not be scrolled
+        # by any means. Measured: fourteen different keys, 575 hidden rows of
+        # preview, nothing moved.
+        #
+        # So they are focusable whenever they are on screen, and which one has
+        # the keyboard is drawn (see the :focus rules) rather than left to be
+        # inferred from what the arrow keys just did.
+        preview.can_focus = bool(show_preview)
+        jobs.can_focus = bool(spec['jobs'])
+        # Never leave the keyboard pointed at a pane that just left the
+        # screen: the keys would go nowhere and the way back is a key nobody
+        # would think to press.
+        focused = self.focused
+        if focused is not None and not getattr(focused, 'display', True):
+            focused = None
+        elif focused in (preview, jobs) and not focused.can_focus:
+            focused = None
+        # Otherwise leave it where it is. Moving the keyboard under someone
+        # who did not ask is the same fault as not letting them move it, and
+        # `z` fires this on every resize as well as every layout change.
+        #
+        # The exception is the table arriving: it was not on screen, now it
+        # is, and it is what a person opens this to read. Coming back from
+        # the queue-only view should not leave the arrows in the queue.
+        if table_arrived or focused is None:
+            if spec['table'] and getattr(self, 'table', None) is not None:
+                self.table.focus()
+            elif spec['expand_jobs']:
+                jobs.focus()
 
         # Coming back from a mode that suppressed live fetches, the pane still
         # holds whatever it last drew, with nothing to say how old that is.
@@ -4647,6 +4725,43 @@ class AutotmuxApp(App):
         except Exception as error:
             self.notify(f'could not open the web dashboard · {error}',
                         severity='error', timeout=6, markup=False)
+
+    # ── which pane the keyboard is pointed at ────────────────────────────
+    # Tab cycles; the digits are for going straight there, which is what you
+    # want the second time. Both only ever land on a pane that is on screen,
+    # because the focus chain is rebuilt from the layout (see _apply_layout).
+    _PANES = {'table': '#left_pane', 'preview': '#right_pane_scroll',
+              'jobs': '#jobs_scroll'}
+
+    def action_focus_pane(self, name: str) -> None:
+        selector = self._PANES.get(name)
+        if selector is None:
+            return
+        try:
+            pane = self.query_one(selector)
+        except Exception:
+            return
+        # Saying why is the point. Silence here reads as a dead key, which is
+        # the complaint this whole section exists to answer.
+        if not pane.display:
+            self.notify(f'the {name} pane is not in this layout · z to cycle',
+                        timeout=2, markup=False)
+            return
+        if not pane.can_focus:
+            return
+        pane.focus()
+
+    def action_focus_table(self) -> None:
+        """The way back, from anywhere.
+
+        Every pane you can steer into needs one key that returns the arrows to
+        the list without your having to remember which direction you came
+        from -- otherwise focus is a maze, which is what made it worth
+        removing the first time.
+        """
+        table = getattr(self, 'table', None)
+        if table is not None and table.display:
+            table.focus()
 
     async def action_cycle_layout(self) -> None:
         self.layout_mode = config.next_layout(self.layout_mode)

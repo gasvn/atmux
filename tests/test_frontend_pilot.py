@@ -504,26 +504,150 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(cell, autotmux.rich.text.Text)
                 self.assertEqual(cell.plain, '[bold]literal[/bold]')
 
-    async def test_preview_pane_not_focusable_so_arrows_always_move_table(self):
-        """The preview pane must stay out of the focus chain. Otherwise a
-        stray click/Tab moves focus there and up/down scroll the preview
-        instead of moving the session cursor ("can't move up/down")."""
+    async def test_the_arrows_move_the_table_while_the_table_has_the_keyboard(self):
+        """The concern that once emptied the focus chain, kept.
+
+        Both scrollers used to be unfocusable so that a stray click or Tab
+        could not leave up/down scrolling a preview while the reader was
+        trying to move the session cursor. It worked, and it cost more than it
+        saved: over SSH mouse reporting is off by default -- which is what
+        this tool is for -- so with the focus chain empty the preview and the
+        queue could not be scrolled by any means at all. Measured before:
+        fourteen keys tried against 575 hidden rows of preview, nothing moved.
+
+        The real fault was that focus was silent, so it is drawn now (see the
+        :focus rules) and there is one key back. What must not regress is
+        this: while the table has the keyboard, the arrows are the table's.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                self.assertTrue(app.table.has_focus,
+                                'the list must start with the keyboard')
+                preview = app.query_one('#right_pane_scroll')
+                jobs = app.query_one('#jobs_scroll')
+                before = app.selected_session
+                where = (preview.scroll_y, jobs.scroll_y)
+                await pilot.press('down')
+                await pilot.pause()
+                self.assertNotEqual(app.selected_session, before,
+                                    'down must move the table cursor')
+                self.assertEqual((preview.scroll_y, jobs.scroll_y), where,
+                                 'a pane scrolled while the table was steering')
+
+    async def test_every_pane_on_screen_can_be_reached_by_keyboard(self):
+        """The bug, stated as the rule it broke: a pane holding more than it
+        shows, with no key that reaches the rest, is a pane that is not there.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                self.assertEqual([w.id for w in app.screen.focus_chain],
+                                 ['left_pane', 'right_pane_scroll',
+                                  'jobs_scroll'],
+                                 'every visible pane, in the order it is read')
+                # Tab walks them and comes back round.
+                seen = []
+                for _ in range(3):
+                    await pilot.press('tab')
+                    await pilot.pause()
+                    seen.append(app.focused.id)
+                self.assertEqual(seen, ['right_pane_scroll', 'jobs_scroll',
+                                        'left_pane'])
+                # And the digits go straight there, which is what you want the
+                # second time.
+                for key, want in (('2', 'right_pane_scroll'),
+                                  ('3', 'jobs_scroll'), ('1', 'left_pane')):
+                    with self.subTest(key=key):
+                        await pilot.press(key)
+                        await pilot.pause()
+                        self.assertEqual(app.focused.id, want)
+
+    async def test_a_pane_with_the_keyboard_actually_scrolls(self):
+        """Reaching it is only half. Measured after: the preview takes down,
+        pagedown, end and home; the queue takes them too, and ← → for the
+        tail of a 95-column squeue row that no other key could reach.
+        """
+        long_text = '\n'.join(f'line {n:03d}' for n in range(200))
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                app.query_one('#right_pane').update(long_text)
+                await pilot.pause()
+                preview = app.query_one('#right_pane_scroll')
+                self.assertGreater(preview.max_scroll_y, 20,
+                                   'nothing hidden, so nothing proved')
+                await pilot.press('2')
+                await pilot.pause()
+                await pilot.press('down')
+                await pilot.pause()
+                self.assertEqual(preview.scroll_y, 1)
+                await pilot.press('end')
+                await pilot.pause()
+                self.assertEqual(preview.scroll_y, preview.max_scroll_y)
+                await pilot.press('home')
+                await pilot.pause()
+                self.assertEqual(preview.scroll_y, 0)
+
+    async def test_escape_always_returns_the_keyboard_to_the_list(self):
+        """Focus without a way back is a maze, and being a maze is what made
+        it worth removing the first time. One key, from any pane."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                for key in ('2', '3'):
+                    with self.subTest(from_pane=key):
+                        await pilot.press(key)
+                        await pilot.pause()
+                        self.assertNotEqual(app.focused.id, 'left_pane')
+                        await pilot.press('escape')
+                        await pilot.pause()
+                        self.assertEqual(app.focused.id, 'left_pane')
+
+    async def test_the_keyboard_never_stays_on_a_pane_that_left_the_screen(self):
+        """`z` can take the pane you are steering off the screen. The keys
+        would then go somewhere invisible, and the way back is a key nobody
+        would think to press."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await pilot.press('2')
+                await pilot.pause()
+                self.assertEqual(app.focused.id, 'right_pane_scroll')
+                app.layout_mode = 'table'          # preview and queue gone
+                app._apply_layout()
+                await pilot.pause()
+                self.assertEqual(app.focused.id, 'left_pane')
+                self.assertFalse(app.query_one('#right_pane_scroll').can_focus)
+
+    async def test_asking_for_a_pane_this_layout_hides_says_so(self):
+        """A key that silently does nothing is the complaint this section
+        exists to answer, so the one case where it legitimately cannot act
+        has to say why."""
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)
             app = autotmux.AutotmuxApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                chain = [w.id for w in app.screen.focus_chain]
-                self.assertEqual(chain, ['left_pane'],
-                                 "only the DataTable should be focusable")
-                # Even after trying to focus the preview pane, arrows move the table.
-                app.set_focus(app.query_one("#right_pane_scroll"))
+                app.layout_mode = 'table'
+                app._apply_layout()
                 await pilot.pause()
-                before = app.selected_session
-                await pilot.press("down")
+                said = []
+                app.notify = lambda msg, **kw: said.append(msg)
+                await pilot.press('3')
                 await pilot.pause()
-                self.assertNotEqual(app.selected_session, before,
-                                    "down must still move the table cursor")
+                self.assertTrue(said, 'the key did nothing, silently')
+                self.assertIn('z', said[0], 'no way out was offered')
 
     async def test_preview_capture_uses_daemon_ipc_and_never_spawns_ssh(self):
         """The TUI must not own network subprocesses or terminal stdin."""
@@ -1295,28 +1419,40 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
                     app.query_one('#jobs_scroll').region.height, 14)
 
     async def test_jobs_only_hands_the_arrow_keys_to_the_queue(self):
-        """A long squeue is unreadable if only the mouse can scroll it -- and
-        the table must keep the arrows in every other mode."""
+        """A long squeue is unreadable if only the mouse can scroll it.
+
+        That was the reasoning, and it was applied to one layout out of four
+        -- so in the other three the queue was exactly as unreadable, and the
+        preview beside it never got the argument at all. The queue is
+        reachable wherever it is drawn now; what stays true of *this* mode is
+        that with nothing else on screen it should already have the keyboard,
+        without anyone having to ask.
+        """
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)
             app = autotmux.AutotmuxApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
                 jobs = app.query_one('#jobs_scroll')
-                self.assertFalse(jobs.can_focus)
+                # Reachable beside the table, but not holding the keyboard:
+                # the list is what a person came here to read.
+                self.assertTrue(jobs.can_focus)
                 self.assertTrue(app.table.has_focus)
 
                 app.layout_mode = 'jobs'
                 app._apply_layout()
                 await pilot.pause()
                 self.assertTrue(jobs.can_focus)
-                self.assertTrue(jobs.has_focus)
+                self.assertTrue(jobs.has_focus,
+                                'the only pane on screen must start with the '
+                                'keyboard')
 
                 app.layout_mode = 'split'
                 app._apply_layout()
                 await pilot.pause()
-                self.assertFalse(jobs.can_focus)
-                self.assertTrue(app.table.has_focus)
+                self.assertTrue(jobs.can_focus)
+                self.assertTrue(app.table.has_focus,
+                                'coming back, the list takes the arrows again')
 
     async def test_a_hidden_preview_stops_costing_ssh_round_trips(self):
         """Capturing a pane nobody can see is a per-tick SSH round trip spent
