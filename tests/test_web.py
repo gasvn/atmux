@@ -921,12 +921,7 @@ class TouchKeypadTests(unittest.TestCase):
         css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
         term = re.search(r'#term \{[^}]*\}', css).group(0)
         self.assertIn('touch-action: none', term)
-        # The drawer's keys do say pan-y, and that is not the same claim:
-        # there is a real scroller under them to hand the gesture to, which is
-        # exactly what #term does not have. So this checks the selectors that
-        # may declare a pan rather than banning the word from the file.
-        panning = re.findall(r'([#.][\w .#-]*) \{[^}]*pan-y[^}]*\}', css)
-        self.assertEqual([s.strip() for s in panning], ['#sheetkeys .key'])
+        self.assertNotIn('pan-y', css)
 
     def test_the_small_text_clears_the_contrast_floor(self):
         """Two of these did not. The drawer's section headings measured
@@ -1886,6 +1881,8 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'typed', 'paintHistory', 'enterHistory',
                  'leaveHistory',
                  'ctrlify', 'applyLatch', 'paintLatch', 'press',
+                 'clock', 'frame', 'stopGlide', 'dragSheet',
+                 'releaseDrawer', 'glideStep',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
                  'renderRows', 'recolumn', 'renderNav', 'band', 'renderPins',
@@ -1900,6 +1897,8 @@ class KeypadVocabularyTests(unittest.TestCase):
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var TERM_KEEP =', 'var navColumns =',
                'var SHEET_PEEK_ROWS =', 'var SHEET_STATE =',
+               'var glideTimer =', 'var GLIDE_WINDOW =', 'var GLIDE_MIN =',
+               'var GLIDE_DECAY =', 'var SHEET_SLOP =', 'var sheetDragged =',
                'var sheetHeight =', 'var GRAB_SLOP =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
                'var prefixSeq =', 'var PINS =',
@@ -2528,38 +2527,61 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     # ── who scrolls the drawer ────────────────────────────────────────────
 
-    def test_the_browser_scrolls_the_drawer_and_this_file_does_not(self):
-        """It used to be a hand crank -- the keys claimed the whole gesture and
-        app.js moved the list a pixel per pixel of finger -- and then a
-        velocity sampler and a decay loop on top of that, to give the crank
-        weight it would not otherwise have.
+    def test_the_whole_drawer_scrolls_and_not_just_the_keys(self):
+        """The hole this leaves when it is wrong is enormous and silent.
 
-        All of it existed to work around touch-action: none on a key, which
-        was there to stop the key taking focus, because losing focus closes
-        the software keyboard. But focus is stopped by preventDefault on
-        pointerdown, and per the Pointer Events spec preventDefault never
-        stops a pan -- that is touch-action's decision alone. The two were
-        never in conflict, and roughly a hundred lines existed because of it.
+        The scroll handler used to hang off each key. With the browser told
+        not to pan (touch-action: none) and a handler only on the keys, every
+        part of the box that is not a key -- the gaps between them, the row
+        margins, the section headings, the toolbar, the padding -- was a place
+        where a drag did nothing at all. Measured with real touch events
+        through the browser's own gesture pipeline: a finger landing on a key
+        scrolled 169px, a finger landing 55px lower scrolled 0. A drawer that
+        ignores half the thumbs put on it reads as broken.
+
+        So the listener is on the box that scrolls, and the keys' events reach
+        it by bubbling. Verified across a grid of 119 starting points covering
+        the whole drawer: all 119 scroll, and none of them types.
         """
-        for gone in ('scrollDrawer', 'releaseDrawer', 'glideStep',
-                     'GLIDE_DECAY'):
-            with self.subTest(token=gone):
-                self.assertNotIn(gone, self.js)
+        self.assertIn("sheet.addEventListener('pointerdown'", self.js)
+        self.assertIn("sheet.addEventListener('pointermove'", self.js)
+        self.assertIn("sheet.addEventListener('pointerup'", self.js)
+        # And no key may be the thing that scrolls, which is what left holes.
+        self.assertNotIn('dragSheet', _extract(self.js, 'buildKey'))
+        self.assertNotIn('scrollDrawer', self.js)
 
-    def test_a_key_in_the_drawer_lets_a_vertical_pan_through(self):
-        """pan-y, not none: vertical is the scroller's, everything else is
-        still ours. Supported on iOS Safari from 13.
+    def test_the_drawer_never_hands_a_drag_to_the_browser(self):
+        """It did, for one commit: `touch-action: pan-y` on a key, so the
+        browser panned and the platform arbitrated tap-versus-scroll. Correct
+        reasoning, works in Chromium, wrong call -- once the browser claims
+        the gesture it decides on its own whether a pointercancel follows, and
+        a key that never hears one types whatever you dragged across. A
+        control character into a live shell is not worth a nicer scroll, and
+        it is not checkable from here.
 
-        #term stays none for a different reason that still holds -- there is
-        no native scroller under it to hand the gesture to."""
+        None everywhere in the drawer, so the answer is the same on every
+        browser and can be tested on this one.
+        """
         css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
-        drawer = re.search(r'#sheetkeys \.key \{[^}]*\}', css)
-        self.assertIsNotNone(drawer, 'the drawer keys set no touch-action')
-        self.assertIn('touch-action: pan-y', drawer.group(0))
-        base = re.search(r'\n  \.key \{[^}]*\}', css)
-        self.assertIn('touch-action: none', base.group(0))
-        term = re.search(r'#term \{[^}]*\}', css)
-        self.assertIn('touch-action: none', term.group(0))
+        self.assertNotIn('pan-y', css)
+        # Selected by what the rule declares, not by where it sits. Matching
+        # on the selector alone has now picked the wrong block three times in
+        # this file -- there are several rules for #tabs button, for .ghead
+        # and for #sheet.open, and the first one found is never the one that
+        # sets the property under test.
+        declaring = [(sel.strip(), body) for sel, body
+                     in re.findall(r'([^{}]*)\{([^}]*touch-action[^}]*)\}', css)
+                     if '#sheet' in sel]
+        self.assertTrue(declaring, 'the drawer declares no touch-action')
+        for selector, body in declaring:
+            with self.subTest(selector=selector):
+                self.assertIn('touch-action: none', body)
+
+    def test_a_drag_that_began_on_a_control_does_not_also_press_it(self):
+        """`keep keys` lives inside the drawer, so a drag that started on it
+        scrolled the drawer -- and the click that follows must not also change
+        a mode."""
+        self.assertIn('if (sheetDragged) return;', self.js)
 
     def test_a_key_still_refuses_the_focus_the_keyboard_is_attached_to(self):
         """The reason any of this was hand-written. A button allowed its

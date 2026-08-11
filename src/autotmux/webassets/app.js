@@ -823,24 +823,143 @@
   }
 
   // ── scrolling the drawer ──────────────────────────────────────────────
-  // The browser does it. There is nothing here.
+  // This file does it, on every browser, the same way.
   //
-  // There used to be: the keys claimed the whole gesture and this file moved
-  // the list a pixel per pixel of finger, then -- when that turned out to
-  // need three drags to cross a list and to ignore a flick entirely -- a
-  // velocity sampler and a decay loop to give the hand crank weight.
+  // It was briefly handed to the browser instead: `touch-action: pan-y` on a
+  // key, on the reasoning that preventDefault stops the focus while
+  // touch-action alone decides the pan, so the two never conflicted and a
+  // hundred lines here were working around nothing. That reasoning is
+  // correct, and it works in Chromium -- measured through the real gesture
+  // pipeline: a 120px drag scrolled 159px, a flick reached the end, a tap
+  // still sent its key.
   //
-  // All of it existed to work around `touch-action: none` on a key, which was
-  // there to stop the key taking focus, because losing focus closes the
-  // software keyboard. But focus is stopped by preventDefault on pointerdown,
-  // and per the Pointer Events spec preventDefault never stops a pan -- the
-  // pan is touch-action's decision alone. The two were never in conflict.
+  // It was still the wrong call. Chromium is not the target. On the phone
+  // this is for, the moment the browser claims the pan it decides on its own
+  // whether a pointercancel follows -- and if it does not, the key sees a
+  // clean pointerdown/pointerup and types whatever you dragged across. That
+  // is a control character into a live shell, and it cannot be checked from
+  // here.
   //
-  // So `#sheetkeys .key` says pan-y, the drawer scrolls itself, and what
-  // arrives here instead of a scroll routine is a pointercancel the moment
-  // the browser decides a pan has won -- which the key already reads as "not
-  // a tap". That is the platform's own arbitration between a tap and a
-  // scroll, and it is better than any threshold measured in this file.
+  // So the whole drawer is ours (#sheet is touch-action: none, not just the
+  // keys), which is deterministic everywhere and testable here. What that
+  // costs is momentum, and momentum is cheap to write.
+  var glideTimer = 0, glideAt = 0, glideV = 0, glideSamples = [];
+  function clock() { return Date.now(); }
+  function frame(fn) {
+    return typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame(fn) : setTimeout(fn, 16);
+  }
+  function stopGlide() {
+    if (!glideTimer) return;
+    if (typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(glideTimer);
+    } else {
+      clearTimeout(glideTimer);
+    }
+    glideTimer = 0; glideV = 0;
+  }
+
+  // One scrolling surface, one thing that scrolls it. This used to hang off
+  // each key, which is why the drawer had holes in it: with the browser told
+  // not to pan (touch-action: none) and a handler only on the keys, every
+  // part of the box that is not a key -- the gaps between them, the row
+  // margins, the section headings, the toolbar, the padding -- was a place
+  // where a drag did nothing at all. Measured: a finger landing on a key
+  // scrolled 169px, a finger landing 55px lower scrolled 0.
+  //
+  // The listener belongs on the box that scrolls. Events from the keys bubble
+  // to it, so a drag behaves the same wherever it starts.
+  function dragSheet(dy) {
+    if (!sheet || !sheet.classList.contains('open')) return;
+    sheet.scrollTop += dy;
+    glideSamples.push({ at: clock(), dy: dy });
+    // Bounded, so a long drag does not grow an array all the way down. The
+    // window that actually decides the throw is applied at release.
+    if (glideSamples.length > 40) glideSamples.shift();
+    markSheetEnd();
+  }
+
+  // Only the last breath of the gesture counts, and the trim happens at
+  // release rather than while sampling: a drag that spends a second creeping
+  // and then flicks is a flick, and averaging the whole thing turns it back
+  // into a creep.
+  var GLIDE_WINDOW = 90;                 // ms
+  // px per millisecond below which a release is a stop, not a throw.
+  var GLIDE_MIN = 0.22;
+  // What the speed is multiplied by every millisecond. 0.995 lands a hard
+  // flick in a little under a second, which is about what the platform does.
+  var GLIDE_DECAY = 0.995;
+
+  function releaseDrawer() {
+    var samples = glideSamples;
+    glideSamples = [];
+    if (!sheet || samples.length < 2) return;
+    var last = samples[samples.length - 1].at;
+    while (samples.length > 2 && last - samples[0].at > GLIDE_WINDOW) {
+      samples.shift();
+    }
+    var span = samples[samples.length - 1].at - samples[0].at;
+    if (span <= 0) return;
+    var moved = 0;
+    for (var i = 1; i < samples.length; i++) moved += samples[i].dy;
+    var speed = moved / span;
+    if (Math.abs(speed) < GLIDE_MIN) return;
+    glideV = speed;
+    glideAt = clock();
+    glideTimer = frame(glideStep);
+  }
+
+  // How far a finger travels before the drawer treats it as a scroll rather
+  // than a press. Same number the keys use, so the two agree about what just
+  // happened.
+  var SHEET_SLOP = 10;
+  // True while a drag is in progress, so the controls inside the drawer can
+  // tell a tap from having been scrolled past.
+  var sheetDragged = false;
+
+  if (sheet) (function () {
+    var live = false, startY = 0, lastY = 0, moving = false;
+    sheet.addEventListener('pointerdown', function (event) {
+      stopGlide();                     // a finger down stops a glide, always
+      live = true; moving = false; sheetDragged = false;
+      startY = lastY = event.clientY;
+      glideSamples = [];
+    });
+    sheet.addEventListener('pointermove', function (event) {
+      if (!live) return;
+      if (!moving) {
+        if (Math.abs(event.clientY - startY) < SHEET_SLOP) return;
+        moving = true; sheetDragged = true;
+      }
+      dragSheet(lastY - event.clientY);
+      lastY = event.clientY;
+    });
+    sheet.addEventListener('pointerup', function () {
+      if (live && moving) releaseDrawer();
+      live = false;
+    });
+    sheet.addEventListener('pointercancel', function () {
+      live = false; moving = false;
+    });
+  })();
+
+  function glideStep() {
+    if (!sheet || !sheet.classList.contains('open')) { stopGlide(); return; }
+    var at = clock();
+    // Clamped: a backgrounded tab resumes with a huge delta, and one frame
+    // worth thirty would jump the list to an end nobody threw it at.
+    var dt = Math.min(32, Math.max(1, at - glideAt));
+    glideAt = at;
+    var before = sheet.scrollTop;
+    sheet.scrollTop = before + glideV * dt;
+    markSheetEnd();
+    // Hit the top or the bottom: nowhere left to go, so stop rather than spin
+    // down against the edge.
+    if (Math.abs(sheet.scrollTop - before) < 0.5) { stopGlide(); return; }
+    glideV *= Math.pow(GLIDE_DECAY, dt);
+    if (Math.abs(glideV) < 0.02) { stopGlide(); return; }
+    glideTimer = frame(glideStep);
+  }
 
   function buildModifier(entry) {
     var button = document.createElement('button');
@@ -927,17 +1046,24 @@
     // should do -- and it is also what would type something every time you
     // dragged through the drawer looking for a different key. A finger that
     // has not moved has still not scrolled anything, so a tap is a tap.
-    function up() {
-      if (live && !repeated && !dragging) {
+    function up(event) {
+      // Two ways to know this was not a press, and both are needed. `dragging`
+      // is set by pointermove, which is the normal route. The coordinates on
+      // the release are the backstop: a browser that claims a gesture may
+      // stop delivering moves and still deliver the up, and a key that typed
+      // because of that would be sending a control character into a live
+      // shell for the crime of being scrolled past.
+      var far = event && (Math.abs(event.clientX - originX) > DRAG
+                          || Math.abs(event.clientY - originY) > DRAG);
+      if (live && !repeated && !dragging && !far) {
         if (!editing) fire();
         else if (pinnable) togglePin(label);
       }
       stop();
     }
-    // On touch the browser settles this: once a pan wins it sends
-    // pointercancel, `stop` runs, and nothing is typed. This is the backstop
-    // for pointers that never pan -- a mouse dragged across the drawer, a
-    // stylus -- where a gesture that travelled this far was not a press.
+    // Past a few pixels this is a scroll, not a key. The drawer scrolls
+    // itself -- the listener is on the box, and this event is on its way
+    // there -- so all this has to do is stop the key thinking it was pressed.
     function moved(event) {
       if (!live || dragging) return;
       if (Math.abs(event.clientX - originX) > DRAG
@@ -1057,6 +1183,9 @@
   keepFocus(editButton);
   if (editButton) editButton.addEventListener('click', function (event) {
     event.preventDefault();
+    // It sits inside the drawer, so a drag that began on it scrolled the
+    // drawer -- and the click that follows must not also change a mode.
+    if (sheetDragged) return;
     setEditing(!editing);
     say(editing ? 'tap keys to keep them' : 'kept');
     renderKeys();

@@ -305,28 +305,24 @@
   }
   #sheet .ghead:first-child { padding-top: 2px; }
   /* ── who scrolls the drawer ───────────────────────────────────────────
-     The browser does. The keys used to claim the whole gesture
-     (touch-action: none) and app.js moved the list by hand, a pixel per pixel
-     of finger, because a button allowed its default takes focus and losing
-     focus closes the software keyboard.
+     This page does, and every part of the drawer behaves the same way.
 
-     But preventDefault on pointerdown is what stops the focus, and per the
-     Pointer Events spec preventDefault never stops a pan -- that is precisely
-     what touch-action decides, and the two are independent. So the key can
-     refuse focus and still let the pan through, which is what pan-y says
-     here: vertical is the scroller's, everything else is still ours.
+     It was briefly `pan-y` on the keys, handing the pan to the browser --
+     which is correct reasoning (preventDefault stops the focus, touch-action
+     alone decides the pan) and works in Chromium. It was still wrong: on a
+     phone, once the browser claims the gesture it decides on its own whether
+     a pointercancel follows, and a key that never hears one types whatever
+     you dragged across. A control character into a live shell is not a
+     defect worth a nicer scroll, and it is not checkable from here.
 
-     What that buys is not just momentum. It is the platform's own arbitration
-     between a tap and a scroll -- far better tuned than a 10px threshold --
-     delivered as a pointercancel the moment a pan wins, which the key already
-     treats as "not a tap". And it is the same feel whether the finger lands
-     on a key or in the gap between two, which it was not: the gaps scrolled
-     natively, with weight, and the keys hand-cranked.
-
-     pan-y is supported on iOS Safari from 13 (2019). The reason #term uses
-     none is different and still stands: there is no native scroller under it
-     to hand the gesture to. Here there is. */
-  #sheetkeys .key { touch-action: pan-y; }
+     `none` on the whole box, not on the keys alone. Before, a finger landing
+     in a gap between two keys got the browser's scroll and a finger landing
+     on a key got ours -- the same panel with two feels depending on where you
+     touched it. Now the drawer is one surface with one behaviour, and app.js
+     gives it weight of its own. */
+  body.touch #sheet.open, #sheet .krow, #sheet .gsec, #sheet .ghead {
+    touch-action: none;
+  }
   /* The sheet's own toolbar, pinned above the sections. Recessed like the
      settings row for the same reason: it changes how the pad behaves rather
      than typing anything, and nothing in this sheet may be mistaken for a key
