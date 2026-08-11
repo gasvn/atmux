@@ -283,6 +283,28 @@ class _ServedFixture(unittest.TestCase):
             head += sock.recv(4096)
         return sock, key, head.decode('latin-1')
 
+    def request(self, path: str, method: str = 'GET',
+                headers: dict | None = None) -> tuple[str, bytes]:
+        """One request, with whatever method and headers the test needs.
+
+        Compression and identity are both decided by request headers, so a
+        helper that can only send the default set cannot exercise either.
+        """
+        lines = [f'{method} {path} HTTP/1.1', 'Host: t', 'Connection: close']
+        for name, value in (headers or {}).items():
+            lines.append(f'{name}: {value}')
+        sock = socket.create_connection((self.host, self.port), timeout=10)
+        sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode())
+        raw = b''
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+        sock.close()
+        head, _, body = raw.partition(b'\r\n\r\n')
+        return head.decode('latin-1'), body
+
     def get(self, path: str) -> tuple[str, bytes]:
         sock = socket.create_connection((self.host, self.port), timeout=10)
         sock.sendall(f'GET {path} HTTP/1.1\r\nHost: t\r\n'
@@ -423,6 +445,233 @@ class AssetTests(_ServedFixture):
         head, body = self.get('/healthz')
         self.assertIn('200', head)
         self.assertEqual(json.loads(body)['ok'], True)
+
+
+class TransferTests(_ServedFixture):
+    """What actually goes over the wire.
+
+    Measured before any of this: the vendored terminal went out at 488,663
+    bytes with `Accept-Encoding: gzip` on the request and nothing negotiating
+    it on the way back -- 590 KB for a whole first load that gzip takes to
+    156 KB. The caching was already right, so it only cost the first load,
+    which is the one happening on a phone away from wifi.
+    """
+
+    def test_a_browser_that_offers_gzip_gets_it(self):
+        head, body = self.request('/console/xterm.js',
+                                  headers={'Accept-Encoding': 'gzip, deflate'})
+        self.assertIn('200', head)
+        self.assertIn('Content-Encoding: gzip', head)
+        raw = open(os.path.join(web.ASSETS, 'xterm.js'), 'rb').read()
+        self.assertLess(len(body), len(raw) / 2)
+        import gzip as _gzip
+        self.assertEqual(_gzip.decompress(body), raw)
+
+    def test_a_client_that_does_not_offer_it_gets_the_file(self):
+        head, body = self.request('/console/xterm.js',
+                                  headers={'Accept-Encoding': 'identity'})
+        self.assertNotIn('Content-Encoding', head)
+        self.assertEqual(
+            body, open(os.path.join(web.ASSETS, 'xterm.js'), 'rb').read())
+
+    def test_a_client_that_refuses_gzip_is_believed(self):
+        """`gzip;q=0` is how a client says no to exactly this encoding, and
+        reading it as a yes because the word appears is the obvious bug."""
+        head, _ = self.request('/console/xterm.js',
+                               headers={'Accept-Encoding': 'gzip;q=0'})
+        self.assertNotIn('Content-Encoding', head)
+
+    def test_the_encoding_is_named_in_vary_whether_or_not_it_was_used(self):
+        """These are served `public, immutable` for a week. A shared cache
+        that kept one encoding for every client would hand a gzip body to one
+        that never asked."""
+        for encoding in ('gzip', 'identity'):
+            with self.subTest(accept=encoding):
+                head, _ = self.request('/console/xterm.js',
+                                       headers={'Accept-Encoding': encoding})
+                self.assertIn('Vary: Accept-Encoding', head)
+
+    def test_what_does_not_compress_is_not_compressed(self):
+        """A PNG through gzip costs CPU to come out slightly larger."""
+        head, _ = self.request('/console/icon-192.png',
+                               headers={'Accept-Encoding': 'gzip'})
+        self.assertIn('200', head)
+        self.assertNotIn('Content-Encoding', head)
+
+    def test_something_smaller_than_the_header_is_left_alone(self):
+        head, body = self.request('/healthz',
+                                  headers={'Accept-Encoding': 'gzip'})
+        self.assertNotIn('Content-Encoding', head)
+        self.assertEqual(body, b'{"ok":true}\n')
+
+    # ── HEAD ──────────────────────────────────────────────────────────────
+
+    def test_head_describes_the_response_without_sending_it(self):
+        """It answered 501. Harmless until something in front of it -- a
+        health probe, a proxy, a link preview -- asks."""
+        head, body = self.request('/', method='HEAD')
+        self.assertIn('200', head)
+        self.assertEqual(body, b'')
+        get_head, get_body = self.get('/')
+        self.assertIn(f'Content-Length: {len(get_body)}', head)
+        self.assertIn('Content-Type: text/html', head)
+
+    def test_head_on_a_socket_is_refused_rather_than_performed(self):
+        """A handshake is a connection, not a document: there is nothing to
+        describe without doing it."""
+        head, _ = self.request('/console/ws', method='HEAD')
+        self.assertIn('405', head)
+
+    def test_head_on_something_missing_is_still_missing(self):
+        head, body = self.request('/console/nope.js', method='HEAD')
+        self.assertIn('404', head)
+        self.assertEqual(body, b'')
+
+
+class TailnetIdentityTests(unittest.TestCase):
+    """Who is allowed in, when anyone is.
+
+    `tailscale serve` sets Tailscale-User-Login on everything it proxies.
+    Believing a header like that is normally the mistake -- whoever can reach
+    the port can also write it -- and the reason it can be believed here is
+    that the server listens on loopback, so that is this machine and nothing
+    else. serve() enforces the precondition rather than assuming it.
+    """
+
+    def serve(self, allow_users):
+        server = web.Server(('127.0.0.1', 0), ['/bin/cat'],
+                            allow_users=allow_users)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[:2]
+
+    def ask(self, address, login=None, path='/healthz'):
+        host, port = address
+        lines = [f'GET {path} HTTP/1.1', 'Host: t', 'Connection: close']
+        if login is not None:
+            lines.append(f'Tailscale-User-Login: {login}')
+        sock = socket.create_connection((host, port), timeout=10)
+        sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode())
+        raw = b''
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+        sock.close()
+        return int(raw.split()[1])
+
+    def test_no_list_is_the_historical_behaviour(self):
+        """Off by default. A tailnet of one does not need this, and turning a
+        check on for everybody would break the deployment that exists."""
+        address = self.serve([])
+        self.assertEqual(self.ask(address), 200)
+        self.assertEqual(self.ask(address, 'anyone@example.com'), 200)
+
+    def test_a_named_login_gets_in_and_nobody_else_does(self):
+        address = self.serve(['alice@example.com'])
+        self.assertEqual(self.ask(address, 'alice@example.com'), 200)
+        for who in (None, '', 'mallory@example.com', 'alice@example.com.evil'):
+            with self.subTest(login=who):
+                self.assertEqual(self.ask(address, who), 403)
+
+    def test_the_comparison_does_not_care_about_case_or_spaces(self):
+        """The config is hand-written and the header comes off the wire."""
+        address = self.serve(['  Alice@Example.COM '])
+        self.assertEqual(self.ask(address, ' ALICE@example.com  '), 200)
+
+    def test_the_socket_is_behind_the_same_door_as_the_page(self):
+        """The check has to be on the route that hands out a shell, not only
+        on the one that hands out HTML."""
+        address = self.serve(['alice@example.com'])
+        self.assertEqual(self.ask(address, None, path='/console/ws'), 403)
+        self.assertEqual(self.ask(address, None, path='/console/'), 403)
+        self.assertEqual(self.ask(address, None, path='/api/state'), 403)
+
+    def test_a_list_with_a_bind_that_cannot_honour_it_refuses_to_start(self):
+        """A security control that is quietly ineffective is worse than one
+        that is absent: off loopback, anyone who can reach the port can also
+        write the header this checks."""
+        import unittest.mock as mock
+        with mock.patch.object(web.config, 'load_web',
+                               lambda: {'allow_users': ['a@b.c']}):
+            for host in ('0.0.0.0', '100.64.1.2'):
+                with self.subTest(host=host):
+                    with self.assertRaises(SystemExit) as caught:
+                        web.serve(host, 0)
+                    self.assertIn('allow_users', str(caught.exception))
+
+    def test_loopback_is_recognised_however_it_is_spelled(self):
+        for host, expected in (('127.0.0.1', True), ('127.0.0.53', True),
+                               ('localhost', True), ('::1', True), ('', True),
+                               ('0.0.0.0', False), ('100.64.1.2', False),
+                               ('example.com', False)):
+            with self.subTest(host=host):
+                self.assertEqual(web.is_loopback_bind(host), expected)
+
+
+class HomeScreenTests(_ServedFixture):
+    """The mark, and the offer to install that does not appear without it.
+
+    It matters more here than on an ordinary site: Safari's chrome is about
+    110px of an 844px screen -- roughly ten rows of terminal, the same order
+    as the landscape bug -- and installing to the home screen is how you get
+    them back. The page was already built for it and was missing the one asset
+    that makes the offer appear.
+    """
+
+    def test_the_manifest_names_icons_that_are_actually_served(self):
+        _head, body = self.get('/manifest.json')
+        manifest = json.loads(body)
+        self.assertTrue(manifest.get('icons'), 'no icons at all')
+        for icon in manifest['icons']:
+            with self.subTest(src=icon['src']):
+                head, data = self.get('/console/' + icon['src'])
+                self.assertIn('200', head)
+                self.assertTrue(data)
+
+    def test_a_launcher_that_crops_the_icon_does_not_crop_the_mark(self):
+        """A maskable icon is cut to whatever shape the launcher wants, so it
+        must be full bleed and the mark must sit inside the middle."""
+        _head, body = self.get('/manifest.json')
+        purposes = [i.get('purpose', '') for i in json.loads(body)['icons']]
+        self.assertTrue(any('maskable' in p for p in purposes))
+
+    def test_both_pages_offer_the_icon_relative_to_wherever_they_are(self):
+        """An absolute path is a claim about where this server is mounted,
+        and behind `tailscale serve --set-path` it is the wrong one."""
+        for path in ('/', web.CONSOLE):
+            with self.subTest(page=path):
+                _head, body = self.get(path)
+                page = body.decode('utf-8')
+                self.assertIn('rel="apple-touch-icon" href="icon-180.png"',
+                              page)
+                self.assertIn('rel="icon" href="icon.svg"', page)
+
+    def test_the_policy_admits_the_icon_it_asks_for(self):
+        head, _ = self.get(web.CONSOLE)
+        self.assertIn("img-src 'self'", head)
+
+    def test_both_pages_opt_into_the_same_transition(self):
+        """Cross-document transitions need both documents to agree; one side
+        alone is a hard cut with extra CSS."""
+        for path in ('/', web.CONSOLE):
+            with self.subTest(page=path):
+                _head, body = self.get(path)
+                self.assertIn('@view-transition { navigation: auto; }',
+                              body.decode('utf-8'))
+
+    def test_the_transition_does_not_scale_a_character_grid(self):
+        """Opacity only. Scaling the incoming page for 180ms is how you turn
+        a transition into a blurry frame of a terminal."""
+        _head, body = self.get(web.CONSOLE)
+        page = body.decode('utf-8')
+        block = page[page.index('@view-transition'):page.index('html, body')]
+        self.assertNotIn('scale', block)
+        self.assertIn('prefers-reduced-motion', block)
 
 
 class WebsocketBridgeTests(_ServedFixture):
@@ -673,6 +922,65 @@ class TouchKeypadTests(unittest.TestCase):
         term = re.search(r'#term \{[^}]*\}', css).group(0)
         self.assertIn('touch-action: none', term)
         self.assertNotIn('pan-y', css)
+
+    def test_the_small_text_clears_the_contrast_floor(self):
+        """Two of these did not. The drawer's section headings measured
+        3.96:1 and the grip strip 3.64:1 against their own backgrounds, where
+        text this small needs 4.5:1 -- and the headings are the only
+        navigation a list of sixty keys has, while the grip is the only way
+        back to the pad once it is hidden.
+
+        Computed from the stylesheet rather than pinned to the hex values, so
+        this stays true through a repaint.
+        """
+        def luminance(hexcolour):
+            parts = [int(hexcolour[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+            parts = [c / 12.92 if c <= 0.03928
+                     else ((c + 0.055) / 1.055) ** 2.4 for c in parts]
+            return 0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2]
+
+        def ratio(fg, bg):
+            first, second = sorted((luminance(fg), luminance(bg)),
+                                   reverse=True)
+            return (first + 0.05) / (second + 0.05)
+
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+
+        def colour_of(selector):
+            rule = re.search(re.escape(selector) + r' \{[^}]*\}', css)
+            self.assertIsNotNone(rule, selector)
+            found = re.search(r'color: (#[0-9a-fA-F]{6})', rule.group(0))
+            self.assertIsNotNone(found, f'{selector} sets no colour')
+            return found.group(1)
+
+        # Backgrounds are the panel behind each: the sheet is flat #17171d so
+        # a pinned heading can sit on it invisibly, and the grip is #141418.
+        for selector, background in (('.ghead', '#17171d'),
+                                     ('body.touch.nopad #grip', '#141418')):
+            with self.subTest(selector=selector):
+                measured = ratio(colour_of(selector), background)
+                self.assertGreaterEqual(
+                    round(measured, 2), 4.5,
+                    f'{selector} is {measured:.2f}:1 against {background}')
+
+    def test_the_one_state_banner_is_announced_and_can_be_focused(self):
+        """It was a <div> with a click handler: the app's only you-are-not-
+        live indicator, invisible to a screen reader, while every key around
+        it carried an aria-label."""
+        banner = re.search(r'<button id="hist"[^>]*>', self.html)
+        self.assertIsNotNone(banner, '#hist is not a button')
+        self.assertIn('aria-live="polite"', banner.group(0))
+        self.assertIn('aria-label=', banner.group(0))
+
+    def test_the_client_speaks_one_language(self):
+        """Two strings arrived in Chinese in an interface that says
+        `connected`, `reconnecting…`, `no sessions` and `tap keys to keep
+        them` everywhere else. Either is a fine choice; a mixture is not
+        one."""
+        strings = re.findall(r"'([^'\\\n]*)'", self.js)
+        chinese = [s for s in strings
+                   if any('一' <= ch <= '鿿' for ch in s)]
+        self.assertEqual(chinese, [])
 
     def test_a_gesture_the_system_takes_away_does_not_seed_the_next_one(self):
         """iOS fires touchcancel rather than touchend when it claims a drag.
@@ -1388,6 +1696,9 @@ _DOM_STUB = r'''
 function El(tag) {
   this.tag = tag; this.children = []; this.attrs = {}; this.style = {};
   this._text = ''; this._cls = {}; this._on = {}; this.scrollTop = 0;
+  // What a scrolling box knows about itself. The sheet decides whether it is
+  // showing its own last row from these, and takes the fade off when it is.
+  this.scrollHeight = 0; this.clientHeight = 0;
   this.parentNode = null;
   var self = this;
   this.classList = {
@@ -1430,9 +1741,11 @@ El.prototype.emit = function (type, event) {
   (this._on[type] || []).forEach(function (fn) { fn(detail); });
 };
 // Width is the one measurement the pad reads back out of the layout: it is
-// what decides how many keys go across.
+// what decides how many keys go across. Height is the second: the sheet is
+// capped at the room the terminal actually has, and whether the pad's own
+// height changed is what decides whether the pty is resized at all.
 El.prototype.getBoundingClientRect = function () {
-  return { width: this._width || 0, height: 0 };
+  return { width: this._width || 0, height: this._height || 0 };
 };
 // A text node, because the page writes its live readouts through nodeValue
 // rather than textContent: replacing an element's children is a structural
@@ -1445,8 +1758,28 @@ var document = { createElement: function (t) { return new El(t); },
 // What the pad needs around it, and nothing more. Every one of these is a
 // thing the browser owns, not a thing the keypad decides.
 var keys = new El('div'), nav = new El('div'), expander = new El('button');
-var hist = new El('div');
+var hist = new El('button');
 var pinRow = new El('div'), editButton = new El('button');
+// The pad, the terminal it sits under, and the sheet that covers that
+// terminal without displacing it. `pad` is measured before and after every
+// render: whether its height changed is what decides whether the pty is
+// resized, and the whole point of the sheet is that opening it does not.
+var pad = new El('div'), host = new El('div');
+var sheet = new El('div'), sheetKeys = new El('div');
+// The pad's height is the rows it lays out, which is the thing the page reads
+// it for: whether that number changed is what decides whether the pty gets
+// resized. Modelled rather than stubbed at a constant, because a constant
+// would let "opening the sheet does not resize the terminal" pass for the
+// wrong reason -- and the sheet is deliberately not in this sum, since it
+// covers the terminal instead of displacing it.
+pad.getBoundingClientRect = function () {
+  var rows = 0;
+  [nav, pinRow, keys].forEach(function (box) {
+    if (box.style.display === 'none') return;
+    rows += box.children.filter(function (c) { return c._cls.krow; }).length;
+  });
+  return { width: keys._width || 0, height: 44 * rows + 51 };
+};
 var current = [], expanded = false;
 var sent = [];
 // Enough of localStorage to prove a choice is remembered, and to be thrown
@@ -1518,15 +1851,17 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
                  'renderRows', 'recolumn', 'renderNav', 'renderPins',
-                 'renderKeys', 'setEditing', 'toggleDrawer', 'setPad')
+                 'renderKeys', 'setEditing', 'toggleDrawer', 'setPad',
+                 'sizeSheet', 'markSheetEnd')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
                'var held =', 'var SLOP =', 'var scrolledBack =',
                'var mouseOn =', 'var GAIN =', 'var lastX =',
                'var owed =', 'var NAV_PER_ROW =',
                'var OFF =', 'var ROWS_COLLAPSED =',
-               'var KEY_TARGET =',
+               'var TERM_KEEP =', 'var navColumns =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
-               'var prefixSeq =', 'var PINS =', 'var pins =',
+               'var prefixSeq =', 'var PINS =',
+               'var DEFAULT_PINS =', 'var pins =',
                'var PAD_STATE =')
 
     @classmethod
@@ -1601,16 +1936,50 @@ class KeypadVocabularyTests(unittest.TestCase):
         """The bottom row was left at 40x34 when the keys were fixed -- under
         the minimum in BOTH directions, which is why it was the one row you
         had to aim at. Measured on a 390px phone after: 44x44, and seven of
-        them plus gaps and padding is 358px, so they fit."""
+        them plus gaps and padding is 363px, so they fit."""
         css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
-        # The rule that sizes them, not merely the first one that mentions
-        # them -- the reduced-motion block names the same selector earlier.
+        # The rules that size them, not merely the ones that mention them --
+        # the reduced-motion block names the same selector earlier. Two size
+        # it now: the default, and the short-landscape override.
         sized = [r for r in re.findall(r'#tabs button \{[^}]*\}', css)
                  if 'min-height' in r]
-        self.assertEqual(len(sized), 1, css.count('#tabs button'))
+        self.assertEqual(len(sized), 2, css.count('#tabs button'))
         for want in ('min-height: 44px', 'min-width: 44px'):
             with self.subTest(want=want):
                 self.assertIn(want, sized[0])
+
+    def test_landscape_spends_height_and_keeps_width(self):
+        """A phone in landscape is 390px tall and four rows of controls do not
+        fit in it at 44 -- but width is the direction a thumb aims, and ten
+        keys across 844px are 79px wide, so the target ends up larger than the
+        162x44 monsters it replaces. 40px is Android's minimum where 44 is
+        Apple's, and it is spent only where the screen is genuinely short."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        block = re.search(
+            r'@media \(orientation: landscape\) and \(max-height: (\d+)px\)'
+            r' \{(.*?)\n  \}\n', css, re.S)
+        self.assertIsNotNone(block, 'no landscape rules at all')
+        self.assertLessEqual(int(block.group(1)), 600)
+        body = block.group(2)
+        self.assertIn('min-height: 40px', body)
+        self.assertNotIn('min-width', body)
+        # The cap is what pushed the settings row off the bottom of the
+        # screen: with the drawer overlaying rather than displacing, the pad
+        # is four rows of fixed height and nothing may squeeze them.
+        self.assertIn('max-height: none', body)
+
+    def test_the_landscape_rules_come_last_so_they_actually_win(self):
+        """They did not. Written above the block that sizes a key, every one
+        of these lost the cascade at equal specificity and the whole media
+        query silently did half its job -- the padding shrank and the keys
+        stayed 44px tall."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        landscape = css.index('@media (orientation: landscape)')
+        for selector in ('.key {', '#tabs button {', '#nav {', '#keys {',
+                         '#pins {', '.krow {'):
+            with self.subTest(selector=selector):
+                self.assertLess(css.index(selector), landscape,
+                                f'{selector} is defined after the override')
 
     def test_the_row_is_wide_enough_to_aim_at(self):
         """`.key` asks for a 44px minimum touch target and got it in height
@@ -1618,12 +1987,42 @@ class KeypadVocabularyTests(unittest.TestCase):
         under the minimum in the direction you actually aim. Five is 71px,
         measured on the same viewport."""
         self.assertEqual(self.run_js("""
-            nav = new El('div');
-            renderNav();
+            nav = new El('div'); navColumns = 0;
+            renderNav(perRow(390));
             console.log(JSON.stringify(nav.children.map(function (row) {
               return buttons(row, []).map(function (k) { return k.textContent; });
             })));"""),
             [['esc', 'ctrl', 'alt', 'pfx', 'tab'], ['⏎', '←', '↓', '↑', '→']])
+
+    def test_landscape_puts_the_same_ten_keys_on_one_row(self):
+        """Measured at 844x390 before this: two rows of five made each key
+        162px wide -- four times what a thumb needs -- and cost 51px of a
+        390px-tall screen to do it. The terminal had twelve rows, which is
+        less room than the keys attached to it."""
+        self.assertEqual(self.run_js("""
+            nav = new El('div'); navColumns = 0;
+            renderNav(perRow(844));
+            console.log(JSON.stringify(nav.children.map(function (row) {
+              return buttons(row, []).map(function (k) { return k.textContent; });
+            })));"""),
+            [['esc', 'ctrl', 'alt', 'pfx', 'tab',
+              '⏎', '←', '↓', '↑', '→']])
+
+    def test_an_armed_modifier_survives_the_row_being_rebuilt(self):
+        """Rotating rebuilds the navigation row, and the buttons showing a
+        latched ctrl are destroyed with it. Without repainting the state onto
+        the new ones, ctrl stays armed invisibly and the next key you tap
+        comes out as a control character."""
+        self.assertEqual(self.run_js("""
+            nav = new El('div'); navColumns = 0;
+            renderNav(5);
+            latch.ctrl = LOCKED;
+            paintLatch();
+            renderNav(10);
+            var ctrl = keyLabelled(nav, 'ctrl');
+            console.log(JSON.stringify(
+              [nav.children.length, !!ctrl._cls.on, applyLatch('c')]));"""),
+            [1, True, '\x03'])
 
     def test_a_fixed_key_acts_on_the_way_down(self):
         """The fixed rows cannot scroll, so waiting for the finger to lift is
@@ -1764,15 +2163,25 @@ class KeypadVocabularyTests(unittest.TestCase):
     # ── the drawer ────────────────────────────────────────────────────────
 
     def render(self, published=(), expanded=False, width=390):
+        """Whichever surface is showing.
+
+        Two surfaces now, not one: #keys is a single row that is always in the
+        layout, and the sheet is everything, over the terminal rather than
+        displacing it. `row` is the first, `keys` is whichever one you are
+        looking at.
+        """
         return self.run_js(f'''
             current = {json.dumps(list(published))};
             expanded = {json.dumps(expanded)};
             keys._width = {width};
             renderKeys();
+            var surface = expanded ? sheetKeys : keys;
             console.log(JSON.stringify({{
-              keys: drawn(keys, []), heads: headings(keys, []),
-              rows: keys.children.filter(function (c) {{
+              keys: drawn(surface, []), heads: headings(surface, []),
+              rows: surface.children.filter(function (c) {{
                 return c._cls.krow; }}).length,
+              row: drawn(keys, []),
+              open: !!sheet._cls.open,
               more: expander.textContent }}));''')
 
     def test_a_closed_drawer_shows_the_apps_own_keys(self):
@@ -1786,9 +2195,12 @@ class KeypadVocabularyTests(unittest.TestCase):
         Showing an empty drawer there is what put detach behind a tap."""
         shown = self.render()['keys']
         self.assertEqual(shown[0], 'detach')
-        # One row of four when collapsed, not two. The pad was taking 45% of
-        # the screen; the row this gives back is the one the nav split costs.
-        self.assertEqual(len(shown), 4)
+        # One row when collapsed, not two -- the pad was taking 45% of the
+        # screen. Five across, because the whole panel is on one pitch now:
+        # the navigation row above holds ten keys and has to divide evenly,
+        # so it picks five, and this follows it. It used to be four here and
+        # five above, and none of the vertical seams lined up.
+        self.assertEqual(len(shown), 5)
 
     def test_an_open_drawer_reaches_every_section(self):
         published = [{'k': 'z', 'l': 'Layout'}]
@@ -1819,16 +2231,137 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     # ── how many across ───────────────────────────────────────────────────
 
-    def test_the_key_width_stays_put_and_the_count_moves(self):
-        """Four across is right on a phone and wrong on everything else.
-        Measured in landscape at 844px, a fixed four made `|` a 204px button
-        and spread forty-two keys over eleven rows on a screen 390px tall."""
-        for width, expected in ((390, 4), (320, 4), (768, 8), (844, 9),
-                                (1400, 10), (0, 4)):
+    def test_the_whole_panel_is_on_one_pitch(self):
+        """Five or ten, and nothing between.
+
+        Two rules that were each right alone: the navigation row is fixed at
+        five so the movement keys never move, and the drawer derived its own
+        columns from a key width. At 390px that gave 5 x 71px above 4 x 86px
+        -- two grids sharing one panel with none of their seams aligned, which
+        is what stopped it reading as a single machined face.
+
+        The navigation row has ten keys and must divide evenly, so the only
+        answers are two rows of five or one row of ten; everything else
+        follows whichever it picks. Ten only where ten fit: at 390px they
+        would be 33px wide, a quarter under the minimum in the direction you
+        aim.
+        """
+        for width, expected in ((390, 5), (320, 5), (619, 5), (620, 10),
+                                (768, 10), (844, 10), (1400, 10), (0, 5)):
             with self.subTest(width=width):
                 self.assertEqual(
                     self.run_js(f'console.log(JSON.stringify(perRow({width})))'),
                     expected)
+
+    def test_the_row_and_the_sheet_never_disagree_about_the_pitch(self):
+        """The failure is visual and silent: nothing errors, the seams just
+        stop lining up. So the three grids are read back and compared to each
+        other rather than each being trusted separately."""
+        for width, columns in ((320, 5), (390, 5), (768, 10), (844, 10)):
+            with self.subTest(width=width):
+                self.assertEqual(self.run_js(f'''
+                    nav = new El('div'); navColumns = 0;
+                    keys._width = {width};
+                    current = []; expanded = true;
+                    renderKeys();
+                    var wide = function (node) {{
+                      var row = node.children.filter(function (c) {{
+                        return c._cls.krow; }})[0];
+                      return row ? row.children.length : 0; }};
+                    console.log(JSON.stringify(
+                      [wide(nav), wide(keys), wide(sheetKeys), columnsUsed]));
+                    '''), [columns] * 4)
+
+    # ── the sheet ─────────────────────────────────────────────────────────
+
+    def test_opening_the_drawer_does_not_resize_the_terminal(self):
+        """The one that cost the most. renderKeys ended in refit(), so opening
+        the drawer took the terminal from 57 rows to 29 -- which resizes the
+        pty, which makes tmux reflow and repaint the whole screen, and again
+        on close. That is the same jolt that made swiping feel unstable,
+        arriving on a tap instead of a drag.
+
+        Measured after, in a browser at 390x844 and at 844x390: the row count
+        is identical open and closed. Here the proxy is the pad's own height,
+        which is what refit() is decided from.
+        """
+        self.assertEqual(self.run_js('''
+            var fits = 0;
+            refit = function () { fits++; };
+            keys._width = 390; current = []; expanded = false;
+            renderKeys();
+            var settled = fits;
+            expanded = true; renderKeys();
+            var afterOpen = fits;
+            expanded = false; renderKeys();
+            console.log(JSON.stringify(
+              [afterOpen - settled, fits - afterOpen, !!sheet._cls.open]));'''),
+            [0, 0, False])
+
+    def test_the_pad_growing_a_row_does_resize_it(self):
+        """The other direction, and the reason this is measured rather than
+        assumed: the pinned row appearing genuinely does take rows from the
+        terminal, and skipping refit() there leaves the app drawing rows that
+        are now behind the keys."""
+        self.assertEqual(self.run_js('''
+            var fits = 0;
+            refit = function () { fits++; };
+            store[PINS] = '[]'; pins = loadPins();
+            keys._width = 390; current = []; expanded = false;
+            renderKeys();
+            var settled = fits;
+            var before = pad.getBoundingClientRect().height;
+            pins = ['detach'];          // as if a key had just been kept
+            renderKeys();
+            console.log(JSON.stringify(
+              [fits - settled,
+               pad.getBoundingClientRect().height - before]));'''), [1, 44])
+
+    def test_a_rotation_that_changes_the_rows_resizes_it(self):
+        """Ten keys on one row instead of two is a row of the pad given back,
+        and the terminal has to be told or it keeps drawing rows that are now
+        behind the keys."""
+        self.assertEqual(self.run_js('''
+            var fits = 0;
+            refit = function () { fits++; };
+            store[PINS] = '[]'; pins = loadPins();
+            keys._width = 390; current = []; expanded = false;
+            renderKeys();
+            var narrow = pad.getBoundingClientRect().height;
+            var settled = fits;
+            keys._width = 844; renderKeys();
+            console.log(JSON.stringify(
+              [fits - settled, narrow - pad.getBoundingClientRect().height]));
+            '''), [1, 44])
+
+    def test_the_sheet_is_capped_by_the_room_there_actually_is(self):
+        """Not a percentage: #app is sized to visualViewport, so the room
+        changes with the software keyboard and with rotation. And what is left
+        over is a usable strip on purpose -- a sheet that covers the screen you
+        are operating on is a modal, and this is a drawer."""
+        self.assertEqual(self.run_js('''
+            expanded = true;
+            host._height = 600; sizeSheet();
+            var tall = sheet.style.maxHeight;
+            host._height = 200; sizeSheet();
+            var short = sheet.style.maxHeight;
+            console.log(JSON.stringify([tall, short, TERM_KEEP]));'''),
+            ['504px', '120px', 96])
+
+    def test_the_fade_comes_off_at_the_end_of_the_list(self):
+        """It says "there is more below". Once there is not, it would be
+        saying something false -- and a hard cut against the settings row is
+        what it replaced, which read as damage rather than as more."""
+        self.assertEqual(self.run_js('''
+            sheet.scrollHeight = 900; sheet.clientHeight = 300;
+            sheet.scrollTop = 0; markSheetEnd();
+            var atTop = !!sheet._cls.atbottom;
+            sheet.scrollTop = 600; markSheetEnd();
+            var atEnd = !!sheet._cls.atbottom;
+            sheet.scrollHeight = 250; sheet.scrollTop = 0; markSheetEnd();
+            console.log(JSON.stringify(
+              [atTop, atEnd, !!sheet._cls.atbottom]));'''),
+            [False, True, True])
 
     def test_a_wider_screen_spends_fewer_rows_on_the_same_keys(self):
         """Which is the point: the drawer is height taken from the terminal,
@@ -1841,7 +2374,7 @@ class KeypadVocabularyTests(unittest.TestCase):
     # ── tap versus scroll ─────────────────────────────────────────────────
 
     def gesture(self, script):
-        """An open drawer, and a finger doing something to it."""
+        """An open sheet, and a finger doing something to it."""
         return self.run_js(f'''
             keys._width = 390; current = []; expanded = true;
             renderKeys();
@@ -1850,10 +2383,10 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     def test_a_tap_sends_the_key_under_the_finger(self):
         self.assertEqual(self.gesture('''
-            var key = keyAt(keys, 0);
+            var key = keyAt(sheetKeys, 0);
             key.emit('pointerdown', {clientX: 50, clientY: 100});
             key.emit('pointerup', {clientX: 50, clientY: 100});
-            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
             [['\x02d'], 0])
 
     def test_a_drag_scrolls_the_drawer_and_types_nothing(self):
@@ -1863,39 +2396,39 @@ class KeypadVocabularyTests(unittest.TestCase):
         scroll natively and cost the terminal its focus, which is what the
         software keyboard is attached to. So the keys scroll it themselves."""
         self.assertEqual(self.gesture('''
-            var key = keyAt(keys, 0);
+            var key = keyAt(sheetKeys, 0);
             key.emit('pointerdown', {clientX: 50, clientY: 200});
             [190, 170, 150, 130].forEach(function (y) {
               key.emit('pointermove', {clientX: 50, clientY: y}); });
             key.emit('pointerup', {clientX: 50, clientY: 130});
-            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
             [[], 70])
 
     def test_a_drag_back_the_other_way_returns(self):
         self.assertEqual(self.gesture('''
-            var key = keyAt(keys, 0);
-            keys.scrollTop = 100;
+            var key = keyAt(sheetKeys, 0);
+            sheet.scrollTop = 100;
             key.emit('pointerdown', {clientX: 50, clientY: 100});
             [130, 160].forEach(function (y) {
               key.emit('pointermove', {clientX: 50, clientY: y}); });
             key.emit('pointerup', {clientX: 50, clientY: 160});
-            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
             [[], 40])
 
     def test_a_small_wobble_is_still_a_tap(self):
         """A thumb is not a stylus. Treating every pixel of movement as a
         scroll would make the pad feel broken rather than careful."""
         self.assertEqual(self.gesture('''
-            var key = keyAt(keys, 0);
+            var key = keyAt(sheetKeys, 0);
             key.emit('pointerdown', {clientX: 50, clientY: 100});
             key.emit('pointermove', {clientX: 53, clientY: 104});
             key.emit('pointerup', {clientX: 53, clientY: 104});
-            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
             [['\x02d'], 0])
 
     def test_a_cancelled_pointer_types_nothing(self):
         self.assertEqual(self.gesture('''
-            var key = keyAt(keys, 0);
+            var key = keyAt(sheetKeys, 0);
             key.emit('pointerdown', {clientX: 50, clientY: 100});
             key.emit('pointercancel', {});
             console.log(JSON.stringify(sent));'''), [])
@@ -1909,13 +2442,12 @@ class KeypadVocabularyTests(unittest.TestCase):
         moving underneath it, and it must not type again on release.
         """
         self.assertEqual(self.gesture('''
-            renderNav();
             var key = keyAt(nav, 0);
             key.emit('pointerdown', {clientX: 50, clientY: 200});
             [170, 140].forEach(function (y) {
               key.emit('pointermove', {clientX: 50, clientY: y}); });
             key.emit('pointerup', {clientX: 50, clientY: 140});
-            console.log(JSON.stringify([sent, keys.scrollTop]));'''),
+            console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
             [['\x1b'], 0])
 
     def test_a_closed_drawer_has_nothing_to_scroll(self):
@@ -1933,7 +2465,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         """Firing on release is what makes a drag safe; it must not also add
         a keystroke to the end of a hold that has already been repeating."""
         self.assertEqual(self.gesture('''
-            var key = keyLabelled(keys, 'PgUp');
+            var key = keyLabelled(sheetKeys, 'PgUp');
             key.emit('pointerdown', {clientX: 0, clientY: 0});
             setTimeout(function () {
               var before = sent.length;
@@ -1962,16 +2494,17 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     def test_what_you_keep_is_remembered(self):
         self.assertEqual(self.edit('''
-            var key = keyLabelled(keys, 'detach');
+            var key = keyLabelled(sheetKeys, 'detach');
             key.emit('pointerdown', {}); key.emit('pointerup', {});
-            console.log(JSON.stringify([pins, store[PINS], sent]));'''),
+            console.log(JSON.stringify([pins, store[PINS], sent]));''',
+            stored=[]),
             [['detach'], '["detach"]', []])
 
     def test_keeping_it_twice_puts_it_back(self):
         self.assertEqual(self.edit('''
-            var key = keyLabelled(keys, '^C');
+            var key = keyLabelled(sheetKeys, '^C');
             key.emit('pointerdown', {}); key.emit('pointerup', {});
-            key = keyLabelled(keys, '^C');
+            key = keyLabelled(sheetKeys, '^C');
             key.emit('pointerdown', {}); key.emit('pointerup', {});
             console.log(JSON.stringify([pins, store[PINS]]));''',
             stored=['detach']),
@@ -1987,10 +2520,47 @@ class KeypadVocabularyTests(unittest.TestCase):
             [['detach', '|'], ''])
 
     def test_no_kept_keys_means_no_row_at_all(self):
+        """An empty choice is still a choice: someone who cleared the row gets
+        it cleared, not helpfully refilled with the defaults."""
         self.assertEqual(self.edit('''
             console.log(JSON.stringify(
-              [drawn(pinRow, []), pinRow.style.display]));'''),
+              [drawn(pinRow, []), pinRow.style.display]));''', stored=[]),
             [[], 'none'])
+
+    def test_the_row_exists_on_a_phone_that_has_never_been_here(self):
+        """It used to render empty, which made the whole feature's on-screen
+        presence an unlabelled star acting on the four keys the closed drawer
+        happened to be showing. Nobody discovers a row that is not there."""
+        page = self.edit('''
+            console.log(JSON.stringify(
+              [drawn(pinRow, []), pinRow.style.display]));''')
+        self.assertEqual(page[1], '')
+        self.assertEqual(page[0], ['^C', '^R', 'PgUp', '/'])
+
+    def test_the_defaults_are_keys_this_client_actually_has(self):
+        """A default naming something that is not in any group would render
+        as nothing at all -- an empty row with extra steps."""
+        self.assertEqual(self.run_js('''
+            store[PINS] = null; delete store[PINS];
+            pins = loadPins();
+            console.log(JSON.stringify(pinnedKeys().map(function (e) {
+              return e.l; })));'''), ['^C', '^R', 'PgUp', '/'])
+
+    def test_a_default_pin_does_not_duplicate_the_way_out(self):
+        """`detach` is in the settings row now. Three ways to leave, stacked
+        one above the other, is not three times as useful."""
+        self.assertNotIn('detach', self.run_js(
+            'console.log(JSON.stringify(DEFAULT_PINS));'))
+
+    def test_clearing_the_last_kept_key_stays_cleared(self):
+        """The store is written even when the list is empty, because the key
+        existing is what records that a choice was made."""
+        self.assertEqual(self.edit('''
+            var key = keyLabelled(sheetKeys, 'detach');
+            key.emit('pointerdown', {}); key.emit('pointerup', {});
+            console.log(JSON.stringify([pins, store[PINS], loadPins()]));''',
+            stored=['detach']),
+            [[], '[]', []])
 
     def test_a_kept_key_follows_a_rebound_prefix(self):
         """Which is why labels are stored and bytes are not. `detach` frozen
@@ -2033,9 +2603,9 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     def test_choosing_a_key_does_not_press_it(self):
         self.assertEqual(self.edit('''
-            var key = keyLabelled(keys, '^C');
+            var key = keyLabelled(sheetKeys, '^C');
             key.emit('pointerdown', {}); key.emit('pointerup', {});
-            console.log(JSON.stringify([sent, pins]));'''),
+            console.log(JSON.stringify([sent, pins]));''', stored=[]),
             [[], ['^C']])
 
     def test_an_app_key_is_inert_while_choosing_rather_than_merely_unkeepable(
@@ -2045,23 +2615,54 @@ class KeypadVocabularyTests(unittest.TestCase):
         through to it because it happened not to be pinnable would be the
         worst bug in this file."""
         self.assertEqual(self.edit('''
-            var key = keyLabelled(keys, 'Kill session');
+            var key = keyLabelled(sheetKeys, 'Kill session');
             key.emit('pointerdown', {}); key.emit('pointerup', {});
             console.log(JSON.stringify(
-              [sent, pins, key._cls.locked === 1, !!key._cls.choose]));'''),
+              [sent, pins, key._cls.locked === 1, !!key._cls.choose]));''',
+            stored=[]),
             [[], [], True, False])
 
     def test_a_held_key_does_not_keep_and_unkeep_itself(self):
         """PgUp repeats. Ten pins a second is the obvious way to get this
         wrong, so nothing repeats while choosing."""
         self.assertEqual(self.edit('''
-            var key = keyLabelled(keys, 'PgUp');
+            var key = keyLabelled(sheetKeys, 'PgUp');
             key.emit('pointerdown', {});
             setTimeout(function () {
               key.emit('pointerup', {});
               console.log(JSON.stringify([sent, pins]));
-            }, 560);'''),
+            }, 560);''', stored=[]),
             [[], ['PgUp']])
+
+    # ── the way out ───────────────────────────────────────────────────────
+
+    def test_the_way_out_is_visible_without_opening_anything(self):
+        """From inside a session the only route back to the list was
+        `detach` -- seventh key into the sheet, under `tmux` -- and this page
+        is built to be installed to the home screen, where there is no browser
+        chrome to fall back on.
+
+        It sends `prefix d` rather than navigating: detaching ends the pty,
+        the socket closes with reason "exit", and onclose is what returns you.
+        So the button does not have to know where the list is, and it follows
+        a rebound prefix for free.
+        """
+        self.assertEqual(self.run_js('''
+            sent = [];
+            prefixSeq = '\\x01';
+            typed(prefixSeq + 'd');
+            console.log(JSON.stringify(sent));'''), ['\x01d'])
+        self.assertIn("typed(prefixSeq + 'd')", self.js)
+
+    def test_leaving_stops_reading_history_first(self):
+        """Typing into a pane that is still in copy-mode reaches nothing --
+        measured. A detach that silently did nothing because you had swiped
+        up first is the worst version of this button."""
+        self.assertEqual(self.run_js('''
+            scrolledBack = true; sent = [];
+            typed(prefixSeq + 'd');
+            console.log(JSON.stringify([sent, scrolledBack]));'''),
+            [['q', '\x02d'], False])
 
     def test_pressing_a_kept_key_normally_sends_it(self):
         self.assertEqual(self.run_js('''
@@ -2297,7 +2898,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         sent, back, label = self.history('swipeBy(3); payScroll();')
         self.assertEqual(sent, ['\x02[', '\x1b[1;5A' * 9])
         self.assertTrue(back)
-        self.assertIn('行', label)              # the drag's own count first
+        self.assertIn('lines', label)           # the drag's own count first
 
     def test_the_bar_is_the_way_back_to_live(self):
         """q is copy-mode's cancel in both key tables."""
@@ -2450,7 +3051,10 @@ class KeypadVocabularyTests(unittest.TestCase):
             setEditing(true);
             setPad(false);
             console.log(JSON.stringify([editing, expanded]));'''),
-            [False, True])
+            # The sheet closes with it too. It covers the terminal rather than
+            # sitting inside the pad, so leaving it open while the pad is
+            # hidden would leave sixty keys over a screen with no way back.
+            [False, False])
 
     def test_closing_the_drawer_ends_editing_too(self):
         """A lit star in the corner is not enough to explain why `detach`
@@ -2482,12 +3086,24 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     def test_the_controls_all_fit_across_a_phone(self):
         """Seven buttons and a spacer in 390px. Measured in a browser at
-        7..383px, but the regression this catches is someone adding an
-        eighth without measuring."""
+        7..370px, but the regression this catches is someone adding an eighth
+        without measuring -- at 44px each plus gaps and padding, eight comes
+        to 408px and the last one goes off the edge.
+
+        `back` is here and `edit` is not, and that is the trade: the way out
+        of a session had to be visible somewhere, and choosing which keys to
+        keep is only meaningful while you can see the keys, which is when the
+        sheet is open. So it moved into the sheet.
+        """
         controls = re.findall(r'<button id="(\w+)"', self.html)
         self.assertEqual(controls,
-                         ['more', 'edit', 'fontminus', 'fontauto', 'fontplus',
-                          'kbd', 'hide', 'grip'])
+                         ['hist', 'edit', 'back', 'more', 'fontminus',
+                          'fontauto', 'fontplus', 'kbd', 'hide', 'grip'])
+        row = self.html[self.html.index('<div id="tabs">'):]
+        row = row[:row.index('</div>')]
+        self.assertEqual(re.findall(r'<button id="(\w+)"', row),
+                         ['back', 'more', 'fontminus', 'fontauto', 'fontplus',
+                          'kbd', 'hide'])
 
     def test_a_rotation_redraws_only_when_the_count_actually_changed(self):
         """Rebuilding the pad on every resize would drop a held key and clear
@@ -2500,7 +3116,7 @@ class KeypadVocabularyTests(unittest.TestCase):
             keys._width = 844; recolumn();
             var rebuilt = keys.children[0] !== marker;
             console.log(JSON.stringify([untouched, rebuilt, columnsUsed]));'''),
-            [True, True, 9])
+            [True, True, 10])
 
 
 @unittest.skipUnless(os.path.exists(os.path.join(
@@ -2590,6 +3206,37 @@ class DashboardTests(_ServedFixture):
         head, _body = self.get(web.CONSOLE.rstrip('/'))
         self.assertIn('302', head)
 
+    def test_the_gesture_replaced_the_bar_rather_than_joining_it(self):
+        """The bar cost about 70px of a phone screen permanently, for one link
+        and a refresh button answering a question the five-second poll had
+        usually already answered. Keeping both would be the worst of it: the
+        cost stays and the gesture is redundant."""
+        _head, body = self.get('/')
+        page = body.decode('utf-8')
+        self.assertNotIn('class="bar"', page)
+        self.assertNotIn('id="refresh"', page)
+        self.assertIn('id="pull"', page)
+        # The one control that earned its place is still one tap away.
+        self.assertIn('id="console"', page)
+        self.assertIn('class="go"', page)
+
+    def test_the_terminal_link_is_big_enough_to_hit(self):
+        css = re.sub(r'/\*.*?\*/', '',
+                     self.get('/')[1].decode('utf-8'), flags=re.S)
+        rule = re.search(r'header \.go \{[^}]*\}', css)
+        self.assertIsNotNone(rule)
+        self.assertIn('min-width: 44px', rule.group(0))
+        self.assertIn('min-height: 44px', rule.group(0))
+
+    def test_the_page_ends_clear_of_the_home_indicator(self):
+        """The bar used to carry that inset. Removing it without moving the
+        inset leaves the queue flush against the bottom of the screen."""
+        css = re.sub(r'/\*.*?\*/', '',
+                     self.get('/')[1].decode('utf-8'), flags=re.S)
+        rule = re.search(r'^\s*section \{[^}]*\}', css, re.M)
+        self.assertIsNotNone(rule)
+        self.assertIn('env(safe-area-inset-bottom)', rule.group(0))
+
     def test_the_state_endpoint_answers_even_with_no_source(self):
         """A dashboard that 500s because nothing has fetched yet is a
         dashboard that looks broken on every cold start."""
@@ -2626,6 +3273,77 @@ class DashboardTests(_ServedFixture):
             js = f.read()
         self.assertNotIn('innerHTML', js)
         self.assertIn('textContent', js)
+
+
+@unittest.skipUnless(_node(), 'needs a javascript runtime')
+class PullToRefreshTests(unittest.TestCase):
+    """The gesture a phone reaches for first, and the page used to refuse it.
+
+    `overscroll-behavior-y: contain` turns the browser's own off, so this one
+    is drawn by hand -- which means the decision has to be right about the
+    thing that matters most: a tap on a session row must never become a pull.
+    Driven end to end in a real browser too, with synthesised touches; this is
+    the part that can be reasoned about without one.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(web.ASSETS, 'dash.js'), encoding='utf-8') as f:
+            cls.js = f.read()
+        parts = []
+        for head in ('var PULL_SLOP =', 'var TRIGGER =', 'var MAX_PULL =',
+                     'var FOLLOW ='):
+            match = re.search(re.escape(head) + r'[^;]*;', cls.js)
+            assert match, head
+            parts.append(match.group(0))
+        parts.append(_extract(cls.js, 'pullState'))
+        cls.harness = '\n'.join(parts)
+
+    def state(self, dy):
+        import subprocess
+        out = subprocess.run(
+            [_node(), '-e', self.harness +
+             f'\nconsole.log(JSON.stringify(pullState({dy})));'],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_a_tap_is_never_a_pull(self):
+        """A thumb is not a stylus, and the rows underneath attach to a
+        session on a single tap. Returning null rather than a zero-height
+        state is the difference between leaving the page alone and taking
+        the gesture and then doing nothing with it."""
+        for dy in (0.5, 3, 7):
+            with self.subTest(dy=dy):
+                self.assertIsNone(self.state(dy))
+
+    def test_a_short_pull_shows_the_strip_but_does_not_arm_it(self):
+        page = self.state(40)
+        self.assertEqual(page['state'], 'pull')
+        self.assertGreater(page['height'], 0)
+
+    def test_a_pull_past_the_trigger_arms(self):
+        self.assertEqual(self.state(64)['state'], 'armed')
+        self.assertEqual(self.state(200)['state'], 'armed')
+
+    def test_the_strip_stops_following_before_it_eats_the_page(self):
+        """A rubber band, so the end of the travel is felt rather than hit."""
+        self.assertEqual(self.state(400)['height'], self.state(4000)['height'])
+        self.assertLessEqual(self.state(4000)['height'], 96)
+
+    def test_an_upward_drag_is_the_list_scrolling_and_nothing_else(self):
+        for dy in (0, -1, -200):
+            with self.subTest(dy=dy):
+                self.assertEqual(self.state(dy), {'height': 0, 'state': ''})
+
+    def test_the_strip_moves_less_than_the_finger(self):
+        """Otherwise the list runs off the bottom of the screen before the
+        gesture has said anything."""
+        self.assertLess(self.state(64)['height'], 64)
+
+    def test_the_page_no_longer_has_a_button_for_it(self):
+        self.assertNotIn("getElementById('refresh')", self.js)
+        self.assertIn('pullState', self.js)
 
 
 class DashboardStateTests(unittest.TestCase):

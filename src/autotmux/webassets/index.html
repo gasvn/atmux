@@ -14,11 +14,33 @@
 <title>atmux</title>
 <link rel="stylesheet" href="xterm.css">
 <link rel="manifest" href="manifest.json">
+<!-- Relative, like everything else here: `tailscale serve --set-path /term`
+     strips the prefix, so an absolute path would point at nothing. -->
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
 <!-- The widths the dashboard has layouts for, filled in by the server from
      config.LAYOUT_WIDTHS. app.js sizes the font to land on one of them. -->
 <!--layout-->
 <!--bootstrap-->
 <style>
+  /* The one navigation this app has -- tap a session on the list, land in it
+     -- was a hard cut between two documents. Chrome 126 and Safari 18.2 will
+     cross-fade it for the cost of this rule; Firefox has not shipped it and
+     simply navigates, so there is nothing to detect and nothing to fall back
+     to. Both pages opt in or neither transition happens.
+
+     Opacity only. The incoming page is a character grid, and scaling one for
+     180ms is how you turn a transition into a blurry frame. */
+  @view-transition { navigation: auto; }
+  ::view-transition-old(root) { animation: atmux-fade-out 110ms ease-in both; }
+  ::view-transition-new(root) { animation: atmux-fade-in 170ms ease-out both; }
+  @keyframes atmux-fade-out { to { opacity: 0; } }
+  @keyframes atmux-fade-in { from { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    ::view-transition-old(root), ::view-transition-new(root) {
+      animation: none;
+    }
+  }
   html, body {
     margin: 0; padding: 0; height: 100%; background: #121212;
     overscroll-behavior: none;          /* no rubber-banding over the terminal */
@@ -74,10 +96,16 @@
   #pad { display: none; }
   body.touch #pad {
     /* Bounded as a share of #app, not in vh. #app is sized to visualViewport,
-       so when the software keyboard is up an open drawer shrinks with it --
-       a vh-based cap would keep its full-screen height and leave the terminal
-       no rows at all. */
+       so when the software keyboard is up the pad shrinks with it -- a
+       vh-based cap would keep its full-screen height and leave the terminal
+       no rows at all.
+       Only a backstop now: the drawer no longer grows this box, so what is
+       laid out here is four fixed rows and the cap never binds in practice. */
     flex: 0 1 auto; display: flex; flex-direction: column; max-height: 62%;
+    /* The containing block for the drawer sheet, which is positioned against
+       this box's top edge so that opening it never changes this box's height.
+       See #sheet.open. */
+    position: relative;
     /* Lit from the terminal's edge and falling off downward, with a hairline
        of light along the seam. Dark as a surface, not dark as an absence --
        which is the difference between a panel and a hole in the page. */
@@ -113,9 +141,14 @@
     position: absolute; top: 0; left: 0; right: 0; z-index: 15;
     text-align: center; padding: 9px 8px;
     font: 13px/1.2 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-    color: #f0d9a0; background: #3a3020; border-top: 1px solid #5a4a28;
+    color: #f0d9a0; background: #3a3020;
+    /* A button now, so the defaults have to be undone rather than inherited. */
+    border: 0; border-bottom: 1px solid #5a4a28; width: 100%;
+    -webkit-appearance: none; appearance: none;
+    -webkit-tap-highlight-color: transparent;
     user-select: none; -webkit-user-select: none; touch-action: none;
   }
+  #hist:active { background: #4a3d28; }
   #hist[hidden] { display: none; }
   /* Anyone who has asked the system for less motion gets the states without
      the travel. The states are the information; the movement is manners. */
@@ -169,25 +202,103 @@
     height: calc(26px + env(safe-area-inset-bottom));
     padding: 0 0 env(safe-area-inset-bottom);
     background: #141418; border: 0; border-top: 1px solid #2a2a30;
-    color: #6e6e78; font: 13px/1 ui-monospace, Menlo, monospace;
+    /* Raised from #6e6e78, which measured 3.64:1 here. This strip is the only
+       way back to the keys once they are hidden; it cannot be the hardest
+       thing on the screen to see. */
+    color: #9096a0; font: 13px/1 ui-monospace, Menlo, monospace;
     -webkit-tap-highlight-color: transparent;
   }
   body.touch.nopad #grip:active { background: #26262c; }
-  /* Only the drawer scrolls. #nav and the row under it stay put so the keys
-     you reach for without looking are always in the same place. */
-  #keys { flex: 0 1 auto; min-height: 0; padding: 7px 7px 4px; }
-  /* contain, so reaching the end of the drawer stops there rather than
-     handing the rest of the swipe to the page behind it. */
-  #keys.open {
+  /* This screen's own keys, one row, always in flow and always the same
+     height. #nav and the row above it stay put for the same reason: the keys
+     you reach for without looking must be in the same place every time. */
+  #keys { flex: 0 0 auto; padding: 7px 7px 4px; }
+
+  /* ── the drawer ───────────────────────────────────────────────────────
+     A sheet over the terminal, not a row of the layout. As a flex child it
+     took the terminal from 57 rows to 29 every time it opened, which resizes
+     the pty, which makes tmux reflow and repaint the whole screen -- and then
+     again on close. That is the same jolt that made swiping feel unstable,
+     arriving on a tap instead of a drag. #hist solved exactly this by
+     overlaying; this is that.
+
+     bottom: 100% puts its lower edge on #pad's upper edge, so it grows
+     upward over the terminal and #pad's own height never changes at all.
+     The cap is set in JS, from the room actually available. */
+  #sheet { display: none; }
+  body.touch #sheet.open {
+    display: block;
+    position: absolute; left: 0; right: 0; bottom: 100%;
     overflow-y: auto; -webkit-overflow-scrolling: touch;
+    /* contain, so reaching the end of the list stops there rather than
+       handing the rest of the swipe to the terminal behind it. */
     overscroll-behavior-y: contain;
+    padding: 8px 7px 6px; box-sizing: border-box;
+    /* Flat, not the panel's gradient: the section headings pin to the top of
+       this box while it scrolls, and a heading can only sit invisibly on a
+       flat colour. Lifted off the terminal by its own shadow instead. */
+    background: #17171d;
+    border-top: 1px solid #000;
+    box-shadow: 0 -12px 28px rgba(0, 0, 0, .6),
+                inset 0 1px 0 rgba(255, 255, 255, .05);
   }
+  /* Sixty-three keys do not fit, and the list used to be cut flat against the
+     settings row -- which reads as damage rather than as "there is more". A
+     fade says the same thing without the hard edge, and it is removed once
+     there is genuinely nothing below, so it never lies. */
+  body.touch #sheet.open:not(.atbottom) {
+    -webkit-mask-image: linear-gradient(to bottom, #000 0,
+                        #000 calc(100% - 26px), transparent 100%);
+    mask-image: linear-gradient(to bottom, #000 0,
+                #000 calc(100% - 26px), transparent 100%);
+  }
+  /* Raised from #75757f, which measured 3.96:1 against this panel -- under the
+     4.5:1 small text needs, on the only navigation a 63-key list has. */
   .ghead {
-    color: #75757f; margin: 6px 2px 4px;
+    color: #9a9aa6; margin: 6px 2px 4px;
     font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
     letter-spacing: .1em; text-transform: uppercase;
   }
   .ghead:first-child { margin-top: 0; }
+  /* Pinned, because once you are scrolling the section you are in has already
+     gone off the top -- and the section is the only thing that tells `^W` in
+     ctrl from `w` in tmux. Offset by the sheet's own padding so it lands
+     flush against the edge, and opaque so the keys pass behind it. */
+  #sheet .ghead {
+    position: sticky; top: -8px; z-index: 2;
+    background: #17171d;
+    margin: 0 0 4px; padding: 10px 2px 5px;
+  }
+  #sheet .ghead:first-child { padding-top: 2px; }
+  /* The sheet's own toolbar, pinned above the sections. Recessed like the
+     settings row for the same reason: it changes how the pad behaves rather
+     than typing anything, and nothing in this sheet may be mistaken for a key
+     that types. */
+  #sheettop {
+    position: sticky; top: -8px; z-index: 3;
+    background: #17171d; padding: 8px 0 8px;
+    margin: -8px 0 0;
+    display: flex; gap: 6px;
+    border-bottom: 1px solid #21212a;
+  }
+  #sheettop button {
+    min-height: 40px; padding: 0 12px;
+    color: #9096a0;
+    background: linear-gradient(180deg, #131317 0%, #17171c 100%);
+    border: 1px solid #000; border-radius: 8px;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, .5),
+                0 1px 0 rgba(255, 255, 255, .045);
+    font: 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .04em;
+    -webkit-tap-highlight-color: transparent;
+    transition: color 90ms ease-out, box-shadow 90ms ease-out;
+  }
+  #sheettop button.on {
+    color: #7ff0cb;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, .5),
+                inset 0 0 0 1px rgba(70, 211, 164, .55),
+                0 0 8px rgba(70, 211, 164, .12);
+  }
   /* Fixed columns, never wrapping the row: flex-wrap stretched whichever key
      landed alone on the last line into a full-width button, which read as
      something important rather than as the leftover it was. A short last row
@@ -348,6 +459,51 @@
   #boot b { color: #d8d8dc; }
   #booterr { color: #e07a7a; max-width: 40em; white-space: pre-wrap;
              word-break: break-word; }
+
+  /* ── landscape ────────────────────────────────────────────────────────
+     Last in the file on purpose: every rule here overrides one above it at
+     the same specificity, so it only wins by coming after. Written earlier in
+     the stylesheet, `.key { min-height: 40px }` lost to the 44px rule further
+     down and the whole block silently did half its job.
+
+     Measured at 844x390 before any of this: the pad was 217px and the
+     terminal 173px -- twelve rows, less room than the keys attached to it --
+     because nothing in this file had ever asked what orientation it was in.
+     The navigation row was the visible half: ten keys in two rows of five,
+     each 162px wide, four times the width one needs, to save nothing.
+     app.js puts all ten on one row when they fit (see perRow); this is the
+     rest.
+
+     Bounded by height as well as orientation: a tablet in landscape has the
+     room and should keep the taller keys and the roomier rows. */
+  @media (orientation: landscape) and (max-height: 560px) {
+    /* No cap. It existed to stop the drawer eating the screen, and the drawer
+       is a sheet now -- what is left is four rows of fixed height. A cap that
+       still binds does not shrink them, because none of them may shrink; it
+       pushes the settings row off the bottom of the screen, which is exactly
+       what 46% did. Better to be honest about the height than to hide the row
+       you most need to reach. */
+    body.touch #pad { max-height: none; }
+    #nav { padding-top: 5px; }
+    /* The kept keys stand down here, and only here. They exist to save you
+       from opening the drawer -- and in landscape the row below already shows
+       ten of this screen's keys instead of five, and the sheet shows all sixty
+       at once. So they buy least exactly where a row costs most: this one is
+       58px of a 390px screen, about four rows of terminal. They are back the
+       moment the phone turns. */
+    #pins { display: none; }
+    #keys { padding: 5px 7px 3px; }
+    #tabs { padding-bottom: 5px; }
+    .krow { gap: 4px; margin-bottom: 4px; }
+    /* Still well over 44 in the direction a thumb aims -- ten across 844px is
+       79px wide -- so the target is larger than the 162x44 it replaces even
+       at 40 tall. Height is the one dimension a short screen cannot spend,
+       and 40px is Android's minimum where 44 is Apple's. */
+    .key { min-height: 40px; }
+    #nav .key.glyph { font-size: 16px; }
+    #tabs button { min-height: 40px; }
+    #grip { height: calc(22px + env(safe-area-inset-bottom)); }
+  }
 </style>
 </head>
 <body>
@@ -369,8 +525,15 @@
        back to the latest -- and this is that button.
 
        Static, never created at runtime: it also carries the page count
-       during a drag, when a structural DOM change would end the gesture. -->
-  <div id="hist" hidden></div>
+       during a drag, when a structural DOM change would end the gesture.
+
+       A button, and announced. It was a <div> with a click handler, which
+       made the app's only you-are-not-live indicator the one thing a screen
+       reader never mentioned -- while every key around it carried an
+       aria-label. aria-live is polite rather than assertive because it also
+       updates on every frame of a drag. -->
+  <button id="hist" type="button" hidden
+          aria-live="polite" aria-label="stop reading history"></button>
   <div id="pad">
     <!-- esc, the two modifiers, tab and the arrows. Fixed, in this order, and
          nothing below may reflow it: a key that moves because the far end
@@ -380,15 +543,38 @@
     <!-- The keys this person kept, if any. Fixed like the row above it: the
          point of keeping a key is that it stops moving. -->
     <div id="pins"></div>
-    <!-- The drawer. Closed it shows this screen's own keys; open it shows
-         everything, in labelled sections down one column. -->
+    <!-- This screen's own keys, one row. Never changes height, because the
+         terminal above it is sized to what is left over. -->
     <div id="keys"></div>
+    <!-- Everything, in labelled sections down one column. A sheet over the
+         terminal rather than a row of the layout: see #sheet.open. -->
+    <div id="sheet">
+      <!-- Pinned to the top of the sheet, because keeping a key is something
+           you do to the keys in front of you. The whole feature used to be an
+           unlabelled ☆ in the settings row acting on the four keys the closed
+           drawer happened to show. -->
+      <div id="sheettop">
+        <button id="edit" aria-label="choose which keys to keep">
+          ☆ keep keys</button>
+      </div>
+      <div id="sheetkeys"></div>
+    </div>
     <div id="tabs">
+      <!-- The way out. From inside a session the only route back to the list
+           was `detach`, seventh key into the drawer under `tmux` -- and this
+           page is built to be installed to the home screen, where there is no
+           browser chrome to fall back on. It sends the same thing that key
+           does; the socket closing is what returns you. -->
+      <button id="back" aria-label="back to the session list">‹</button>
       <!-- No pages. Pages are what put the layout key two taps deep behind a
            tab nobody would open; a second axis of navigation would be that
            same mistake wearing a different name. This opens the one drawer. -->
       <button id="more" aria-label="more keys">⌄</button>
-      <button id="edit" aria-label="choose which keys to keep">☆</button>
+      <!-- ☆ used to sit here and now lives at the top of the sheet. Seven
+           buttons at 44px plus gaps is 363px and an eighth does not fit on a
+           390px phone -- but the reason to move it rather than shrink the row
+           is that choosing which keys to keep is only meaningful while you
+           can see the keys, which is exactly when the sheet is open. -->
       <span class="spacer"></span>
       <button id="fontminus" aria-label="smaller">A−</button>
       <!-- Lit while the layout is choosing the size, which is the normal

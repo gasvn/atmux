@@ -172,9 +172,9 @@
   }
 
   function poll() {
-    if (inflight) return;
+    if (inflight) return Promise.resolve();
     inflight = true;
-    fetch(api('state'), { cache: 'no-store' })
+    return fetch(api('state'), { cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(render)
       .catch(function (error) {
@@ -184,6 +184,98 @@
       })
       .then(function () { inflight = false; });
   }
+
+  // ── pull to refresh ─────────────────────────────────────────────────────
+  // The gesture a phone reaches for first. The page had a button for it in a
+  // sticky bar instead -- 70px of screen, permanently, for something the
+  // five-second poll usually did before you asked -- and actively refused the
+  // gesture, because overscroll-behavior-y: contain turns the browser's own
+  // off. So it is ours to draw.
+  //
+  // Only from the very top, and only downward: anywhere else a vertical drag
+  // is the list scrolling, and stealing that would be far worse than not
+  // having this at all.
+  var pull = document.getElementById('pull');
+  var PULL_SLOP = 8;         // below this a touch is still a tap
+  var TRIGGER = 64;          // finger travel before letting go means anything
+  var MAX_PULL = 96;         // past here the strip stops following
+  var FOLLOW = 0.5;          // how far the strip moves per pixel of finger
+  var pullStart = -1, pulling = false, refreshing = false;
+
+  // What a downward drag of `dy` from the top of the page means. Pure, and
+  // separate from the listeners, because this is the whole of the decision
+  // and everything around it is plumbing: null means "not a pull, leave the
+  // page alone", which is what keeps a tap on a session row a tap.
+  function pullState(dy) {
+    if (dy <= 0) return { height: 0, state: '' };
+    if (dy < PULL_SLOP) return null;
+    var shown = Math.min(MAX_PULL, dy * FOLLOW);
+    return { height: shown, state: dy >= TRIGGER ? 'armed' : 'pull' };
+  }
+
+  function setPull(height, state) {
+    if (!pull) return;
+    pull.style.height = Math.round(height) + 'px';
+    pull.textContent = state === 'busy' ? 'refreshing…'
+                     : state === 'armed' ? 'release to refresh'
+                     : state === 'pull' ? 'pull to refresh' : '';
+    pull.classList.toggle('armed', state === 'armed');
+    pull.classList.toggle('busy', state === 'busy');
+  }
+
+  function endPull() {
+    pulling = false;
+    pullStart = -1;
+    if (pull) pull.classList.remove('dragging');
+  }
+
+  document.addEventListener('touchstart', function (event) {
+    if (refreshing || event.touches.length !== 1) return;
+    // scrollY, not the list's own scrollTop: the whole page scrolls here.
+    pullStart = window.scrollY <= 0 ? event.touches[0].clientY : -1;
+  }, { passive: true });
+
+  document.addEventListener('touchmove', function (event) {
+    if (pullStart < 0 || refreshing) return;
+    var next = pullState(event.touches[0].clientY - pullStart);
+    if (next === null) return;            // still inside the slop: a tap
+    if (!next.state) {
+      // Turned into an upward scroll: hand it back rather than keep a strip
+      // open above a list the reader is trying to move.
+      if (pulling) { setPull(0, ''); endPull(); }
+      pullStart = -1;
+      return;
+    }
+    if (!pulling) {
+      pulling = true;
+      if (pull) pull.classList.add('dragging');
+    }
+    setPull(next.height, next.state);
+  }, { passive: true });
+
+  document.addEventListener('touchend', function () {
+    if (!pulling) { pullStart = -1; return; }
+    var armed = pull && pull.classList.contains('armed');
+    endPull();
+    if (!armed) { setPull(0, ''); return; }
+    refreshing = true;
+    setPull(36, 'busy');
+    var settled = Date.now();
+    poll().then(function () {
+      // Held briefly if the answer came back instantly. A strip that appears
+      // and vanishes in the same frame reads as nothing having happened.
+      var wait = Math.max(0, 350 - (Date.now() - settled));
+      setTimeout(function () {
+        refreshing = false;
+        setPull(0, '');
+      }, wait);
+    });
+  }, { passive: true });
+
+  document.addEventListener('touchcancel', function () {
+    if (pulling) setPull(0, '');
+    endPull();
+  }, { passive: true });
 
   function start() {
     poll();
@@ -198,6 +290,5 @@
     if (document.hidden) clearInterval(timer);
     else start();
   });
-  document.getElementById('refresh').addEventListener('click', poll);
   start();
 })();

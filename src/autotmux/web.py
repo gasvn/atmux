@@ -12,8 +12,12 @@ need an ASGI stack, and the stdlib already has everything: ``pty`` for the
 terminal, ``http.server`` for the page, and a WebSocket that fits in a hundred
 lines because only two frame types matter here.
 
-Bind to loopback and publish with ``tailscale serve``. Nothing here
-authenticates a caller, so anything that can open the socket owns a shell.
+Bind to loopback and publish with ``tailscale serve``. By default nothing here
+authenticates a caller, so anything that can open the socket owns a shell --
+which is a coherent design for a tailnet of one and worth stating out loud
+before it is a tailnet of several. Setting ``[web] allow_users`` turns on a
+check against the login ``tailscale serve`` reports; see ``Handler._allowed``
+for why that header can be believed here and nowhere else.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from __future__ import annotations
 import base64
 import errno
 import fcntl
+import gzip
 import hashlib
 import http.server
 import ipaddress
@@ -58,6 +63,14 @@ MAX_FRAME_BYTES = 4 * 1024 * 1024
 # Bigger than any single PTY read, so output is forwarded whole rather than in
 # fragments the terminal has to reassemble mid-escape-sequence.
 PTY_READ_BYTES = 65536
+
+# Text compresses; the PNGs do not, and gzipping them would cost CPU to make
+# them slightly larger. Below a kilobyte the header alone outweighs the saving.
+_COMPRESSIBLE = frozenset({
+    'text/html', 'text/css', 'text/javascript', 'text/plain',
+    'application/json', 'image/svg+xml',
+})
+MIN_COMPRESS_BYTES = 1024
 
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 7681
@@ -254,6 +267,12 @@ _ASSET_TYPES = {
     '.js': 'text/javascript; charset=utf-8',
     '.css': 'text/css; charset=utf-8',
     '.json': 'application/json; charset=utf-8',
+    # The home-screen mark. Without these a launcher gets a screenshot of the
+    # page, and Chrome does not offer to install at all -- which matters here
+    # more than on an ordinary site, because installing is worth about ten
+    # rows of terminal in reclaimed browser chrome.
+    '.svg': 'image/svg+xml; charset=utf-8',
+    '.png': 'image/png',
 }
 _ASSET_NAME = re.compile(r'^[A-Za-z0-9._-]+$')
 
@@ -305,8 +324,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.server.verbose:
             super().log_message(fmt, *args)
 
+    # ── who is asking ─────────────────────────────────────────────────────
+    # `tailscale serve` puts the authenticated tailnet user on every request
+    # it proxies. Believing a header like that is normally a mistake -- anyone
+    # who can reach the port can also write it -- but this server listens on
+    # loopback, so "anyone who can reach the port" is this machine and nothing
+    # else. serve() enforces that precondition rather than assuming it.
+    IDENTITY_HEADER = 'Tailscale-User-Login'
+
+    def _allowed(self) -> bool:
+        allowed = getattr(self.server, 'allow_users', ())
+        if not allowed:
+            return True                      # no list, no check: as it was
+        who = (self.headers.get(self.IDENTITY_HEADER) or '').strip().lower()
+        return bool(who) and who in allowed
+
+    def do_HEAD(self) -> None:
+        # Same routing, no body. _bytes() checks self.command, and the
+        # stdlib's send_error already suppresses its own body for HEAD.
+        self.do_GET()
+
     def do_GET(self) -> None:
         path = self.path.split('?', 1)[0]
+        if not self._allowed():
+            # 403, not 401: there is no credential this server could ask for.
+            # The name is echoed back because the usual cause is a request
+            # that did not come through `tailscale serve` at all.
+            self.send_error(
+                403, 'Forbidden',
+                'This atmux-web only answers to the logins in [web] '
+                'allow_users, as reported by `tailscale serve`.')
+            return
+        # A handshake is a connection, not a document; there is nothing to
+        # describe without performing it.
+        if self.command == 'HEAD' and (path == '/ws' or path.endswith('/ws')):
+            self.send_error(405, 'Method Not Allowed')
+            return
         # The socket is addressed relative to whichever page opened it, so
         # the console at /console/ asks for /console/ws. One rule rather than
         # a list of mount points: the page must keep working wherever it is
@@ -392,10 +445,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # presented itself.
         self._bytes(body, ctype, cache=name not in _VOLATILE_ASSETS)
 
+    def _wants_gzip(self) -> bool:
+        # Deliberately not a full q-value parser: the only thing that matters
+        # is whether gzip is offered and not explicitly refused, and every
+        # browser that reaches this page offers it.
+        offered = (self.headers.get('Accept-Encoding') or '').lower()
+        for part in offered.split(','):
+            name, _, params = part.strip().partition(';')
+            if name.strip() != 'gzip':
+                continue
+            return 'q=0' not in params.replace(' ', '')
+        return False
+
     def _bytes(self, body: bytes, ctype: str, cache: bool = False) -> None:
+        # The vendored terminal is half a megabyte of JavaScript and went out
+        # uncompressed: 590 KB for a first load that gzip takes to 156 KB. The
+        # caching above only helps the second one, and the first is the one
+        # happening on a phone away from wifi.
+        encoded = False
+        if (len(body) >= MIN_COMPRESS_BYTES
+                and ctype.split(';', 1)[0] in _COMPRESSIBLE
+                and self._wants_gzip()):
+            body = gzip.compress(body, 6)
+            encoded = True
         self.send_response(200)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
+        if encoded:
+            self.send_header('Content-Encoding', 'gzip')
+        # Named whether or not this particular response was compressed: the
+        # assets are cached `immutable` for a week, and a shared cache that
+        # kept one encoding for every client would hand a gzip body to a
+        # client that never asked for one.
+        self.send_header('Vary', 'Accept-Encoding')
         self.send_header('Cache-Control',
                          'public, max-age=604800, immutable' if cache
                          else 'no-store')
@@ -416,7 +498,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != 'HEAD':
+            self.wfile.write(body)
 
     # ── the bridge ────────────────────────────────────────────────────
     def _websocket(self) -> None:
@@ -583,11 +666,18 @@ class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, argv, env=None, verbose=False) -> None:
+    def __init__(self, address, argv, env=None, verbose=False,
+                 allow_users=()) -> None:
         super().__init__(address, Handler)
         self.argv = list(argv)
         self.env = dict(env or {})
         self.verbose = bool(verbose)
+        # Frozen, lower-cased, and compared as a set: the header arrives on
+        # every request and the check must not be a linear scan of a list the
+        # handler could also mutate.
+        self.allow_users = frozenset(
+            str(login).strip().lower() for login in allow_users
+            if str(login).strip())
         # One refresh loop for every client. Started by serve(); None in the
         # tests that only exercise the transport.
         self.state = None
@@ -603,9 +693,32 @@ def default_argv() -> list[str]:
     return [sys.executable, '-m', 'autotmux.cli']
 
 
+def is_loopback_bind(host: str) -> bool:
+    """True when only this machine can open the port."""
+    if host in ('localhost', ''):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
           argv: list[str] | None = None, verbose: bool = False) -> None:
-    server = Server((host, port), argv or default_argv(), verbose=verbose)
+    allow_users = config.load_web()['allow_users']
+    # The allow list is only as good as the bind. Off loopback, anyone who can
+    # reach the port can also write the header it checks, so the setting would
+    # promise something it cannot deliver -- and a security control that is
+    # quietly ineffective is worse than one that is absent.
+    if allow_users and not is_loopback_bind(host):
+        raise SystemExit(
+            f'[atmux-web] refusing to start: [web] allow_users is set but the '
+            f'server would bind {host}. The login it checks comes from a '
+            f'`tailscale serve` header, which only this machine can set when '
+            f'the bind is loopback. Bind 127.0.0.1 and publish with '
+            f'`tailscale serve`, or clear allow_users.')
+    server = Server((host, port), argv or default_argv(), verbose=verbose,
+                    allow_users=allow_users)
     # One background refresh shared by every client. Started before the first
     # request so the dashboard has something to draw rather than an empty
     # list that looks like "no sessions".
@@ -613,6 +726,8 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     server.state.start()
     where = f'http://{host}:{port}/'
     print(f'[atmux-web] serving {" ".join(server.argv)} on {where}')
+    if allow_users:
+        print(f'[atmux-web] only for: {", ".join(sorted(allow_users))}')
     if host in ('127.0.0.1', 'localhost', '::1'):
         print('[atmux-web] loopback only — publish it with: '
               f'tailscale serve --bg {port}')

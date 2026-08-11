@@ -12,6 +12,8 @@
 <meta name="format-detection" content="telephone=no">
 <title>atmux</title>
 <link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
 <!-- Filled in by the server. Must come before anything relative -- it is what
      puts the trailing slash back, and every href below is resolved against
      the address the browser actually asked for. -->
@@ -20,6 +22,18 @@
   /* A list, not a terminal. Everything the console had to fight for -- a
      layout that fits, text that wraps, rows you can touch, a keyboard that
      does not steal half the screen -- is what a page does by default. */
+  /* The other half of the transition. Must match the console's opt-in or the
+     navigation stays a hard cut -- both documents have to agree. */
+  @view-transition { navigation: auto; }
+  ::view-transition-old(root) { animation: atmux-fade-out 110ms ease-in both; }
+  ::view-transition-new(root) { animation: atmux-fade-in 170ms ease-out both; }
+  @keyframes atmux-fade-out { to { opacity: 0; } }
+  @keyframes atmux-fade-in { from { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    ::view-transition-old(root), ::view-transition-new(root) {
+      animation: none;
+    }
+  }
   :root {
     --bg: #121212; --panel: #1a1a1e; --line: #2a2a30;
     --ink: #e2e2e6; --dim: #8b8b95;
@@ -38,13 +52,46 @@
   }
   header {
     position: sticky; top: 0; z-index: 5;
-    display: flex; align-items: baseline; gap: 10px;
-    padding: 12px 14px 10px; background: var(--bg);
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 8px 10px 14px; background: var(--bg);
     border-bottom: 1px solid var(--line);
   }
   header h1 { font-size: 17px; margin: 0; font-weight: 600; }
   header .age { color: var(--dim); font-size: 13px; margin-left: auto; }
   header .age.stale { color: var(--stale); }
+  /* The one control that earned its place. It used to sit in a sticky bar at
+     the foot of the page next to a refresh button -- about 70px of a phone
+     screen, permanently, for one link and one button answering a question the
+     five-second poll had already answered. */
+  header .go {
+    display: flex; align-items: center; justify-content: center;
+    min-width: 44px; min-height: 44px; border-radius: 10px;
+    color: var(--ink); text-decoration: none; font-size: 19px;
+    border: 1px solid var(--line); background: var(--panel);
+  }
+  header .go:active { background: #26262c; }
+
+  /* ── pull to refresh ──────────────────────────────────────────────────
+     The gesture a phone reaches for first, and the page used to refuse it:
+     overscroll-behavior-y: contain turns off the browser's own, and the
+     button that replaced it sat in a bar costing a permanent 70px.
+     A strip that opens under the header and pushes the list down with the
+     finger, which is what both platforms do and therefore what the gesture
+     already means. In flow rather than sticky: a sticky strip would open
+     *behind* the sticky header and show about a third of itself. */
+  #pull {
+    height: 0; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--dim); background: var(--bg);
+    font-size: 12px; letter-spacing: .04em;
+    transition: height 160ms ease-out;
+  }
+  #pull.dragging { transition: none; }
+  #pull.armed { color: var(--accent); }
+  #pull.busy { color: var(--accent); }
+  @media (prefers-reduced-motion: reduce) {
+    #pull { transition: none; }
+  }
 
   ul { list-style: none; margin: 0; padding: 0; }
   /* Two targets on one row, both full height: tapping the row attaches,
@@ -96,7 +143,10 @@
   .tag.paused { background: #3a1f1f; color: var(--stale); }
   .tag.renewing { background: #3a331f; color: var(--hint); }
 
-  section { padding: 16px 14px 28px; }
+  /* The bottom bar is gone, so the last thing on the page needs the room the
+     bar used to occupy -- otherwise the queue ends flush against the home
+     indicator. */
+  section { padding: 16px 14px calc(28px + env(safe-area-inset-bottom)); }
   section h2 {
     font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
     color: var(--dim); margin: 0 0 8px;
@@ -110,19 +160,6 @@
                             monospace; color: var(--ink);
   }
   .empty { color: var(--dim); padding: 28px 14px; text-align: center; }
-  .bar {
-    position: sticky; bottom: 0; display: flex; gap: 10px;
-    padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
-    background: var(--bg); border-top: 1px solid var(--line);
-  }
-  .bar a, .bar button {
-    flex: 1 1 0; min-height: 44px; display: flex; align-items: center;
-    justify-content: center; gap: 6px;
-    background: var(--panel); color: var(--ink);
-    border: 1px solid var(--line); border-radius: 10px;
-    font: 15px/1 inherit; text-decoration: none;
-  }
-  .bar a:active, .bar button:active { background: #26262c; }
   .err {
     margin: 10px 14px; padding: 10px 12px; border-radius: 8px;
     background: #2a1a1a; color: #f0a0a0; font-size: 13px;
@@ -137,17 +174,18 @@
 <header>
   <h1>atmux</h1>
   <span class="age" id="age">…</span>
+  <a class="go" id="console" href="console/" aria-label="terminal">▤</a>
 </header>
+<!-- Opens under the header while you drag the list down, and says what letting
+     go will do. Empty and zero-height until then. role=status so the outcome
+     is announced rather than only drawn. -->
+<div id="pull" role="status"></div>
 <div id="err" class="err" hidden></div>
 <ul id="list"></ul>
 <section id="queue" hidden>
   <h2 id="queue-title">queue</h2>
   <pre id="queue-body"></pre>
 </section>
-<div class="bar">
-  <a id="console" href="console/">▤ terminal</a>
-  <button id="refresh" type="button">⟳ refresh</button>
-</div>
 <script src="dash.js"></script>
 </body>
 </html>

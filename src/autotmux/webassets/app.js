@@ -411,11 +411,32 @@
   // this file keeps guarding against: a button whose label outlived what it
   // does.
   var PINS = 'atmux.pins', MAX_PINS = 8;
+  // Four to start with, so the row exists on first run. It used to render
+  // empty, which meant the whole feature's on-screen presence was an
+  // unlabelled star -- and nobody discovers a row that is not there. These
+  // four are the ones that are right before anything is known about the
+  // person: stop what is running, find the command you ran before, read what
+  // scrolled past, and the one character every path needs that iOS buries two
+  // keyboard layers deep.
+  //
+  // Not `detach`: it is in the settings row now, and three ways to leave
+  // stacked one above the other is not three times as useful.
+  //
+  // Only a starting point, and only on the very first run.
+  var DEFAULT_PINS = ['^C', '^R', 'PgUp', '/'];
   var pins = loadPins(), editing = false;
 
   function loadPins() {
+    var stored = null;
+    try { stored = localStorage.getItem(PINS); } catch (e) {}
+    // Never written: nobody has been here, so start them off with four.
+    // Anything else -- including an entry that no longer parses -- means a
+    // choice was made, and the answer to a choice may be none. Handing the
+    // defaults back to someone who deliberately cleared the row would be the
+    // pad refilling itself every time they opened it.
+    if (stored === null) return DEFAULT_PINS.slice();
     try {
-      var raw = JSON.parse(localStorage.getItem(PINS) || '[]');
+      var raw = JSON.parse(stored);
       if (!Array.isArray(raw)) return [];
       return raw.filter(function (label) {
         return typeof label === 'string' && label && label.length <= 24;
@@ -424,6 +445,8 @@
   }
 
   function savePins() {
+    // Always writes, even when the list is empty: the key existing is what
+    // records that a choice was made. See loadPins.
     try { localStorage.setItem(PINS, JSON.stringify(pins)); } catch (e) {}
   }
 
@@ -436,25 +459,59 @@
     renderKeys();
   }
 
+  var pad = document.getElementById('pad');
   var keys = document.getElementById('keys');
+  var sheet = document.getElementById('sheet');
+  var sheetKeys = document.getElementById('sheetkeys');
   var nav = document.getElementById('nav');
   var pinRow = document.getElementById('pins');
   var expander = document.getElementById('more');
+
+  // How much terminal the sheet may cover. Not a percentage: #app is sized to
+  // visualViewport, so the room actually available changes with the software
+  // keyboard and with rotation, and the only honest source for it is the
+  // terminal box itself. What is left over is deliberately a usable strip and
+  // not a sliver -- a sheet that covers the screen you are operating on is a
+  // modal, and this is a drawer.
+  var TERM_KEEP = 96;
+  function sizeSheet() {
+    if (!sheet || !expanded) return;
+    var room = host.getBoundingClientRect().height - TERM_KEEP;
+    sheet.style.maxHeight = Math.max(120, Math.round(room)) + 'px';
+  }
+
+  // The fade at the bottom edge says "there is more below". Once there is
+  // not, it would be saying something false, so it comes off.
+  function markSheetEnd() {
+    if (!sheet) return;
+    var end = sheet.scrollTop + sheet.clientHeight >= sheet.scrollHeight - 2;
+    sheet.classList.toggle('atbottom', end);
+  }
+  if (sheet) sheet.addEventListener('scroll', markSheetEnd, { passive: true });
   // Two rows fit under a phone's thumb without eating the dashboard. The
   // rest are one tap away rather than one page away.
   var ROWS_COLLAPSED = 1;
   var current = [], expanded = false;
 
   // How many across is the screen's decision, not a constant -- the same rule
-  // the font size follows, for the same reason. Four is right on a phone and
-  // wrong on everything else: measured in landscape at 844px it made `|` a
-  // 204px button and spread forty-two keys over eleven rows on a screen 390px
-  // tall. What should stay put is the size of a key, not the number of them.
-  var KEY_TARGET = 86, PER_ROW_MIN = 4, PER_ROW_MAX = 10;
+  // the font size follows, for the same reason. What should stay put is the
+  // size of a key, not the number of them.
+  //
+  // One pitch for the whole panel, though, and only two values it may take.
+  // The navigation row holds exactly ten keys and has to divide evenly, so
+  // its only choices are two rows of five or one row of ten -- and whatever
+  // it picks, the rows under it pick the same, because two grids at different
+  // pitches sharing one panel is what stopped it reading as a single machined
+  // face. It was 5 x 71px above 4 x 86px, and none of the seams lined up.
+  //
+  // Ten only when ten fit: at 390px that would be 71px keys in the nav row
+  // and 33px ones would be a quarter under the minimum in the direction you
+  // aim. At 844px landscape it is 84px, which is where the two rows of 162px
+  // monsters used to be.
+  var NAV_PER_ROW = 5, WIDE_PER_ROW = 10, WIDE_KEY_MIN = 62;
   function perRow(width) {
-    if (!(width > 0)) return PER_ROW_MIN;
-    return Math.max(PER_ROW_MIN,
-                    Math.min(PER_ROW_MAX, Math.floor(width / KEY_TARGET)));
+    if (!(width > 0)) return NAV_PER_ROW;
+    return width / WIDE_PER_ROW >= WIDE_KEY_MIN ? WIDE_PER_ROW : NAV_PER_ROW;
   }
 
   function haptic() {
@@ -478,22 +535,30 @@
     sendText(applyLatch(data));
   }
 
-  // Two rows of five, not one row of ten. `.key` asks for a 44px minimum
-  // touch target and got it in height only: ten across a 390px phone is 33px
-  // wide, a quarter under the minimum in the direction you actually aim.
-  // Five is 70px. The split falls where the row already divides -- what
-  // modifies a key above, what moves the cursor below.
-  var NAV_PER_ROW = 5;
-  function renderNav() {
-    if (!nav || nav.childElementCount) return;      // fixed; built once
-    for (var start = 0; start < NAV_KEYS.length; start += NAV_PER_ROW) {
+  // Built once and then only when the width changes its mind. Two rows of
+  // five on a phone -- ten across 390px is 33px wide, a quarter under the
+  // minimum in the direction you actually aim -- and one row of ten wherever
+  // ten fit, which is every landscape phone and every tablet. The split at
+  // five falls where the row already divides: what modifies a key above,
+  // what moves the cursor below.
+  var navColumns = 0;
+  function renderNav(columns) {
+    if (!nav) return;
+    if (navColumns === columns && nav.childElementCount) return;
+    navColumns = columns;
+    nav.textContent = '';
+    modButtons = {};
+    for (var start = 0; start < NAV_KEYS.length; start += columns) {
       var line = document.createElement('div');
       line.className = 'krow';
-      NAV_KEYS.slice(start, start + NAV_PER_ROW).forEach(function (entry) {
+      NAV_KEYS.slice(start, start + columns).forEach(function (entry) {
         line.appendChild(buildKey(entry, true));
       });
       nav.appendChild(line);
     }
+    // The latch survives the rebuild; the buttons showing it do not, so it
+    // has to be repainted onto the new ones or an armed ctrl goes invisible
+    // and starts modifying keystrokes nobody asked it to.
     paintLatch();
   }
 
@@ -566,6 +631,10 @@
   function recolumn() {
     if (perRow(keys.getBoundingClientRect().width) !== columnsUsed) {
       renderKeys();
+    } else {
+      // The width did not change the grid, but a rotation still changes how
+      // much terminal there is for the sheet to cover.
+      sizeSheet();
     }
   }
 
@@ -581,47 +650,68 @@
   }
 
   function renderKeys() {
+    // Measured rather than reasoned about. The pad grows when the pinned row
+    // appears and when the width changes the column count, and does not when
+    // the sheet opens or the app publishes a different set of keys -- and
+    // getting that wrong in either direction is either a stale terminal or a
+    // full tmux repaint. The box knows; ask it.
+    var before = pad ? pad.getBoundingClientRect().height : 0;
     var columns = perRow(keys.getBoundingClientRect().width);
     columnsUsed = columns;
+    renderNav(columns);
     renderPins(columns);
+
+    // The row that is always there: what this screen can do, one row of it.
+    // When nothing has published anything the screen belongs to tmux or a
+    // shell, and the useful answer is tmux's own verbs -- detach first.
+    // Showing nothing here would put the one key nobody can guess behind a
+    // tap.
     keys.textContent = '';
-    keys.classList.toggle('open', expanded);
     keys.classList.toggle('editing', editing);
-    var hidden = 0;
-    if (expanded) {
-      groups().forEach(function (group) {
-        if (!group.keys.length) return;
-        if (group.name) {
-          var head = document.createElement('div');
-          head.className = 'ghead';
-          head.textContent = group.name;
-          keys.appendChild(head);
-        }
-        renderRows(keys, group.keys, columns, 0);
-      });
-    } else {
-      // Closed, the drawer shows what this screen can do. When nothing has
-      // published anything the screen belongs to tmux or a shell, and the
-      // useful answer is tmux's own verbs -- detach first. Showing nothing
-      // there would put the one key nobody can guess behind a tap.
-      var head = current.length ? current : tmuxKeys();
-      var drawn = Math.min(renderRows(keys, head, columns, ROWS_COLLAPSED),
-                           head.length);
-      hidden = groups().reduce(function (n, group) {
-        return n + group.keys.length;
-      }, 0) - drawn;
+    var head = current.length ? current : tmuxKeys();
+    var drawn = Math.min(renderRows(keys, head, columns, ROWS_COLLAPSED),
+                         head.length);
+    var total = groups().reduce(function (n, group) {
+      return n + group.keys.length;
+    }, 0);
+
+    // The sheet, which covers the terminal rather than displacing it.
+    if (sheet) {
+      sheet.classList.toggle('open', expanded);
+      sheet.classList.toggle('editing', editing);
+      sheetKeys.textContent = '';
+      if (expanded) {
+        groups().forEach(function (group) {
+          if (!group.keys.length) return;
+          if (group.name) {
+            var label = document.createElement('div');
+            label.className = 'ghead';
+            label.textContent = group.name;
+            sheetKeys.appendChild(label);
+          }
+          renderRows(sheetKeys, group.keys, columns, 0);
+        });
+        sizeSheet();
+        markSheetEnd();
+      } else {
+        sheet.style.maxHeight = '';
+      }
     }
+
     if (expander) {
       // Always offered. There is always more than fits: the terminal's own
       // vocabulary does not depend on anything having been published, and a
       // hidden expander is what left a bare shell with three keys.
-      expander.textContent = expanded ? '⌃' : '⌄ ' + Math.max(hidden, 0);
+      expander.textContent = expanded ? '⌃' : '⌄ ' + Math.max(total - drawn, 0);
       expander.setAttribute(
         'aria-label', expanded ? 'fewer keys' : 'more keys');
     }
-    // The pad's height just changed, and the terminal has to be told or the
-    // app keeps drawing rows that are now behind the keys.
-    refit();
+    // Opening the sheet leaves this unchanged, which is the entire point of
+    // it being a sheet: refit() resizes the pty, and tmux answers a resize by
+    // reflowing and repainting the whole screen -- twice per toggle, when
+    // nothing behind the keys had moved.
+    var after = pad ? pad.getBoundingClientRect().height : 0;
+    if (Math.abs(after - before) > 0.5) refit();
   }
 
   function setKeys(list) {
@@ -633,13 +723,14 @@
     renderKeys();
   }
 
-  // Only the drawer scrolls, and only a key that lives in it may scroll it:
-  // the row above is fixed on purpose, and dragging a fixed key to move
+  // Only the sheet scrolls, and only a key that lives in it may scroll it:
+  // the rows below it are fixed on purpose, and dragging a fixed key to move
   // something else is a gesture nobody asked for.
   function scrollDrawer(button, dy) {
-    if (!keys.classList.contains('open')) return;
-    if (!button.parentNode || button.parentNode.parentNode !== keys) return;
-    keys.scrollTop += dy;
+    if (!sheet || !sheet.classList.contains('open')) return;
+    if (!button.parentNode || button.parentNode.parentNode !== sheetKeys) return;
+    sheet.scrollTop += dy;
+    markSheetEnd();
   }
 
   function buildModifier(entry) {
@@ -799,6 +890,25 @@
     renderKeys();
   });
 
+  // ── the way out ───────────────────────────────────────────────────────
+  // `prefix d`, which is what the drawer's `detach` key sends. Detaching ends
+  // the pty, the socket closes with reason "exit", and onclose navigates back
+  // to the list -- so this button does not have to know where the list is.
+  //
+  // It exists because there was no visible way back at all: `detach` is
+  // seventh into the sheet under `tmux`, and this page is built to be
+  // installed to the home screen, where there is no browser chrome to fall
+  // back on.
+  var backButton = document.getElementById('back');
+  keepFocus(backButton);
+  if (backButton) backButton.addEventListener('click', function (event) {
+    event.preventDefault();
+    // Through typed(), so that reading history is left first: sending the
+    // prefix into a pane that is still in copy-mode reaches nothing at all.
+    typed(prefixSeq + 'd');
+    haptic();
+  });
+
   // ── getting out of the way ────────────────────────────────────────────
   // The pad is two hundred pixels of a phone screen, and there are stretches
   // -- reading a log, watching a job -- where you want none of it. Hidden
@@ -811,10 +921,16 @@
 
   function setPad(shown) {
     document.body.classList.toggle('nopad', !shown);
-    // Putting the pad away ends editing with it. Coming back to a pad whose
-    // keys silently keep instead of press, because of something you did
-    // before you hid it, is the same trap the expander closes.
-    if (!shown && editing) { setEditing(false); renderKeys(); }
+    // Putting the pad away ends editing with it, and closes the sheet. Coming
+    // back to a pad whose keys silently keep instead of press, because of
+    // something you did before you hid it, is the same trap the expander
+    // closes -- and a sheet that reappears over the terminal because it was
+    // open when you hid the pad is that trap with a bigger footprint.
+    if (!shown && (editing || expanded)) {
+      setEditing(false);
+      expanded = false;
+      renderKeys();
+    }
     try {
       localStorage.setItem(PAD_STATE, shown ? '' : 'hidden');
     } catch (e) {}
@@ -1014,7 +1130,7 @@
   function paintHistory(during) {
     if (!hist) return;
     if (!histText) hist.appendChild(histText = document.createTextNode(''));
-    var show = during || (scrolledBack ? '历史 · 点此回到实时' : '');
+    var show = during || (scrolledBack ? 'history · tap to go live' : '');
     // nodeValue, never textContent: replacing children is a structural change
     // and this one updates mid-gesture, which is when that ends the gesture.
     if (histText.nodeValue !== show) histText.nodeValue = show;
@@ -1032,7 +1148,7 @@
   // through one does not replace the running count with the standing bar.
   function duringLabel() {
     if (!scrolled) return '';
-    return (scrolled > 0 ? '▲ ' : '▼ ') + Math.abs(scrolled) + ' 行';
+    return (scrolled > 0 ? '▲ ' : '▼ ') + Math.abs(scrolled) + ' lines';
   }
   function enterHistory() {
     if (scrolledBack) return;
@@ -1473,8 +1589,8 @@
     document.body.classList.add('touch');
     // The published keys start empty; movement and escape do not, because
     // they have to work before anything has published and after everything
-    // has stopped.
-    renderNav();
+    // has stopped. renderKeys builds the navigation row too, so that both
+    // grids are decided by one measurement of one width.
     renderKeys();
     setKeyboard(false);
     var stored = '';

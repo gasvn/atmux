@@ -167,6 +167,22 @@ _NOTIFY_NUMBER_RULES = {
     'idle_cooldown': (float, 60.0, 604_800.0),
 }
 
+# The browser client.  Empty by default, which is the historical behaviour:
+# atmux-web binds loopback and whoever publishes it owns the door.
+WEB_DEFAULTS = {
+    # Logins allowed to reach the terminal, as `tailscale serve` reports them
+    # ("alice@example.com").  Empty means no check at all -- correct for a
+    # tailnet of one, and a decision worth making explicitly once it is not.
+    #
+    # Trustworthy only because the server listens on loopback: the usual
+    # objection to believing a proxy's identity header is that anyone who can
+    # reach the port directly can also set it, and on loopback that is nobody
+    # but this machine.  serve() refuses to start with a list set and a
+    # non-loopback bind rather than pretend the guarantee still holds.
+    'allow_users': [],
+}
+
+
 # Defaults mirror the current daemon.py constants exactly.
 DEFAULTS = {
     'squeue_interval': 30,
@@ -1040,3 +1056,64 @@ def load_notify() -> dict:
             cfg[key] = _validated_number(
                 key, section[key], NOTIFY_DEFAULTS[key], rule)
     return _notify_normalized(cfg)
+
+
+def _web_login(value) -> str | None:
+    """Validate one entry of the allow list.
+
+    Compared against a header, so it is normalised the way the comparison will
+    be: trimmed and lower-cased.  Anything that cannot be a login -- empty,
+    absurdly long, carrying control characters or a header separator -- is
+    dropped rather than silently admitted, because an entry that can never
+    match is indistinguishable from one that always does until someone tests
+    it.
+    """
+    if not isinstance(value, str):
+        return None
+    login = value.strip().lower()
+    if not login or len(login) > 320:
+        return None
+    if _CONTROL_CHARS.search(login) or any(c in login for c in ' ,;'):
+        return None
+    return login
+
+
+def load_web() -> dict:
+    """Return WEB_DEFAULTS merged with the ``[web]`` table. Never raises."""
+    cfg = dict(WEB_DEFAULTS)
+    cfg['allow_users'] = []
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            return cfg
+    if not os.path.exists(CONFIG_PATH):
+        return cfg
+    try:
+        with open(CONFIG_PATH, 'rb') as f:
+            data = tomllib.load(f)
+    except Exception as e:
+        log.warning(f'failed to parse {CONFIG_PATH}: {e}; using web defaults')
+        return cfg
+    section = data.get('web', {})
+    if not isinstance(section, dict):
+        log.warning('ignoring invalid [web] config (expected a table)')
+        return cfg
+    value = section.get('allow_users')
+    if value is None:
+        return cfg
+    if not isinstance(value, list):
+        log.warning('ignoring invalid web allow_users (expected a list)')
+        return cfg
+    # An entry that does not survive validation is dropped, but a list that
+    # was written and survives as empty must not read as "no list configured":
+    # that would turn a typo into an open door. Refuse the whole list instead.
+    logins = [_web_login(entry) for entry in value]
+    if any(login is None for login in logins):
+        log.warning('ignoring web allow_users: it contains an entry that '
+                    'cannot be a login')
+        return cfg
+    cfg['allow_users'] = sorted(set(logins))
+    return cfg

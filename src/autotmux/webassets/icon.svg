@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"
+     role="img" aria-label="atmux">
+  <title>atmux</title>
+  <!-- A prompt and a status bar: the two things that are on screen in every
+       session this app has ever shown. Full bleed, because a maskable icon
+       must survive being cut to whatever shape the launcher wants, and the
+       mark sits inside the inner 80% circle that survives with it.
+
+       Not flat black. The same top-lit gradient the keypad panel uses, so the
+       tile on the home screen is made of the same material as the thing it
+       opens -- invisible at 32px, and the reason it does not read as a hole. -->
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e1e25"/>
+      <stop offset="0.55" stop-color="#141418"/>
+      <stop offset="1" stop-color="#0e0e12"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#panel)"/>
+
+  <!-- ❯ — the prompt. Round joins, because the one in the terminal is type,
+       not a corner. -->
+  <path d="M 170 168 L 250 232 L 170 296"
+        fill="none" stroke="#46d3a4" stroke-width="34"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- The block cursor, waiting. -->
+  <rect x="286" y="200" width="60" height="64" rx="5" fill="#46d3a4"/>
+  <!-- tmux's status line. The single most recognisable thing about a tmux
+       session, and what tells this apart from every other terminal icon. -->
+  <rect x="140" y="322" width="232" height="38" rx="11" fill="#46d3a4"/>
+</svg>

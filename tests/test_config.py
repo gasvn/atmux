@@ -498,5 +498,87 @@ class LayoutPreferenceTests(unittest.TestCase):
             self.assertEqual(leftovers, [])
 
 
+class LoadWebConfigTests(unittest.TestCase):
+    """`[web] allow_users` -- off by default, and refusing to be half on.
+
+    atmux-web authenticates nobody: it binds loopback and whatever publishes
+    it owns the door, which is coherent for a tailnet of one and worth being
+    able to change before it is a tailnet of several.
+    """
+
+    def setUp(self):
+        self._saved_path = config.CONFIG_PATH
+
+    def tearDown(self):
+        config.CONFIG_PATH = self._saved_path
+
+    def _write(self, td, text):
+        path = os.path.join(td, 'config.toml')
+        with open(path, 'w') as handle:
+            handle.write(text)
+        config.CONFIG_PATH = path
+        return path
+
+    def test_no_file_and_no_section_both_mean_no_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            config.CONFIG_PATH = os.path.join(td, 'missing.toml')
+            self.assertEqual(config.load_web()['allow_users'], [])
+            self._write(td, '[notify]\nenabled = true\n')
+            self.assertEqual(config.load_web()['allow_users'], [])
+
+    def test_logins_are_normalised_the_way_they_will_be_compared(self):
+        """The config is hand-written and the header comes off the wire."""
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, '[web]\n'
+                            'allow_users = ["  Alice@Example.COM ", '
+                            '"bob@example.com", "bob@example.com"]\n')
+            self.assertEqual(config.load_web()['allow_users'],
+                             ['alice@example.com', 'bob@example.com'])
+
+    def test_a_list_that_cannot_all_be_logins_is_refused_whole(self):
+        """Dropping the bad entry and keeping the rest is the dangerous
+        reading: a typo that silently narrows the list is survivable, and a
+        list that validates down to empty reads as "no list configured",
+        which is an open door."""
+        for bad in ('""', '"  "', '"a b@c.d"', '"a,b@c.d"', '"a;b@c.d"',
+                    '123', 'true', '"x@' + 'y' * 400 + '"',
+                    '"a\\u0000b@c.d"'):
+            with self.subTest(entry=bad):
+                with tempfile.TemporaryDirectory() as td:
+                    self._write(td, '[web]\nallow_users = '
+                                    f'["good@example.com", {bad}]\n')
+                    self.assertEqual(config.load_web()['allow_users'], [])
+
+    def test_a_section_that_is_not_a_table_is_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, 'web = "yes"\n')
+            self.assertEqual(config.load_web()['allow_users'], [])
+
+    def test_a_value_that_is_not_a_list_is_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, '[web]\nallow_users = "alice@example.com"\n')
+            self.assertEqual(config.load_web()['allow_users'], [])
+
+    def test_an_unparseable_file_does_not_raise(self):
+        """Same contract as every other loader here: a broken config degrades
+        to the defaults rather than stopping the program."""
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, '[web\nallow_users = [')
+            self.assertEqual(config.load_web()['allow_users'], [])
+
+    def test_an_empty_list_written_on_purpose_is_still_no_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._write(td, '[web]\nallow_users = []\n')
+            self.assertEqual(config.load_web()['allow_users'], [])
+
+    def test_the_defaults_are_not_shared_between_calls(self):
+        """WEB_DEFAULTS holds a list, and handing the same one out twice lets
+        one caller's mutation become everyone's allow list."""
+        first = config.load_web()
+        first['allow_users'].append('mallory@example.com')
+        self.assertEqual(config.load_web()['allow_users'], [])
+        self.assertEqual(config.WEB_DEFAULTS['allow_users'], [])
+
+
 if __name__ == '__main__':
     unittest.main()
