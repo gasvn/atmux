@@ -59,8 +59,11 @@
   var hideTimer = null;
   function say(text, sticky) {
     status.textContent = text;
-    status.style.display = 'block';
+    // Nothing to say is not the same as saying nothing: an empty sticky box
+    // is a grey rectangle sitting over the terminal for ever.
+    status.style.display = text ? 'block' : 'none';
     clearTimeout(hideTimer);
+    if (!text) return;
     if (!sticky) hideTimer = setTimeout(function () {
       status.style.display = 'none';
     }, 1600);
@@ -480,7 +483,6 @@
   // size changes -- in landscape a key is 40px and here it is 44.
   var TERM_KEEP = 96;                  // the strip of terminal never covered
   var SHEET_PEEK_ROWS = 4;
-  var SHEET_STATE = 'atmux.sheet';
   var sheetHeight = 0;                 // remembered across opens; 0 = ask
 
   // The first row of keys, wherever it is: the sections are boxed, so it is
@@ -589,20 +591,36 @@
   // Open to everything that is free, so the default costs the terminal
   // nothing and uses all of what it is allowed. Four rows is the floor for a
   // screen where that is not much.
+  // How tall the whole list actually is. The sheet is the scroller, so this
+  // box keeps its natural height inside it.
+  function sheetContent() {
+    if (!sheetKeys) return 0;
+    // + #sheet's own padding, 8 above and 6 below.
+    return Math.ceil(sheetKeys.getBoundingClientRect().height) + 14;
+  }
+
   function sheetPeek() {
     // One heading plus the rows. There is no toolbar to allow for any more:
     // the keep control rides the first heading instead of taking a row.
     var rows = 25 + SHEET_PEEK_ROWS * sheetRowHeight();
-    return Math.min(sheetRoom(), Math.max(freeSpace(), rows));
+    // Never taller than there is list to put in it. A wide screen fits ten
+    // keys to a row, so the same sixty keys are six rows there and ten on a
+    // phone -- and opening to all the free space made an iPad show 390px of
+    // keys in a 990px drawer covering most of the screen. Measured; the phone
+    // was fine and the tablet was two thirds empty, which is the same rule
+    // failing at a size it was never checked at.
+    //
+    // A content height of almost nothing means nothing has been rendered yet,
+    // not that there is nothing to show.
+    var content = sheetContent();
+    var want = content > 40 ? Math.min(freeSpace(), content) : freeSpace();
+    return Math.min(sheetRoom(), Math.max(rows, want));
   }
 
-  // Never smaller than the space that is free, because being smaller gives
-  // the terminal nothing back -- it just leaves keys unshown over rows that
-  // are empty anyway. This is also what repairs a height dragged small and
-  // remembered: a stored number is a pixel count from whatever the layout was
-  // that day, and clamping it here means it adapts instead of persisting.
+  // The smallest a drag may leave it. Below this the intent is closed rather
+  // than tiny, which `up` on the handle reads it as.
   function sheetFloor() {
-    return Math.min(sheetRoom(), Math.max(110, freeSpace()));
+    return Math.min(sheetRoom(), 110);
   }
 
   // How far the terminal has to slide for its last written line to stay above
@@ -646,7 +664,17 @@
       shiftTerminal(0);
       return;
     }
-    var want = px === undefined ? (sheetHeight || sheetPeek()) : px;
+    // Opening is always the natural size, never a number kept from last
+    // time. A remembered pixel height is a measurement of whatever the layout
+    // was the day it was dragged: it survived a change of orientation, of
+    // font, of how many keys the far end publishes, and of which phone it
+    // was, and the symptom was a drawer opening at two rows over a screen
+    // with room for ten. A height dragged smaller is still honoured -- it
+    // just cannot outlive what the drawer is being asked to hold.
+    var natural = sheetPeek();
+    var want = px === undefined
+      ? (sheetHeight ? Math.min(sheetHeight, natural) : natural)
+      : px;
     sheetHeight = Math.max(sheetFloor(),
                            Math.min(sheetRoom(), Math.round(want)));
     sheet.style.bottom = sheetBase() + 'px';
@@ -658,14 +686,6 @@
     markSheetEnd();
   }
 
-  function rememberSheet() {
-    try { localStorage.setItem(SHEET_STATE, String(sheetHeight)); } catch (e) {}
-  }
-  (function () {
-    var stored = 0;
-    try { stored = parseInt(localStorage.getItem(SHEET_STATE), 10); } catch (e) {}
-    if (stored > 0) sheetHeight = stored;
-  })();
 
   // The fade at the bottom edge says "there is more below". Once there is
   // not, it would be saying something false, so it comes off.
@@ -1295,8 +1315,6 @@
         if (editing) setEditing(false);
         renderKeys();
         sizeSheet();
-      } else {
-        rememberSheet();
       }
     }
 
@@ -1463,6 +1481,43 @@
     e.preventDefault(); setAutoFont();
   });
   markAuto();
+  // ── selecting text ────────────────────────────────────────────────────
+  // A drag over the terminal can mean read the scrollback or it can mean
+  // select this text, and it cannot mean both. Which one is a mode rather
+  // than something inferred from how long a finger rested: guessing costs a
+  // page of scrollback every time it guesses wrong, and there is no way to
+  // tell the reader what it guessed.
+  //
+  // Nothing here is clever. The two rules that stop a selection are xterm's
+  // own `user-select: none` and this page's `touch-action: none`, both of
+  // them load-bearing the rest of the time, and this turns off exactly those
+  // two and stands the terminal's own handlers down while it does.
+  var selecting = false;
+  var selButton = document.getElementById('sel');
+  function setSelecting(on) {
+    selecting = !!on;
+    document.body.classList.toggle('selecting', selecting);
+    if (selButton) selButton.classList.toggle('on', selecting);
+    if (selecting) {
+      // Reading is over: a selection made in copy-mode would be a selection
+      // of a screen that is not live and cannot be typed into afterwards.
+      if (scrolledBack) leaveHistory();
+      say('press and hold to select · sel to stop', true);
+    } else {
+      try {
+        var sel = window.getSelection && window.getSelection();
+        if (sel) sel.removeAllRanges();
+      } catch (e) {}
+      say('');
+      term.focus();
+    }
+  }
+  keepFocus(selButton);
+  if (selButton) selButton.addEventListener('click', function (event) {
+    event.preventDefault();
+    setSelecting(!selecting);
+  });
+
   var kbd = document.getElementById('kbd');
   keepFocus(kbd);
   if (kbd) kbd.addEventListener('click', function (e) {
@@ -1821,6 +1876,9 @@
   var pinchStart = 0, pinchFont = 0;
   var dragFrom = 0, swiped = false;
   host.addEventListener('touchstart', function (event) {
+    // Selecting is the browser's gesture, all of it. Not even holding the
+    // writes: a repaint mid-selection is the browser's business now.
+    if (selecting) return;
     // Before anything else, and for a pinch as much as a swipe: both are
     // gestures iOS will abandon the moment a row element is rebuilt.
     holdWrites(true);
@@ -1837,6 +1895,7 @@
     }
   }, { passive: true });
   host.addEventListener('touchmove', function (event) {
+    if (selecting) return;
     if (event.touches.length === 2 && pinchStart > 0) {
       event.preventDefault();
       setFont(pinchFont * (spread(event.touches) / pinchStart));
@@ -1867,6 +1926,7 @@
   // never ended seeds the next one wrong -- a pinch that reads as a swipe.
   ['touchend', 'touchcancel'].forEach(function (name) {
     host.addEventListener(name, function () {
+      if (selecting) return;
       pinchStart = 0; swiped = false;
       holdWrites(false);
       // The count belonged to the gesture; what remains is where you are.

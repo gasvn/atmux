@@ -217,6 +217,28 @@
     -webkit-tap-highlight-color: transparent;
   }
   body.touch.nopad #grip:active { background: #26262c; }
+
+  /* ── selecting text ───────────────────────────────────────────────────
+     Two things kept a finger from ever selecting anything. xterm's own
+     stylesheet sets user-select: none on the terminal, and #term sets
+     touch-action: none -- which is what stops a drag being handed to the
+     browser, and a long press is a gesture the browser has to be allowed to
+     recognise before it can offer Copy.
+     Both are undone here and nowhere else, because both are load-bearing the
+     rest of the time: without them a drag over the terminal cannot page the
+     scrollback at all. */
+  body.selecting #term { touch-action: auto; }
+  body.selecting .xterm,
+  body.selecting .xterm .xterm-screen,
+  body.selecting .xterm-rows,
+  body.selecting .xterm-rows * {
+    user-select: text !important;
+    -webkit-user-select: text !important;
+    -webkit-touch-callout: default !important;
+  }
+  /* Says which mode the terminal is in without covering anything: the pad is
+     the only thing that changes colour, and it is not what you are reading. */
+  body.selecting #pad { box-shadow: inset 0 2px 0 #46d3a4; }
   /* This screen's own keys, one row, always in flow and always the same
      height. #nav and the row above it stay put for the same reason: the keys
      you reach for without looking must be in the same place every time. */
@@ -374,10 +396,18 @@
     /* The drawer's lower edge, one row above the settings row -- which is
        both where the drawer opens from and the part of the pad a thumb
        reaches without the hand moving. It sits above the sheet in paint
-       order, so opening the drawer never covers the way to close it. */
-    width: 100%; height: 26px; padding: 0;
+       order, so opening the drawer never covers the way to close it.
+
+       44px, like everything else you are meant to hit. It was 26, which is
+       under the minimum in the direction you aim at it -- and its neighbour
+       above is a row of keys, so missing low is free and missing high types
+       something. The padding is uneven for the same reason: the grip sits in
+       the lower half of the target, so the slack is on the side where a miss
+       costs nothing. */
+    width: 100%; height: 44px; padding: 14px 0 4px;
     background: none; border: 0;
     border-top: 1px solid rgba(255, 255, 255, 0.05);
+    box-sizing: border-box;
     position: relative; z-index: 2;
     -webkit-tap-highlight-color: transparent;
     touch-action: none;
@@ -510,7 +540,10 @@
   .key { position: relative; }
   #tabs {
     flex: 0 0 auto;
-    display: flex; gap: 6px; padding: 0 7px 7px; align-items: center;
+    /* Seven controls at 44 plus a word on two of them is 382px of a 390px
+       phone once the gap comes down to 5. Measured, because eight at these
+       sizes does not fit and the one that does not fit goes off the edge. */
+    display: flex; gap: 5px; padding: 0 5px 6px; align-items: center;
   }
   /* Settings, not keys: these change how the pad behaves rather than typing
      anything, so they are cut INTO the panel where the caps sit ON it. Same
@@ -688,6 +721,11 @@
       <button id="fontauto" aria-label="automatic size">A</button>
       <button id="fontplus" aria-label="larger">A+</button>
       <button id="kbd" aria-label="keyboard">⌨</button>
+      <!-- A drag over the terminal can mean read the scrollback, or it can
+           mean select this text. It cannot mean both, so which one is a mode
+           and it is here rather than guessed at from how long a finger
+           rested. -->
+      <button id="sel" aria-label="select text to copy">sel</button>
       <button id="hide" aria-label="hide the keys">hide</button>
     </div>
   </div>

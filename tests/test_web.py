@@ -1901,17 +1901,17 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'firstRow',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad',
                  'padCover', 'sheetBase', 'keepVisibleRow', 'freeSpace',
-                 'neededShift', 'reshiftSoon',
+                 'neededShift', 'reshiftSoon', 'sheetContent',
                  'sheetRowHeight', 'sheetRoom', 'sheetPeek', 'sheetFloor',
                  'shiftTerminal',
-                 'sizeSheet', 'rememberSheet', 'markSheetEnd')
+                 'sizeSheet', 'markSheetEnd')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
                'var held =', 'var SLOP =', 'var scrolledBack =',
                'var mouseOn =', 'var GAIN =', 'var lastX =',
                'var owed =', 'var NAV_PER_ROW =',
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var TERM_KEEP =', 'var navColumns =',
-               'var SHEET_PEEK_ROWS =', 'var SHEET_STATE =',
+               'var SHEET_PEEK_ROWS =',
                'var CURSOR_MARGIN =', 'var shiftedBy =',
                'var reshiftTimer =',
                'var glideTimer =', 'var GLIDE_WINDOW =', 'var GLIDE_MIN =',
@@ -2464,29 +2464,6 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertEqual(shift, '', 'the terminal moved for space it was '
                                     'not using')
 
-    def test_it_never_opens_smaller_than_the_space_that_is_free(self):
-        """Which is also what repairs a height dragged small and remembered.
-        A stored number is a pixel count from whatever the layout was that
-        day; without a floor it survives every change of geometry, and the
-        drawer opens at two rows over a screen with room for ten."""
-        self.assertEqual(self.run_js(
-            self.SETUP
-            + 'term.buffer.active.cursorY = 44;'
-            + "store[SHEET_STATE] = '110';"      # dragged small, once
-            + 'sheetHeight = parseInt(store[SHEET_STATE], 10);'
-            + 'expanded = true; sizeSheet();'
-            + 'console.log(JSON.stringify([sheetHeight, sheetFloor()]));'),
-            [255, 255])
-
-    def test_the_drawer_can_be_dragged_taller_and_remembers_it(self):
-        """The free space is a starting point, not a decision."""
-        self.assertEqual(self.sizing(
-            'sizeSheet(); var opened = sheetHeight;'
-            'sizeSheet(400); rememberSheet();'
-            'var stored = parseInt(store[SHEET_STATE], 10);'
-            'console.log(JSON.stringify([opened, sheetHeight, stored]));'),
-            [255, 400, 400])
-
     def test_what_will_not_fit_there_comes_out_of_the_terminal(self):
         """Past what was free, the rest is borrowed from the top -- by sliding
         the terminal, never by resizing it, because resizing is what makes
@@ -2530,6 +2507,95 @@ class KeypadVocabularyTests(unittest.TestCase):
                     f'term.buffer.active.cursorY = {cursor};'
                     'console.log(JSON.stringify(keepVisibleRow()));'),
                     expected)
+
+    def test_opening_it_never_uses_a_height_kept_from_last_time(self):
+        """A remembered pixel height is a measurement of whatever the layout
+        was the day it was dragged. It survived a change of orientation, of
+        font, of how many keys the far end publishes, and of which device it
+        was -- and the symptom was a drawer opening at two rows over a screen
+        with room for ten.
+
+        There is nothing left to go stale: opening computes the size from what
+        is on screen now. A height dragged smaller is still honoured, it just
+        cannot outlive what the drawer is being asked to hold.
+        """
+        self.assertNotIn('atmux.sheet', self.js)
+        self.assertNotIn('rememberSheet', self.js)
+        opened, dragged, reopened = self.sizing(
+            'sizeSheet(); var opened = sheetHeight;'
+            'sizeSheet(150); var dragged = sheetHeight;'
+            'sizeSheet(); '
+            'console.log(JSON.stringify([opened, dragged, sheetHeight]));')
+        self.assertEqual(opened, 255)
+        self.assertEqual(dragged, 150)
+        self.assertEqual(reopened, 150, 'a smaller drag was not honoured')
+
+    def test_it_never_opens_taller_than_there_is_list_to_show(self):
+        """The tablet. A wide screen fits ten keys to a row, so the same sixty
+        keys are six rows there and ten on a phone -- and opening to all the
+        free space made an iPad show 431px of keys in a 990px drawer covering
+        84% of the screen, two thirds of it empty.
+
+        Measured after, at 820x1180: 431px, 37% of the screen, all forty-two
+        keys on show, and the terminal still does not move. The phone is
+        unchanged.
+        """
+        self.assertEqual(self.run_js(
+            self.SETUP
+            + 'term.buffer.active.cursorY = 4;'      # lots of free space
+            + 'sheetKeys._height = 300;'             # a short list, as on a tablet
+            + 'expanded = true; sheetHeight = 0; sizeSheet();'
+            + 'console.log(JSON.stringify('
+            + '  [sheetContent(), Math.round(freeSpace()), sheetHeight]));'),
+            [314, 702, 314])
+
+    def test_selecting_text_is_a_mode_and_undoes_exactly_what_blocks_it(self):
+        """Two rules stop a finger selecting anything, and both are
+        load-bearing the rest of the time: xterm's own stylesheet sets
+        user-select: none on the terminal, and #term sets touch-action: none,
+        which is what stops a drag being handed to the browser -- and a long
+        press is a gesture the browser has to be allowed to recognise before
+        it can offer Copy.
+
+        A drag can mean read the scrollback or it can mean select this text.
+        It cannot mean both, so which one is a mode rather than something
+        inferred from how long a finger rested: guessing costs a page of
+        scrollback every time it guesses wrong, and there is no way to tell
+        the reader what it guessed.
+        """
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        self.assertIn('body.selecting #term { touch-action: auto; }', css)
+        block = re.search(r'body\.selecting \.xterm,(.*?)\}', css, re.S)
+        self.assertIsNotNone(block, 'nothing re-enables user-select')
+        self.assertIn('user-select: text !important', block.group(0))
+        self.assertIn('-webkit-touch-callout: default', block.group(0))
+        # And the terminal's own gesture handlers stand down while it is on,
+        # or the first drag pages the scrollback out from under the selection.
+        self.assertEqual(self.js.count('if (selecting) return;'), 3)
+
+    def test_leaving_selection_mode_puts_the_terminal_back(self):
+        """A selection left behind is a selection the next tap extends."""
+        toggle = _extract(self.js, 'setSelecting')
+        self.assertIn('removeAllRanges', toggle)
+        self.assertIn('term.focus()', toggle)
+        # Reading and selecting are both "not live"; being in one while
+        # entering the other leaves a selection of a screen that cannot be
+        # typed into.
+        self.assertIn('leaveHistory()', toggle)
+
+    def test_the_handle_is_big_enough_to_hit(self):
+        """It was 26px tall -- under the minimum in the direction you aim at
+        it -- and its neighbour above is a row of keys, so missing low costs
+        nothing and missing high types something. The padding is uneven for
+        that reason: the grip sits low in its target."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        rule = [r for r in re.findall(r'body\.touch #grab \{[^}]*\}', css)
+                if 'height' in r]
+        self.assertEqual(len(rule), 1)
+        self.assertIn('height: 44px', rule[0])
+        padding = re.search(r'padding: (\d+)px 0 (\d+)px', rule[0])
+        self.assertIsNotNone(padding, 'the grip is not biased low')
+        self.assertGreater(int(padding.group(1)), int(padding.group(2)))
 
     def test_a_closed_drawer_has_no_height_at_all(self):
         """Not a zero-height open one: it is out of the layout entirely, which
@@ -3368,10 +3434,11 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertRegex(css, r'body\.touch\.nopad #grip \{[^}]*display: block')
 
     def test_the_controls_all_fit_across_a_phone(self):
-        """Seven buttons and a spacer in 390px. Measured in a browser at
-        7..370px, but the regression this catches is someone adding an eighth
-        without measuring -- at 44px each plus gaps and padding, eight comes
-        to 408px and the last one goes off the edge.
+        """Seven buttons and a spacer in 390px. Measured in a browser --
+        390px of 390 exactly, with the gap down to 5 to make room for the
+        seventh -- and the regression this catches is someone adding an eighth
+        without measuring, because the one that does not fit goes off the edge
+        rather than wrapping.
 
         `back` is here and `edit` is not, and that is the trade: the way out
         of a session had to be visible somewhere, and choosing which keys to
@@ -3381,12 +3448,13 @@ class KeypadVocabularyTests(unittest.TestCase):
         controls = re.findall(r'<button id="(\w+)"', self.html)
         self.assertEqual(controls,
                          ['hist', 'edit', 'grab', 'back', 'fontminus',
-                          'fontauto', 'fontplus', 'kbd', 'hide', 'grip'])
+                          'fontauto', 'fontplus', 'kbd', 'sel', 'hide',
+                          'grip'])
         row = self.html[self.html.index('<div id="tabs">'):]
         row = row[:row.index('</div>')]
         self.assertEqual(re.findall(r'<button id="(\w+)"', row),
                          ['back', 'fontminus', 'fontauto', 'fontplus',
-                          'kbd', 'hide'])
+                          'kbd', 'sel', 'hide'])
         # Six, and each of the two that carry a verb gets a word. There was
         # never room for that at eight, which is why `‹` and `▾` were bare
         # glyphs -- and `▾` sat four buttons from `⌄`, which meant something
