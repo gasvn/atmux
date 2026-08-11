@@ -463,7 +463,6 @@
   var keys = document.getElementById('keys');
   var sheet = document.getElementById('sheet');
   var sheetKeys = document.getElementById('sheetkeys');
-  var sheetTop = document.getElementById('sheettop');
   var nav = document.getElementById('nav');
   var pinRow = document.getElementById('pins');
   var expander = document.getElementById('grab');
@@ -521,6 +520,54 @@
     return total;
   }
 
+  // ── the blank end of the terminal ─────────────────────────────────────
+  // The other space the drawer can have for nothing. tmux sizes a window to
+  // the smallest client attached to it, so a session that is also open on a
+  // laptop draws its status line well above this terminal's last row and
+  // leaves everything below it empty. A phone can be showing forty rows of
+  // which twelve are blank, and the drawer was opening to two rows above
+  // them rather than using them.
+  //
+  // Counted from the buffer rather than guessed at, and re-read as output
+  // arrives, because it shrinks: a bare shell starts with one prompt and
+  // forty-five empty rows, and fills them.
+  // The one row that has to stay out from under the drawer is the one being
+  // written on. Not "the last row with anything in it": with a session also
+  // open on a laptop, tmux sizes the window to the smaller client, fills the
+  // rest of this one with its own dotted filler and pins its status line to
+  // the very last row -- so "last row with anything in it" is the status
+  // line, and holding *that* above the drawer keeps a screenful of filler on
+  // display and pushes the shell off the top.
+  //
+  // The cursor is where you are. Everything below it is either blank, filler
+  // or a status line, and all three are worth less than four more rows of
+  // keys.
+  var CURSOR_MARGIN = 1;                 // rows of air under it
+  function keepVisibleRow() {
+    try {
+      var y = term.buffer.active.cursorY;
+      if (typeof y === 'number' && y >= 0 && y < term.rows) {
+        return Math.min(term.rows - 1, y + CURSOR_MARGIN);
+      }
+    } catch (e) { /* fall through */ }
+    try {
+      var buffer = term.buffer.active;
+      for (var i = term.rows - 1; i >= 0; i--) {
+        var line = buffer.getLine(buffer.viewportY + i);
+        if (line && line.translateToString(true).trim()) return i;
+      }
+    } catch (e) { return term.rows - 1; }
+    return -1;
+  }
+
+  // Everything the drawer may cover without the terminal losing a line it is
+  // showing: the pad's own key rows, plus whatever is blank at the bottom.
+  function freeSpace() {
+    var row = keepVisibleRow();
+    var below = row < 0 ? 0 : (term.rows - 1 - row) * lineHeight();
+    return padCover() + Math.max(0, Math.round(below));
+  }
+
   // Where the drawer's lower edge sits: the top of the handle, which is one
   // row above the settings row. Expressed as an offset from the pad's bottom,
   // because that is what `bottom` on an absolutely positioned box means here.
@@ -539,19 +586,36 @@
                     + host.getBoundingClientRect().height - TERM_KEEP);
   }
 
-  // Open to exactly the space the pad was already spending on keys, so the
-  // default costs the terminal nothing at all. Four rows is the floor for a
-  // screen too small for that to be much.
+  // Open to everything that is free, so the default costs the terminal
+  // nothing and uses all of what it is allowed. Four rows is the floor for a
+  // screen where that is not much.
   function sheetPeek() {
-    var top = sheetTop ? sheetTop.getBoundingClientRect().height : 0;
-    var rows = (top || 56) + SHEET_PEEK_ROWS * sheetRowHeight();
-    return Math.min(sheetRoom(), Math.max(padCover(), rows));
+    // One heading plus the rows. There is no toolbar to allow for any more:
+    // the keep control rides the first heading instead of taking a row.
+    var rows = 25 + SHEET_PEEK_ROWS * sheetRowHeight();
+    return Math.min(sheetRoom(), Math.max(freeSpace(), rows));
   }
 
-  // The smallest the drawer is worth being: the toolbar and one row. Below
-  // this a drag is on its way to closed rather than aiming at a height.
+  // Never smaller than the space that is free, because being smaller gives
+  // the terminal nothing back -- it just leaves keys unshown over rows that
+  // are empty anyway. This is also what repairs a height dragged small and
+  // remembered: a stored number is a pixel count from whatever the layout was
+  // that day, and clamping it here means it adapts instead of persisting.
   function sheetFloor() {
-    return Math.min(sheetRoom(), 110);
+    return Math.min(sheetRoom(), Math.max(110, freeSpace()));
+  }
+
+  // How far the terminal has to slide for its last written line to stay above
+  // the drawer. Asked rather than assumed, and re-asked as output arrives:
+  // the blank rows the drawer is sitting over are not permanently blank.
+  var shiftedBy = 0;
+  function neededShift() {
+    if (!expanded || !sheet) return 0;
+    var row = keepVisibleRow();
+    if (row < 0) return 0;
+    var box = host.getBoundingClientRect();
+    var bottom = box.top + shiftedBy + (row + 1) * lineHeight();
+    return Math.max(0, Math.round(bottom - sheet.getBoundingClientRect().top));
   }
 
   // ── what the drawer covers ────────────────────────────────────────────
@@ -571,7 +635,8 @@
   // and follows the handle continuously while it is dragged.
   function shiftTerminal(px) {
     if (!host) return;
-    host.style.transform = px > 0 ? 'translateY(' + -Math.round(px) + 'px)' : '';
+    shiftedBy = Math.max(0, Math.round(px));
+    host.style.transform = shiftedBy ? 'translateY(' + -shiftedBy + 'px)' : '';
   }
 
   function sizeSheet(px) {
@@ -586,10 +651,10 @@
                            Math.min(sheetRoom(), Math.round(want)));
     sheet.style.bottom = sheetBase() + 'px';
     sheet.style.height = sheetHeight + 'px';
-    // Only what the drawer needs beyond the pad's own key rows is taken from
-    // the terminal, and it is taken by sliding the terminal rather than by
-    // shortening it -- so the prompt stays visible and the pty is untouched.
-    shiftTerminal(Math.max(0, sheetHeight - padCover()));
+    // Whatever the drawer needs beyond the rows the terminal was not using is
+    // taken by sliding the terminal rather than by shortening it -- so the
+    // last written line stays visible and the pty is never resized.
+    shiftTerminal(neededShift());
     markSheetEnd();
   }
 
@@ -825,6 +890,8 @@
       sheet.classList.toggle('open', expanded);
       sheet.classList.toggle('editing', editing);
       sheetKeys.textContent = '';
+      var placed = false;
+      if (editButton) editButton.hidden = true;
       if (expanded) {
         groups().forEach(function (group) {
           if (!group.keys.length) return;
@@ -839,6 +906,15 @@
           var section = document.createElement('div');
           section.className = 'gsec';
           if (group.name) band(section, group.name);
+          // The keep control rides the first heading. On a row of its own it
+          // was 38px of every open -- most of a key row -- for something used
+          // once when the pad is set up, and the heading was already there
+          // with a hairline running to the right edge doing nothing.
+          if (editButton && !placed && section.children.length) {
+            section.children[0].appendChild(editButton);
+            editButton.hidden = false;
+            placed = true;
+          }
           renderRows(section, group.keys, columns, 0);
           sheetKeys.appendChild(section);
         });
@@ -1664,9 +1740,23 @@
   // what that finger asked for -- unrelated output, a status-bar clock, a
   // reconnect are all held and played out in order on release.
   var held = [], holding = false, holdTimer = 0, flushTimer = 0;
+  // Output that arrives while the drawer is open can fill the rows it was
+  // sitting over, and the line you are watching would go under it. Rechecked
+  // on a cadence rather than per write: a build log writes hundreds of times
+  // a second and the answer only changes when the last line does.
+  var reshiftTimer = 0;
+  function reshiftSoon() {
+    if (!expanded || reshiftTimer) return;
+    reshiftTimer = setTimeout(function () {
+      reshiftTimer = 0;
+      if (expanded) shiftTerminal(neededShift());
+    }, 120);
+  }
+
   function feed(data) {
     if (holding) held.push(data);
     else term.write(data);
+    reshiftSoon();
   }
   // Everything queued goes to the screen, in order. The hold itself stays on:
   // this is used mid-gesture to let one scroll through.

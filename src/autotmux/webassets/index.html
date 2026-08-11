@@ -334,31 +334,25 @@
      settings row for the same reason: it changes how the pad behaves rather
      than typing anything, and nothing in this sheet may be mistaken for a key
      that types. */
-  /* Not pinned. It measured 57px of a 253px drawer -- 23% of the space, held
-     forever, for a control used once when you set the pad up. It scrolls away
-     with everything else now, and scrolling back to the top is how you reach
-     it, which is the same cost as reopening the drawer. */
-  #sheettop {
-    padding: 0 0 6px; margin: 0;
-    display: flex; gap: 6px;
-  }
-  #sheettop button {
-    min-height: 32px; padding: 0 12px;
-    color: #9096a0;
+  /* Sits at the right end of the first section heading, which was already
+     there with a hairline running to the edge. On a row of its own it cost
+     38px of every open -- most of a key row -- for a control used once. */
+  .ghead #edit {
+    flex: 0 0 auto;
+    min-height: 24px; padding: 0 9px;
+    color: var(--label);
     background: linear-gradient(180deg, #131317 0%, #17171c 100%);
-    border: 1px solid #000; border-radius: 8px;
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, .5),
-                0 1px 0 rgba(255, 255, 255, .045);
-    font: 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
-    letter-spacing: .04em;
+    border: 1px solid #000; border-radius: 7px;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, .5);
+    font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .08em; text-transform: uppercase;
     -webkit-tap-highlight-color: transparent;
     transition: color 90ms ease-out, box-shadow 90ms ease-out;
   }
-  #sheettop button.on {
+  .ghead #edit.on {
     color: #7ff0cb;
     box-shadow: inset 0 1px 2px rgba(0, 0, 0, .5),
-                inset 0 0 0 1px rgba(70, 211, 164, .55),
-                0 0 8px rgba(70, 211, 164, .12);
+                inset 0 0 0 1px rgba(70, 211, 164, .55);
   }
 
   /* ── the handle ───────────────────────────────────────────────────────
@@ -655,14 +649,13 @@
     <!-- Everything, in labelled sections down one column. A sheet over the
          terminal rather than a row of the layout: see #sheet.open. -->
     <div id="sheet">
-      <!-- Pinned to the top of the sheet, because keeping a key is something
-           you do to the keys in front of you. The whole feature used to be an
-           unlabelled ☆ in the settings row acting on the four keys the closed
-           drawer happened to show. -->
-      <div id="sheettop">
-        <button id="edit" aria-label="choose which keys to keep">
-          ☆ keep keys</button>
-      </div>
+      <!-- Rides the first section heading rather than a row of its own.
+           A row of its own was 38px of every open -- most of a key row --
+           for a control used once when the pad is set up, and the heading it
+           now sits in was already there with a hairline running to the right
+           edge doing nothing. -->
+      <button id="edit" aria-label="choose which keys to keep"
+              hidden>☆ keep</button>
       <div id="sheetkeys"></div>
     </div>
     <!-- The seam of the drawer, and the one control that opens it.

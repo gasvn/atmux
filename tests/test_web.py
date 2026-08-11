@@ -1818,6 +1818,18 @@ var localStorage = {
   setItem: function (k, v) { store[k] = String(v); },
   removeItem: function (k) { delete store[k]; }
 };
+// Enough of xterm to answer the one question the drawer asks it: which row
+// is being written on. Everything below that row is blank, or tmux's filler,
+// or a status line, and the drawer may cover all three.
+var term = {
+  rows: 46,
+  buffer: { active: { cursorY: 44, viewportY: 0,
+                      getLine: function (y) {
+                        return { translateToString: function () {
+                          return y <= 44 ? 'x' : ''; } };
+                      } } }
+};
+
 // A browser global like the two above it. The page reads it once, to decide
 // whether ?debug=1 asked for the readout; without it the module throws on
 // load and every test in here fails for a reason that has nothing to do
@@ -1888,7 +1900,8 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'renderRows', 'recolumn', 'renderNav', 'band', 'renderPins',
                  'firstRow',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad',
-                 'padCover', 'sheetBase',
+                 'padCover', 'sheetBase', 'keepVisibleRow', 'freeSpace',
+                 'neededShift', 'reshiftSoon',
                  'sheetRowHeight', 'sheetRoom', 'sheetPeek', 'sheetFloor',
                  'shiftTerminal',
                  'sizeSheet', 'rememberSheet', 'markSheetEnd')
@@ -1899,6 +1912,8 @@ class KeypadVocabularyTests(unittest.TestCase):
                'var OFF =', 'var ROWS_COLLAPSED =',
                'var TERM_KEEP =', 'var navColumns =',
                'var SHEET_PEEK_ROWS =', 'var SHEET_STATE =',
+               'var CURSOR_MARGIN =', 'var shiftedBy =',
+               'var reshiftTimer =',
                'var glideTimer =', 'var GLIDE_WINDOW =', 'var GLIDE_MIN =',
                'var GLIDE_DECAY =', 'var SHEET_SLOP =', 'var sheetDragged =',
                'var sheetHeight =', 'var GRAB_SLOP =',
@@ -2382,121 +2397,6 @@ class KeypadVocabularyTests(unittest.TestCase):
               [fits - settled, narrow - pad.getBoundingClientRect().height]));
             '''), [1, 44])
 
-    def test_the_drawer_opens_at_four_rows_rather_than_at_every_pixel(self):
-        """The one the phone actually complained about. It opened to the whole
-        allowance, which on a 390x844 screen left 96px of terminal -- about
-        seven rows. Scrolling was already there and did nothing, because
-        nothing ever needed to scroll: the sheet simply took the screen.
-
-        Measured after, at 390x844: 253px open, 261px of terminal still
-        visible, twenty-three rows.
-        """
-        self.assertEqual(self.run_js('''
-            expanded = true; sheetHeight = 0;
-            host._height = 600;
-            sizeSheet();
-            console.log(JSON.stringify(
-              [sheet.style.height, sheetPeek(), sheetRoom()]));'''),
-            ['252px', 252, 504])
-
-    def test_the_cap_is_the_room_there_actually_is(self):
-        """Not a percentage: #app is sized to visualViewport, so the room
-        changes with the software keyboard and with rotation. And what is left
-        over is a usable strip on purpose -- a sheet that covers the screen you
-        are operating on is a modal, and this is a drawer."""
-        self.assertEqual(self.run_js('''
-            expanded = true;
-            host._height = 600; sizeSheet(99999);
-            var tall = sheet.style.height;
-            host._height = 200; sizeSheet(99999);
-            var short = sheet.style.height;
-            console.log(JSON.stringify([tall, short, TERM_KEEP]));'''),
-            ['504px', '120px', 96])
-
-    def test_the_drawer_never_covers_the_line_you_are_working_on(self):
-        """It grows upward out of the pad, so what it covers is the bottom of
-        the terminal -- the prompt, the newest output, tmux's own status line.
-        That is the worst possible choice of rows to hide: you open the keys
-        in order to press one, and cannot see what pressing it did.
-
-        Making the terminal shorter instead resizes the pty and makes tmux
-        reflow and repaint everything, which is the jolt this drawer was made
-        a sheet to avoid. So neither: it keeps every row and slides up by
-        exactly what the drawer covers. The rows that leave go off the top,
-        oldest first.
-
-        Measured at 390x844 with the drawer open: the terminal is shifted
-        -234px, tmux's status line ends at y=276, and the drawer starts at
-        y=280 -- four pixels clear.
-        """
-        self.assertEqual(self.run_js('''
-            expanded = true; host._height = 600; sheetHeight = 0;
-            sizeSheet();
-            var open = [sheetHeight, host.style.transform];
-            expanded = false; sizeSheet();
-            console.log(JSON.stringify([open, host.style.transform]));'''),
-            [[252, 'translateY(-252px)'], ''])
-
-    def test_the_drawer_opens_over_the_keys_it_is_replacing(self):
-        """The pad's own key rows -- movement, kept, this screen's -- are
-        255px of a 390x844 phone, and every key in them is also in the list.
-        So while the drawer was open they showed the reader something the
-        drawer was showing them again, and the drawer took 252px off the
-        terminal to do it.
-
-        It opens over them now, and the default costs the terminal nothing at
-        all. Measured with real touch events: tapping the handle opens a 255px
-        drawer with the terminal's transform still 'none', its row count
-        unchanged at 46, and tmux's status line ending three pixels above it.
-        """
-        self.assertEqual(self.run_js('''
-            nav._height = 105; pinRow._height = 77; keys._height = 73;
-            host._height = 514;
-            expanded = true; sheetHeight = 0;
-            sizeSheet();
-            console.log(JSON.stringify(
-              [padCover(), sheetHeight, host.style.transform]));'''),
-            [255, 255, ''])
-
-    def test_only_what_will_not_fit_there_comes_out_of_the_terminal(self):
-        """Drag it past the rows it is covering and the rest is borrowed, a
-        pixel at a time, from the top of the terminal."""
-        self.assertEqual(self.run_js('''
-            nav._height = 105; pinRow._height = 77; keys._height = 73;
-            host._height = 514;
-            expanded = true;
-            sizeSheet(255); var atCover = host.style.transform;
-            sizeSheet(455); var past = host.style.transform;
-            console.log(JSON.stringify([atCover, past, sheetRoom()]));'''),
-            ['', 'translateY(-200px)', 673])
-
-    def test_dragging_the_drawer_taller_moves_the_terminal_with_it(self):
-        """Continuously, because the transform composites: the content
-        follows the handle rather than jumping when it is let go."""
-        self.assertEqual(self.run_js('''
-            expanded = true; host._height = 600;
-            sizeSheet(150); var a = host.style.transform;
-            sizeSheet(300); var b = host.style.transform;
-            sizeSheet(99999); var c = host.style.transform;
-            console.log(JSON.stringify([a, b, c, sheetRoom()]));'''),
-            ['translateY(-150px)', 'translateY(-300px)',
-             'translateY(-504px)', 504])
-
-    def test_the_drawer_can_be_dragged_to_a_height_and_remembers_it(self):
-        """Four rows is a starting point, not a decision. Somebody reading a
-        log wants it small; somebody hunting for a key wants it large, and
-        picking one number for both is what a handle avoids having to do."""
-        self.assertEqual(self.run_js('''
-            expanded = true; host._height = 600;
-            sizeSheet(); var opened = sheetHeight;
-            sizeSheet(380); rememberSheet();
-            var dragged = sheetHeight;
-            sheetHeight = 0;                    // as if the page reloaded
-            var stored = parseInt(store[SHEET_STATE], 10);
-            sheetHeight = stored; sizeSheet();
-            console.log(JSON.stringify([opened, dragged, sheetHeight]));'''),
-            [252, 380, 380])
-
     def test_a_drag_cannot_shrink_it_past_being_useful_or_grow_it_past_the_room(
             self):
         self.assertEqual(self.run_js('''
@@ -2506,6 +2406,130 @@ class KeypadVocabularyTests(unittest.TestCase):
             console.log(JSON.stringify(
               [floor, ceiling, sheetFloor(), sheetRoom()]));'''),
             [110, 504, 110, 504])
+
+    # ── how much room the drawer takes ────────────────────────────────────
+
+    SETUP = ("nav._height = 105; pinRow._height = 77; keys._height = 73;"
+             "host._height = 514; term.rows = 46;")
+
+    def sizing(self, script, cursor=44):
+        return self.run_js(
+            self.SETUP
+            + f'term.buffer.active.cursorY = {cursor};'
+            + 'expanded = true; sheetHeight = 0;'
+            + script)
+
+    def test_the_drawer_opens_over_the_keys_it_is_replacing(self):
+        """The pad's own key rows -- movement, kept, this screen's -- are
+        255px of a 390x844 phone, and every key in them is also in the list.
+        So while the drawer was open they showed the reader something the
+        drawer was showing them again, and the drawer took 252px off the
+        terminal to do it. It opens over them now, and the default costs the
+        terminal nothing.
+
+        Verified with real touch events: tapping the handle opens a 255px
+        drawer with the terminal's transform still 'none', 46 rows before and
+        after, and tmux's status line three pixels above it.
+        """
+        self.assertEqual(self.sizing(
+            'sizeSheet();'
+            'console.log(JSON.stringify('
+            '  [padCover(), sheetHeight, host.style.transform]));'),
+            [255, 255, ''])
+
+    def test_the_dead_end_of_the_terminal_belongs_to_the_drawer_too(self):
+        """The one the phone actually showed. With a session also open on a
+        laptop, tmux sizes the window to the smaller client, fills the rest of
+        this one with its own dotted filler and pins its status line to the
+        very last row. Measured on a phone: a screenful of filler, and a
+        drawer opening to three rows above it.
+
+        Deciding what to keep visible by "the last row with anything in it" is
+        what caused that -- that row is the status line, and holding it out
+        from under the drawer keeps the whole band of filler on display. The
+        cursor is where you are; everything under it is blank, filler or a
+        status line, and all three are worth less than more keys.
+
+        Measured after, with tmux pinned to 18 rows in a 46-row terminal: the
+        drawer opens to 671px showing all fifty keys, and the terminal still
+        does not move.
+        """
+        free, height, shift = self.sizing(
+            'sizeSheet();'
+            'console.log(JSON.stringify('
+            '  [Math.round(freeSpace()), sheetHeight, host.style.transform]));',
+            cursor=8)
+        self.assertGreater(free, 600, 'the dead rows were not counted')
+        self.assertEqual(height, free)
+        self.assertEqual(shift, '', 'the terminal moved for space it was '
+                                    'not using')
+
+    def test_it_never_opens_smaller_than_the_space_that_is_free(self):
+        """Which is also what repairs a height dragged small and remembered.
+        A stored number is a pixel count from whatever the layout was that
+        day; without a floor it survives every change of geometry, and the
+        drawer opens at two rows over a screen with room for ten."""
+        self.assertEqual(self.run_js(
+            self.SETUP
+            + 'term.buffer.active.cursorY = 44;'
+            + "store[SHEET_STATE] = '110';"      # dragged small, once
+            + 'sheetHeight = parseInt(store[SHEET_STATE], 10);'
+            + 'expanded = true; sizeSheet();'
+            + 'console.log(JSON.stringify([sheetHeight, sheetFloor()]));'),
+            [255, 255])
+
+    def test_the_drawer_can_be_dragged_taller_and_remembers_it(self):
+        """The free space is a starting point, not a decision."""
+        self.assertEqual(self.sizing(
+            'sizeSheet(); var opened = sheetHeight;'
+            'sizeSheet(400); rememberSheet();'
+            'var stored = parseInt(store[SHEET_STATE], 10);'
+            'console.log(JSON.stringify([opened, sheetHeight, stored]));'),
+            [255, 400, 400])
+
+    def test_what_will_not_fit_there_comes_out_of_the_terminal(self):
+        """Past what was free, the rest is borrowed from the top -- by sliding
+        the terminal, never by resizing it, because resizing is what makes
+        tmux reflow and repaint everything.
+
+        The arithmetic needs a real layout, so the numbers come from a browser
+        rather than from here: at 390x844 the drawer at 255px leaves the
+        transform empty and at 455px sets it to -200, which is exactly the
+        part that would not fit over the pad. What this pins is the wiring --
+        that the shift is asked for rather than assumed, and asked in terms of
+        the row being written on.
+        """
+        self.assertIn('shiftTerminal(neededShift())',
+                      _extract(self.js, 'sizeSheet'))
+        self.assertIn('keepVisibleRow()', _extract(self.js, 'neededShift'))
+        self.assertIn('keepVisibleRow()', _extract(self.js, 'freeSpace'))
+        # And nothing may reach for the pty to make room.
+        self.assertNotIn('refit', _extract(self.js, 'sizeSheet'))
+
+    def test_output_arriving_is_rechecked_rather_than_ignored(self):
+        """The rows the drawer sits over are not permanently blank: a bare
+        shell starts with one prompt and forty-five empty rows and fills them,
+        and the line being written would go under the drawer.
+
+        On a cadence rather than per write, because a build log writes
+        hundreds of times a second and the answer only changes when the cursor
+        moves."""
+        self.assertIn('reshiftSoon()', _extract(self.js, 'feed'))
+        recheck = _extract(self.js, 'reshiftSoon')
+        self.assertIn('if (!expanded || reshiftTimer) return;', recheck)
+        self.assertIn('neededShift()', recheck)
+
+    def test_the_row_it_keeps_out_is_the_one_being_written_on(self):
+        """Not the last row with anything in it. That row is tmux's status
+        line, and holding it above the drawer keeps a whole band of filler on
+        display -- which is what a phone showed."""
+        for cursor, expected in ((44, 45), (8, 9), (45, 45)):
+            with self.subTest(cursorY=cursor):
+                self.assertEqual(self.run_js(
+                    'term.rows = 46;'
+                    f'term.buffer.active.cursorY = {cursor};'
+                    'console.log(JSON.stringify(keepVisibleRow()));'),
+                    expected)
 
     def test_a_closed_drawer_has_no_height_at_all(self):
         """Not a zero-height open one: it is out of the layout entirely, which
