@@ -1469,7 +1469,8 @@ def _notify_idle_sessions(node: str, info: dict) -> None:
             return
         text = notify.build_idle_message(
             {**entry, 'tail': _idle_tail(entry)},
-            link=bool(_notify_cfg.get('attach_link')))
+            link=bool(_notify_cfg.get('attach_link')),
+            web=str(_notify_cfg.get('web_url') or ''))
         ok, error = notify.post(
             _notify_cfg['webhook_url'], text, float(_notify_cfg['timeout']))
         if ok:

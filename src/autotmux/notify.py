@@ -372,6 +372,28 @@ def attach_url(node: str, session: str) -> str:
             + '/' + urllib.parse.quote(session, safe=''))
 
 
+def web_attach_url(base: str, node: str, session: str) -> str:
+    """The same session in the browser client, or "" if it cannot be built.
+
+    Nothing on a phone resolves ``atmux://``, so a notice read where notices
+    are actually read -- away from the machine that has the handler installed
+    -- has a dead link on it. This is the one it can follow.
+
+    `base` comes from the user's own config; node and session come off the
+    cluster, so they go through the same refusal as attach_url and are then
+    percent-encoded. The result is a query value, never a path segment: a
+    session named `../..` must not be able to climb out of /console/.
+    """
+    base = str(base).strip()
+    if not base.startswith(('http://', 'https://')):
+        return ''
+    node, session = str(node), str(session)
+    if not _NODE_RE.fullmatch(node) or not _URL_SESSION_RE.fullmatch(session):
+        return ''
+    target = urllib.parse.quote(f'{node}:{session}', safe='')
+    return base.rstrip('/') + '/console/?attach=' + target
+
+
 def parse_attach_url(url: str) -> tuple[str, str] | None:
     """Validate an ``atmux://attach/<node>/<session>`` link.
 
@@ -481,7 +503,8 @@ def last_output_line(content, limit: int = TAIL_LIMIT) -> str:
     return ''
 
 
-def build_idle_message(entry: dict, *, link: bool = False) -> str:
+def build_idle_message(entry: dict, *, link: bool = False,
+                       web: str = '') -> str:
     """Say what stopped and for how long, and why that is worth a look.
 
     ``link`` appends a Slack-formatted ``atmux://`` link. It is opt-in because
@@ -502,6 +525,16 @@ def build_idle_message(entry: dict, *, link: bool = False) -> str:
         url = attach_url(node, session)
         if url:
             text += f'  <{url}|Attach>'
+    # Offered alongside rather than instead: the scheme link is the better one
+    # on the machine that has the handler, and the browser link is the only one
+    # that works anywhere else. Which device is reading cannot be told from
+    # here -- and cannot reliably be told from a User-Agent either, because
+    # iPadOS reports itself as MacIntel -- so both are shown and the reader,
+    # who does know, picks.
+    if web:
+        url = web_attach_url(web, node, session)
+        if url:
+            text += f'  <{url}|Browser>'
     return text[:_MAX_TEXT]
 
 

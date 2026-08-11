@@ -133,6 +133,17 @@ NOTIFY_DEFAULTS = {
     # Append a clickable atmux:// link. Opt-in: the scheme only resolves where
     # the URL handler is installed, and a dead link is worse than none.
     'attach_link': False,
+    # Where atmux-web is reachable from a browser, if it is. Set this and the
+    # notice carries a second link that opens the session in the web client --
+    # which is the one a phone can follow, because nothing on a phone resolves
+    # atmux://. Empty means no such link, for the same reason attach_link is
+    # off by default.
+    #
+    # It cannot be discovered: atmux-web binds loopback and whatever publishes
+    # it (`tailscale serve`, a reverse proxy) is configured outside this
+    # program, so only you know the address. Example:
+    #   web_url = "https://host.tailnet.ts.net/term/"
+    'web_url': '',
     # Desktop notification on whichever machine runs the TUI.  Needs no
     # endpoint, so unlike the webhook it is on by default.
     'desktop': True,
@@ -1016,13 +1027,14 @@ def load_notify() -> dict:
             else:
                 log.warning(
                     f'ignoring invalid notify {flag} (expected a boolean)')
-    if 'webhook_url' in section:
-        url = _notify_webhook_url(section['webhook_url'])
-        if url is None:
-            log.warning('ignoring invalid notify webhook_url '
-                        '(expected an http(s) URL)')
-        else:
-            cfg['webhook_url'] = url
+    for name in ('webhook_url', 'web_url'):
+        if name in section:
+            url = _notify_webhook_url(section[name])
+            if url is None:
+                log.warning(f'ignoring invalid notify {name} '
+                            '(expected an http(s) URL)')
+            else:
+                cfg[name] = url
     for key, rule in _NOTIFY_NUMBER_RULES.items():
         if key in section:
             cfg[key] = _validated_number(

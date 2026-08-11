@@ -288,6 +288,66 @@ class LastOutputLineTests(unittest.TestCase):
         self.assertEqual(notify.last_output_line(pane), 'old')
 
 
+class WebAttachUrlTests(unittest.TestCase):
+    """The link a phone can actually follow.
+
+    Nothing on a phone resolves atmux://, so a notice read where notices are
+    actually read -- away from the machine with the handler installed -- had a
+    dead link on it and nothing else.
+    """
+
+    BASE = 'https://host.tailnet.ts.net/term/'
+
+    def test_it_opens_the_session_in_the_browser_client(self):
+        self.assertEqual(
+            notify.web_attach_url(self.BASE, 'gpu1', 'train'),
+            'https://host.tailnet.ts.net/term/console/?attach=gpu1%3Atrain')
+
+    def test_a_missing_trailing_slash_is_not_the_users_problem(self):
+        self.assertEqual(
+            notify.web_attach_url('https://h/term', 'gpu1', 'train'),
+            notify.web_attach_url('https://h/term/', 'gpu1', 'train'))
+
+    def test_the_target_is_a_query_value_not_a_path(self):
+        """A session named ../.. must not be able to climb out of /console/.
+        It is refused outright, and the colon is encoded either way."""
+        self.assertEqual(notify.web_attach_url(self.BASE, 'gpu1', '../../etc'), '')
+        self.assertIn('%3A', notify.web_attach_url(self.BASE, 'gpu1', 'train'))
+        self.assertNotIn('..', notify.web_attach_url(self.BASE, 'gpu1', 'train'))
+
+    def test_only_http_bases_are_accepted(self):
+        """Same rule as the webhook: a file:/ftp: base would turn a config
+        typo into a link that does something else entirely."""
+        for base in ('ftp://h/', 'file:///etc/', 'javascript:x', '', 'h/term'):
+            with self.subTest(base=base):
+                self.assertEqual(
+                    notify.web_attach_url(base, 'gpu1', 'train'), '')
+
+    def test_a_name_it_cannot_express_gets_no_link(self):
+        for node, session in (('bad host', 's'), ('gpu1', 'a/b'),
+                              ('gpu1', ''), ('', 's')):
+            with self.subTest(node=node, session=session):
+                self.assertEqual(
+                    notify.web_attach_url(self.BASE, node, session), '')
+
+    def test_the_notice_offers_both_and_neither_by_default(self):
+        """Which device is reading cannot be told from here -- nor reliably
+        from a User-Agent, because iPadOS reports itself as MacIntel -- so
+        both are shown and the reader, who does know, picks."""
+        entry = {'session': 'train', 'node': 'gpu1', 'idle': 900}
+        plain = notify.build_idle_message(entry)
+        self.assertNotIn('|Attach>', plain)
+        self.assertNotIn('|Browser>', plain)
+        both = notify.build_idle_message(entry, link=True, web=self.BASE)
+        self.assertIn('|Attach>', both)
+        self.assertIn('|Browser>', both)
+        # The browser link stands on its own: someone who never installed the
+        # handler still gets the link that works.
+        web_only = notify.build_idle_message(entry, web=self.BASE)
+        self.assertNotIn('|Attach>', web_only)
+        self.assertIn('|Browser>', web_only)
+
+
 class AttachUrlTests(unittest.TestCase):
     """The link arrives from a chat message, so anyone who can post to the
     channel can craft one. It is validated here and dispatched as argv."""
