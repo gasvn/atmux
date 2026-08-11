@@ -290,26 +290,57 @@
   /* Pinned, because once you are scrolling the section you are in has already
      gone off the top -- and the section is the only thing that tells `^W` in
      ctrl from `w` in tmux. Offset by the sheet's own padding so it lands
-     flush against the edge, and opaque so the keys pass behind it. */
+     flush against the edge, and opaque so the keys pass behind it.
+
+     The only sticky layer in this box, which it was not: the toolbar was
+     pinned to the same edge with a higher z-index, so every heading slid
+     underneath it and stayed there. Measured at four scroll positions, the
+     headings buried were tmux, then tmux+ctrl, then tmux+ctrl+move -- that
+     is, all of them, the whole time you were scrolling. Sticky headings you
+     cannot see are worse than none: they cost the height and pay nothing. */
   #sheet .ghead {
     position: sticky; top: -8px; z-index: 2;
     background: var(--panel-top);
     margin: 0 0 4px; padding: 10px 2px 5px;
   }
   #sheet .ghead:first-child { padding-top: 2px; }
+  /* ── who scrolls the drawer ───────────────────────────────────────────
+     The browser does. The keys used to claim the whole gesture
+     (touch-action: none) and app.js moved the list by hand, a pixel per pixel
+     of finger, because a button allowed its default takes focus and losing
+     focus closes the software keyboard.
+
+     But preventDefault on pointerdown is what stops the focus, and per the
+     Pointer Events spec preventDefault never stops a pan -- that is precisely
+     what touch-action decides, and the two are independent. So the key can
+     refuse focus and still let the pan through, which is what pan-y says
+     here: vertical is the scroller's, everything else is still ours.
+
+     What that buys is not just momentum. It is the platform's own arbitration
+     between a tap and a scroll -- far better tuned than a 10px threshold --
+     delivered as a pointercancel the moment a pan wins, which the key already
+     treats as "not a tap". And it is the same feel whether the finger lands
+     on a key or in the gap between two, which it was not: the gaps scrolled
+     natively, with weight, and the keys hand-cranked.
+
+     pan-y is supported on iOS Safari from 13 (2019). The reason #term uses
+     none is different and still stands: there is no native scroller under it
+     to hand the gesture to. Here there is. */
+  #sheetkeys .key { touch-action: pan-y; }
   /* The sheet's own toolbar, pinned above the sections. Recessed like the
      settings row for the same reason: it changes how the pad behaves rather
      than typing anything, and nothing in this sheet may be mistaken for a key
      that types. */
+  /* Not pinned. It measured 57px of a 253px drawer -- 23% of the space, held
+     forever, for a control used once when you set the pad up. It scrolls away
+     with everything else now, and scrolling back to the top is how you reach
+     it, which is the same cost as reopening the drawer. */
   #sheettop {
-    position: sticky; top: -8px; z-index: 3;
-    background: #17171d; padding: 8px 0 8px;
-    margin: -8px 0 0;
+    padding: 0 0 6px; margin: 0;
     display: flex; gap: 6px;
-    border-bottom: 1px solid #21212a;
   }
   #sheettop button {
-    min-height: 40px; padding: 0 12px;
+    min-height: 32px; padding: 0 12px;
     color: #9096a0;
     background: linear-gradient(180deg, #131317 0%, #17171c 100%);
     border: 1px solid #000; border-radius: 8px;
@@ -407,10 +438,9 @@
     letter-spacing: .01em;
     white-space: normal; overflow-wrap: anywhere; hyphens: auto;
     -webkit-tap-highlight-color: transparent;
-    /* Still none: the gesture stays ours, and app.js scrolls the drawer with
-       it. Handing it to the browser instead would scroll natively, but a
-       button that is allowed its default takes focus, and losing focus closes
-       the software keyboard -- right when you reached for the symbol row. */
+    /* None on the fixed rows: there is nothing under them to scroll, and a
+       drag through them must not move something else. The drawer overrides
+       this -- see #sheetkeys .key. */
     touch-action: none;
     /* Transform and shadow only: both composite, so a key can depress while
        the terminal is repainting without costing a layout. */

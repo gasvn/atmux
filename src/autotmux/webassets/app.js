@@ -484,14 +484,22 @@
   var SHEET_STATE = 'atmux.sheet';
   var sheetHeight = 0;                 // remembered across opens; 0 = ask
 
-  function sheetRowHeight() {
-    for (var i = 0; i < sheetKeys.children.length; i++) {
-      var child = sheetKeys.children[i];
-      if (String(child.className).indexOf('krow') < 0) continue;
-      var box = child.getBoundingClientRect().height;
-      if (box > 0) return box + 5;     // + .krow margin-bottom
+  // The first row of keys, wherever it is: the sections are boxed, so it is
+  // no longer a direct child.
+  function firstRow(node) {
+    for (var i = 0; i < node.children.length; i++) {
+      var child = node.children[i];
+      if (String(child.className).indexOf('krow') >= 0) return child;
+      var found = firstRow(child);
+      if (found) return found;
     }
-    return 49;
+    return null;
+  }
+
+  function sheetRowHeight() {
+    var row = firstRow(sheetKeys);
+    var box = row ? row.getBoundingClientRect().height : 0;
+    return box > 0 ? box + 5 : 49;       // + .krow margin-bottom
   }
 
   // The most it may ever cover. Not a percentage: #app is sized to
@@ -760,13 +768,19 @@
       if (expanded) {
         groups().forEach(function (group) {
           if (!group.keys.length) return;
-          if (group.name) {
-            var label = document.createElement('div');
-            label.className = 'ghead';
-            label.textContent = group.name;
-            sheetKeys.appendChild(label);
-          }
-          renderRows(sheetKeys, group.keys, columns, 0);
+          // Each section in its own box. A sticky heading is held by its
+          // parent's edges, so headings that are all siblings of one another
+          // pin to the same spot and stack there -- which happens to paint
+          // the right one on top, because the current section is the last one
+          // in the document, and is wrong the moment anything about that
+          // changes. Boxed, each heading is pushed out by the next one
+          // arriving underneath it, which is also what makes the change of
+          // section read as a change rather than as a flicker.
+          var section = document.createElement('div');
+          section.className = 'gsec';
+          if (group.name) band(section, group.name);
+          renderRows(section, group.keys, columns, 0);
+          sheetKeys.appendChild(section);
         });
         sizeSheet();
         markSheetEnd();
@@ -809,95 +823,24 @@
   }
 
   // ── scrolling the drawer ──────────────────────────────────────────────
-  // The keys own the gesture -- touch-action: none, because handing it to the
-  // browser lets a button take focus and losing focus closes the software
-  // keyboard -- so this moves the list by hand, a pixel per pixel of finger.
+  // The browser does it. There is nothing here.
   //
-  // Which is fine until there is more list than window. Measured: 691px of
-  // keys in a 253px drawer, so 438px to scroll, and a phone gives about 250px
-  // of travel per drag. Three drags to reach the end, and a flick does exactly
-  // nothing. Worse, it was inconsistent -- a finger landing in the gap between
-  // two keys got the browser's own scroll, with weight, and a finger landing
-  // on a key got the hand crank. Same panel, two feels.
+  // There used to be: the keys claimed the whole gesture and this file moved
+  // the list a pixel per pixel of finger, then -- when that turned out to
+  // need three drags to cross a list and to ignore a flick entirely -- a
+  // velocity sampler and a decay loop to give the hand crank weight.
   //
-  // So the hand crank gets weight too.
-  var glideTimer = 0, glideAt = 0, glideV = 0, glideSamples = [];
-  function clock() { return Date.now(); }
-  function frame(fn) {
-    return typeof requestAnimationFrame === 'function'
-      ? requestAnimationFrame(fn) : setTimeout(fn, 16);
-  }
-  function stopGlide() {
-    if (!glideTimer) return;
-    if (typeof cancelAnimationFrame === 'function') {
-      cancelAnimationFrame(glideTimer);
-    } else {
-      clearTimeout(glideTimer);
-    }
-    glideTimer = 0; glideV = 0;
-  }
-
-  function scrollDrawer(button, dy) {
-    if (!sheet || !sheet.classList.contains('open')) return;
-    if (!button.parentNode || button.parentNode.parentNode !== sheetKeys) return;
-    stopGlide();                       // a finger down stops a glide, always
-    sheet.scrollTop += dy;
-    glideSamples.push({ at: clock(), dy: dy });
-    // Bounded, so a long drag does not grow an array all the way down. The
-    // window that actually decides the throw is applied at release.
-    if (glideSamples.length > 40) glideSamples.shift();
-    markSheetEnd();
-  }
-
-  // Only the last breath of the gesture counts, and the trim happens here
-  // rather than while sampling: a drag that spends a second creeping and then
-  // flicks is a flick, and averaging the whole thing turns it back into a
-  // creep. Deciding it at the point of decision also means it holds however
-  // the samples were collected.
-  var GLIDE_WINDOW = 90;                 // ms
-
-  // px per millisecond below which a release is a stop, not a throw.
-  var GLIDE_MIN = 0.22;
-  // What the speed is multiplied by every millisecond. 0.995 lands a hard
-  // flick in a little under a second, which is about what the platform does.
-  var GLIDE_DECAY = 0.995;
-
-  function releaseDrawer() {
-    var samples = glideSamples;
-    glideSamples = [];
-    if (!sheet || samples.length < 2) return;
-    var last = samples[samples.length - 1].at;
-    while (samples.length > 2 && last - samples[0].at > GLIDE_WINDOW) {
-      samples.shift();
-    }
-    var span = samples[samples.length - 1].at - samples[0].at;
-    if (span <= 0) return;
-    var moved = 0;
-    for (var i = 1; i < samples.length; i++) moved += samples[i].dy;
-    var speed = moved / span;
-    if (Math.abs(speed) < GLIDE_MIN) return;
-    glideV = speed;
-    glideAt = clock();
-    glideTimer = frame(glideStep);
-  }
-
-  function glideStep() {
-    if (!sheet || !sheet.classList.contains('open')) { stopGlide(); return; }
-    var at = clock();
-    // Clamped: a backgrounded tab resumes with a huge delta, and one frame
-    // worth thirty would jump the list to an end nobody threw it at.
-    var dt = Math.min(32, Math.max(1, at - glideAt));
-    glideAt = at;
-    var before = sheet.scrollTop;
-    sheet.scrollTop = before + glideV * dt;
-    markSheetEnd();
-    // Hit the top or the bottom: there is nowhere left to go, so stop rather
-    // than spin down against the edge.
-    if (Math.abs(sheet.scrollTop - before) < 0.5) { stopGlide(); return; }
-    glideV *= Math.pow(GLIDE_DECAY, dt);
-    if (Math.abs(glideV) < 0.02) { stopGlide(); return; }
-    glideTimer = frame(glideStep);
-  }
+  // All of it existed to work around `touch-action: none` on a key, which was
+  // there to stop the key taking focus, because losing focus closes the
+  // software keyboard. But focus is stopped by preventDefault on pointerdown,
+  // and per the Pointer Events spec preventDefault never stops a pan -- the
+  // pan is touch-action's decision alone. The two were never in conflict.
+  //
+  // So `#sheetkeys .key` says pan-y, the drawer scrolls itself, and what
+  // arrives here instead of a scroll routine is a pointercancel the moment
+  // the browser decides a pan has won -- which the key already reads as "not
+  // a tap". That is the platform's own arbitration between a tap and a
+  // scroll, and it is better than any threshold measured in this file.
 
   function buildModifier(entry) {
     var button = document.createElement('button');
@@ -944,7 +887,7 @@
     button.setAttribute('aria-label', label);
     var timer = null, interval = null;
     var live = false, repeated = false, dragging = false;
-    var originX = 0, originY = 0, lastY = 0;
+    var originX = 0, originY = 0;
     // Derived, not flagged: the keys worth repeating are the ones that move or
     // remove something a step at a time -- the CSI sequences (arrows, page
     // up/down, delete) and backspace. Nothing has to remember to mark them.
@@ -958,14 +901,13 @@
       timer = interval = null;
     }
     function down(event) {
-      // The gesture stays ours -- this is what stops the button taking the
-      // terminal's focus, and focus is what the software keyboard is attached
-      // to. The cost is that the drawer will not pan by itself, which `moved`
-      // below pays.
+      // This is what stops the button taking the terminal's focus, and focus
+      // is what the software keyboard is attached to. It does not stop the
+      // drawer panning: a pan is touch-action's decision and nothing else's,
+      // which is why the key can refuse focus and still be scrolled through.
       event.preventDefault();
       live = true; repeated = false; dragging = false;
       originX = event.clientX; originY = event.clientY;
-      lastY = event.clientY;
       button.classList.add('down');
       // Editing is choosing, not pressing: a fixed key that typed on the way
       // down while you were picking what to keep would be the same bug the
@@ -989,31 +931,21 @@
       if (live && !repeated && !dragging) {
         if (!editing) fire();
         else if (pinnable) togglePin(label);
-      } else if (dragging) {
-        // Let go of a moving list and it keeps going. Without this the drawer
-        // stopped dead under the finger, which is the one thing no other
-        // scrolling surface on the phone does.
-        releaseDrawer();
       }
       stop();
     }
-    // Past a few pixels this is a scroll, not a key. The drawer is nearly all
-    // keys, so a finger dragging through it lands here rather than on any
-    // scrollable gap -- which is why nothing moved at all, and why the keys
-    // themselves have to do the scrolling.
+    // On touch the browser settles this: once a pan wins it sends
+    // pointercancel, `stop` runs, and nothing is typed. This is the backstop
+    // for pointers that never pan -- a mouse dragged across the drawer, a
+    // stylus -- where a gesture that travelled this far was not a press.
     function moved(event) {
-      if (!live) return;
-      if (!dragging
-          && (Math.abs(event.clientX - originX) > DRAG
-              || Math.abs(event.clientY - originY) > DRAG)) {
+      if (!live || dragging) return;
+      if (Math.abs(event.clientX - originX) > DRAG
+          || Math.abs(event.clientY - originY) > DRAG) {
         dragging = true;
         button.classList.remove('down');
         clearTimeout(timer); clearInterval(interval);
         timer = interval = null;
-      }
-      if (dragging) {
-        scrollDrawer(button, lastY - event.clientY);
-        lastY = event.clientY;
       }
     }
     button.addEventListener('pointerdown', down);

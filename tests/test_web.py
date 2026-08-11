@@ -921,7 +921,12 @@ class TouchKeypadTests(unittest.TestCase):
         css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
         term = re.search(r'#term \{[^}]*\}', css).group(0)
         self.assertIn('touch-action: none', term)
-        self.assertNotIn('pan-y', css)
+        # The drawer's keys do say pan-y, and that is not the same claim:
+        # there is a real scroller under them to hand the gesture to, which is
+        # exactly what #term does not have. So this checks the selectors that
+        # may declare a pan rather than banning the word from the file.
+        panning = re.findall(r'([#.][\w .#-]*) \{[^}]*pan-y[^}]*\}', css)
+        self.assertEqual([s.strip() for s in panning], ['#sheetkeys .key'])
 
     def test_the_small_text_clears_the_contrast_floor(self):
         """Two of these did not. The drawer's section headings measured
@@ -1843,6 +1848,11 @@ function drawn(node, out) {
   node.children.forEach(function (child) { drawn(child, out); });
   return out;
 }
+function rows(node, out) {
+  if (node._cls && node._cls.krow) out.push(node);
+  node.children.forEach(function (child) { rows(child, out); });
+  return out;
+}
 function headings(node, out) {
   if (node._cls.ghead) out.push(node.textContent);
   node.children.forEach(function (child) { headings(child, out); });
@@ -1876,11 +1886,10 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'typed', 'paintHistory', 'enterHistory',
                  'leaveHistory',
                  'ctrlify', 'applyLatch', 'paintLatch', 'press',
-                 'clock', 'frame', 'stopGlide', 'scrollDrawer',
-                 'releaseDrawer', 'glideStep',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
                  'renderRows', 'recolumn', 'renderNav', 'band', 'renderPins',
+                 'firstRow',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad',
                  'sheetRowHeight', 'sheetRoom', 'sheetPeek', 'sheetFloor',
                  'sizeSheet', 'rememberSheet', 'markSheetEnd')
@@ -1892,8 +1901,6 @@ class KeypadVocabularyTests(unittest.TestCase):
                'var TERM_KEEP =', 'var navColumns =',
                'var SHEET_PEEK_ROWS =', 'var SHEET_STATE =',
                'var sheetHeight =', 'var GRAB_SLOP =',
-               'var glideTimer =', 'var GLIDE_MIN =', 'var GLIDE_DECAY =',
-               'var GLIDE_WINDOW =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
                'var prefixSeq =', 'var PINS =',
                'var DEFAULT_PINS =', 'var pins =',
@@ -2213,8 +2220,7 @@ class KeypadVocabularyTests(unittest.TestCase):
             var surface = expanded ? sheetKeys : keys;
             console.log(JSON.stringify({{
               keys: drawn(surface, []), heads: headings(surface, []),
-              rows: surface.children.filter(function (c) {{
-                return c._cls.krow; }}).length,
+              rows: rows(surface, []).length,
               row: drawn(keys, []),
               open: !!sheet._cls.open,
               more: grabCount.textContent }}));''')
@@ -2307,8 +2313,7 @@ class KeypadVocabularyTests(unittest.TestCase):
                     current = []; expanded = true;
                     renderKeys();
                     var wide = function (node) {{
-                      var row = node.children.filter(function (c) {{
-                        return c._cls.krow; }})[0];
+                      var row = rows(node, [])[0];
                       return row ? row.children.length : 0; }};
                     console.log(JSON.stringify(
                       [wide(nav), wide(keys), wide(sheetKeys), columnsUsed]));
@@ -2486,32 +2491,6 @@ class KeypadVocabularyTests(unittest.TestCase):
             console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
             [['\x02d'], 0])
 
-    def test_a_drag_scrolls_the_drawer_and_types_nothing(self):
-        """The bug: the drawer is nearly all keys, and a key claimed the whole
-        gesture -- so a finger dragging through it to reach the rows below
-        moved nothing at all. Handing the gesture to the browser instead would
-        scroll natively and cost the terminal its focus, which is what the
-        software keyboard is attached to. So the keys scroll it themselves."""
-        self.assertEqual(self.gesture('''
-            var key = keyAt(sheetKeys, 0);
-            key.emit('pointerdown', {clientX: 50, clientY: 200});
-            [190, 170, 150, 130].forEach(function (y) {
-              key.emit('pointermove', {clientX: 50, clientY: y}); });
-            key.emit('pointerup', {clientX: 50, clientY: 130});
-            console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
-            [[], 70])
-
-    def test_a_drag_back_the_other_way_returns(self):
-        self.assertEqual(self.gesture('''
-            var key = keyAt(sheetKeys, 0);
-            sheet.scrollTop = 100;
-            key.emit('pointerdown', {clientX: 50, clientY: 100});
-            [130, 160].forEach(function (y) {
-              key.emit('pointermove', {clientX: 50, clientY: y}); });
-            key.emit('pointerup', {clientX: 50, clientY: 160});
-            console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
-            [[], 40])
-
     def test_a_small_wobble_is_still_a_tap(self):
         """A thumb is not a stylus. Treating every pixel of movement as a
         scroll would make the pad feel broken rather than careful."""
@@ -2547,93 +2526,95 @@ class KeypadVocabularyTests(unittest.TestCase):
             console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
             [['\x1b'], 0])
 
-    # ── letting go of a moving list ───────────────────────────────────────
+    # ── who scrolls the drawer ────────────────────────────────────────────
 
-    def glide(self, samples):
-        """Release the drawer having just moved it the given way.
+    def test_the_browser_scrolls_the_drawer_and_this_file_does_not(self):
+        """It used to be a hand crank -- the keys claimed the whole gesture and
+        app.js moved the list a pixel per pixel of finger -- and then a
+        velocity sampler and a decay loop on top of that, to give the crank
+        weight it would not otherwise have.
 
-        The samples are handed over directly rather than produced by a
-        synthesised drag: a drag dispatched in one tick has no time between
-        its moves, so there is no speed to read and every gesture reads as a
-        stop. That is a property of the test, not of the pad, and it hid this
-        entirely the first time.
+        All of it existed to work around touch-action: none on a key, which
+        was there to stop the key taking focus, because losing focus closes
+        the software keyboard. But focus is stopped by preventDefault on
+        pointerdown, and per the Pointer Events spec preventDefault never
+        stops a pan -- that is touch-action's decision alone. The two were
+        never in conflict, and roughly a hundred lines existed because of it.
         """
-        return self.run_js(f'''
-            sheet.classList.add('open');
-            sheet.scrollHeight = 900; sheet.clientHeight = 300;
-            glideSamples = {json.dumps(samples)};
-            releaseDrawer();
-            console.log(JSON.stringify(
-              [Math.round(glideV * 1000) / 1000, !!glideTimer]));''')
+        for gone in ('scrollDrawer', 'releaseDrawer', 'glideStep',
+                     'GLIDE_DECAY'):
+            with self.subTest(token=gone):
+                self.assertNotIn(gone, self.js)
 
-    def test_a_flick_keeps_going_after_the_finger_stops(self):
-        """Measured: 691px of keys in a 253px drawer, so 438px to scroll, and
-        a phone gives about 250px of travel per drag. Three drags to reach the
-        end, and a flick did nothing at all -- the list stopped dead under the
-        finger, which is the one thing no other scrolling surface on a phone
-        does.
+    def test_a_key_in_the_drawer_lets_a_vertical_pan_through(self):
+        """pan-y, not none: vertical is the scroller's, everything else is
+        still ours. Supported on iOS Safari from 13.
 
-        Worse, it was inconsistent: a finger landing in the gap between two
-        keys got the browser's own scroll, with weight, and a finger landing
-        on a key got the hand crank. Same panel, two feels.
+        #term stays none for a different reason that still holds -- there is
+        no native scroller under it to hand the gesture to."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        drawer = re.search(r'#sheetkeys \.key \{[^}]*\}', css)
+        self.assertIsNotNone(drawer, 'the drawer keys set no touch-action')
+        self.assertIn('touch-action: pan-y', drawer.group(0))
+        base = re.search(r'\n  \.key \{[^}]*\}', css)
+        self.assertIn('touch-action: none', base.group(0))
+        term = re.search(r'#term \{[^}]*\}', css)
+        self.assertIn('touch-action: none', term.group(0))
+
+    def test_a_key_still_refuses_the_focus_the_keyboard_is_attached_to(self):
+        """The reason any of this was hand-written. A button allowed its
+        default takes focus, and the software keyboard is attached to the
+        terminal's textarea -- so the row would close the keyboard exactly
+        when you reached for the symbol row.
+
+        Verified in a browser too: after a tap on a drawer key the active
+        element is still xterm-helper-textarea, and the drawer still pans."""
+        build = _extract(self.js, 'buildKey')
+        down = build[build.index('function down('):]
+        down = down[:down.index('\n    }')]
+        self.assertIn('event.preventDefault();', down)
+
+    def test_a_pan_the_browser_claims_types_nothing(self):
+        """Once a pan wins, the browser sends pointercancel and the key must
+        treat that as "not a tap" -- which is the platform's own arbitration
+        between a tap and a scroll, and better than any threshold measured
+        here."""
+        self.assertEqual(self.gesture('''
+            var key = keyAt(sheetKeys, 0);
+            key.emit('pointerdown', {clientX: 50, clientY: 200});
+            key.emit('pointermove', {clientX: 50, clientY: 160});
+            key.emit('pointercancel', {});
+            key.emit('pointerup', {clientX: 50, clientY: 160});
+            console.log(JSON.stringify(sent));'''), [])
+
+    def test_a_pointer_that_never_pans_still_cannot_type_by_dragging(self):
+        """A mouse or a stylus is never cancelled by a pan, so the distance
+        check stays as the backstop for those."""
+        self.assertEqual(self.gesture('''
+            var key = keyAt(sheetKeys, 0);
+            key.emit('pointerdown', {clientX: 50, clientY: 200});
+            key.emit('pointermove', {clientX: 50, clientY: 130});
+            key.emit('pointerup', {clientX: 50, clientY: 130});
+            console.log(JSON.stringify(sent));'''), [])
+
+    def test_each_section_holds_its_own_heading(self):
+        """A sticky heading is held by its parent's edges. Headings that are
+        all siblings pin to the same spot and stack there -- which happened to
+        paint the right one on top, because the current section is the last in
+        the document, and would be wrong the moment that stopped being true.
+
+        Measured before boxing them, at four scroll positions: the headings
+        pinned were tmux, then tmux+ctrl, then tmux+ctrl+move. Measured after:
+        exactly one, and the right one.
         """
-        speed, running = self.glide(
-            [{'at': 0, 'dy': 0}, {'at': 16, 'dy': 26}, {'at': 32, 'dy': 28}])
-        self.assertGreater(speed, 1.0)
-        self.assertTrue(running, 'nothing is animating')
-
-    def test_a_slow_drag_is_a_search_and_does_not_throw(self):
-        """Dragging through the list looking for a key must end where you left
-        it. Throwing there would mean never being able to stop on one."""
-        speed, running = self.glide(
-            [{'at': 0, 'dy': 0}, {'at': 60, 'dy': 6}, {'at': 120, 'dy': 6}])
-        self.assertEqual(speed, 0)
-        self.assertFalse(running)
-
-    def test_only_the_end_of_the_gesture_decides_the_throw(self):
-        """A long slow drag that finishes with a flick is a flick. Averaging
-        the whole gesture would turn it back into a drag."""
-        speed, running = self.glide(
-            [{'at': 0, 'dy': 2}, {'at': 400, 'dy': 2}, {'at': 800, 'dy': 2},
-             {'at': 860, 'dy': 40}, {'at': 876, 'dy': 44}])
-        self.assertGreater(speed, 1.0, 'the flick at the end was averaged away')
-        self.assertTrue(running)
-
-    def test_a_finger_coming_down_catches_it(self):
-        """Every native scroller stops where you touch it. One that kept going
-        would make the key under your finger unreachable."""
         self.assertEqual(self.run_js('''
-            sheet.classList.add('open');
-            sheet.scrollHeight = 900; sheet.clientHeight = 300;
-            glideSamples = [{at: 0, dy: 0}, {at: 16, dy: 30}];
-            releaseDrawer();
-            var was = !!glideTimer;
-            var key = buildKey({l: 'x', k: 'x'});
-            var row = document.createElement('div');
-            row.className = 'krow';
-            row.appendChild(key);
-            sheetKeys.appendChild(row);
-            scrollDrawer(key, 5);
-            console.log(JSON.stringify([was, !!glideTimer, glideV]));'''),
-            [True, False, 0])
-
-    def test_a_throw_stops_at_the_end_instead_of_grinding_on_it(self):
-        """scrollTop clamps itself, so a glide into the bottom would otherwise
-        keep burning frames against an edge it cannot move."""
-        self.assertEqual(self.run_js('''
-            sheet.classList.add('open');
-            sheet.scrollHeight = 300; sheet.clientHeight = 300;  // nothing to do
-            glideSamples = [{at: 0, dy: 0}, {at: 16, dy: 40}];
-            releaseDrawer();
-            glideStep();
-            console.log(JSON.stringify([!!glideTimer, glideV]));'''),
-            [False, 0])
-
-    def test_a_backgrounded_tab_does_not_resume_by_jumping_to_the_end(self):
-        """requestAnimationFrame stops while the tab is hidden and the first
-        frame back carries the whole gap. One frame worth thirty would throw
-        the list somewhere nobody aimed it."""
-        self.assertIn('Math.min(32,', _extract(self.js, 'glideStep'))
+            keys._width = 390; current = []; expanded = true;
+            renderKeys();
+            var sections = sheetKeys.children.filter(function (c) {
+              return c._cls.gsec; });
+            console.log(JSON.stringify(sections.map(function (s) {
+              return headings(s, []).length; })));'''),
+            [1, 1, 1, 1])
 
     def test_a_closed_drawer_has_nothing_to_scroll(self):
         self.assertEqual(self.run_js('''
