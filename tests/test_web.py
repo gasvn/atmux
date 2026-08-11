@@ -1888,6 +1888,7 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'renderRows', 'recolumn', 'renderNav', 'band', 'renderPins',
                  'firstRow',
                  'renderKeys', 'setEditing', 'toggleDrawer', 'setPad',
+                 'padCover', 'sheetBase',
                  'sheetRowHeight', 'sheetRoom', 'sheetPeek', 'sheetFloor',
                  'shiftTerminal',
                  'sizeSheet', 'rememberSheet', 'markSheetEnd')
@@ -2435,6 +2436,39 @@ class KeypadVocabularyTests(unittest.TestCase):
             expanded = false; sizeSheet();
             console.log(JSON.stringify([open, host.style.transform]));'''),
             [[252, 'translateY(-252px)'], ''])
+
+    def test_the_drawer_opens_over_the_keys_it_is_replacing(self):
+        """The pad's own key rows -- movement, kept, this screen's -- are
+        255px of a 390x844 phone, and every key in them is also in the list.
+        So while the drawer was open they showed the reader something the
+        drawer was showing them again, and the drawer took 252px off the
+        terminal to do it.
+
+        It opens over them now, and the default costs the terminal nothing at
+        all. Measured with real touch events: tapping the handle opens a 255px
+        drawer with the terminal's transform still 'none', its row count
+        unchanged at 46, and tmux's status line ending three pixels above it.
+        """
+        self.assertEqual(self.run_js('''
+            nav._height = 105; pinRow._height = 77; keys._height = 73;
+            host._height = 514;
+            expanded = true; sheetHeight = 0;
+            sizeSheet();
+            console.log(JSON.stringify(
+              [padCover(), sheetHeight, host.style.transform]));'''),
+            [255, 255, ''])
+
+    def test_only_what_will_not_fit_there_comes_out_of_the_terminal(self):
+        """Drag it past the rows it is covering and the rest is borrowed, a
+        pixel at a time, from the top of the terminal."""
+        self.assertEqual(self.run_js('''
+            nav._height = 105; pinRow._height = 77; keys._height = 73;
+            host._height = 514;
+            expanded = true;
+            sizeSheet(255); var atCover = host.style.transform;
+            sizeSheet(455); var past = host.style.transform;
+            console.log(JSON.stringify([atCover, past, sheetRoom()]));'''),
+            ['', 'translateY(-200px)', 673])
 
     def test_dragging_the_drawer_taller_moves_the_terminal_with_it(self):
         """Continuously, because the transform composites: the content
@@ -3322,7 +3356,7 @@ class KeypadVocabularyTests(unittest.TestCase):
         """
         controls = re.findall(r'<button id="(\w+)"', self.html)
         self.assertEqual(controls,
-                         ['hist', 'grab', 'edit', 'back', 'fontminus',
+                         ['hist', 'edit', 'grab', 'back', 'fontminus',
                           'fontauto', 'fontplus', 'kbd', 'hide', 'grip'])
         row = self.html[self.html.index('<div id="tabs">'):]
         row = row[:row.index('</div>')]
@@ -3336,17 +3370,24 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertIn('>‹ list</button>', self.html)
         self.assertIn('>hide</button>', self.html)
 
-    def test_the_drawer_opens_from_its_own_edge(self):
+    def test_the_drawer_opens_from_the_last_row(self):
         """It used to open from a button in the settings row, at the far end
-        of the pad from the drawer itself. A drawer opens from its edge, and
-        putting the control there is also what removed the pair of chevrons --
-        `⌄` for more keys and `▾` for hide the keypad -- from one row."""
+        of the pad from the drawer itself. A drawer opens from its edge -- and
+        this drawer's edge is its bottom, one row above the settings row,
+        because it grows upward and because that is the part of the pad a
+        thumb reaches without the hand moving.
+
+        The handle comes after the sheet in the document so it paints above
+        it: opening the drawer must never cover the way to close it.
+        """
         pad = self.html[self.html.index('<div id="pad">'):]
         order = re.findall(r'<(?:div|button) id="(\w+)"', pad)[1:]   # skip #pad
-        self.assertEqual(order[0], 'grab',
-                         f'the handle is not the pad\'s top edge: {order}')
-        self.assertLess(order.index('grab'), order.index('nav'))
-        self.assertLess(order.index('grab'), order.index('tabs'))
+        for earlier, later in (('nav', 'grab'), ('pins', 'grab'),
+                               ('keys', 'grab'), ('sheet', 'grab'),
+                               ('grab', 'tabs')):
+            with self.subTest(order=f'{earlier} before {later}'):
+                self.assertLess(order.index(earlier), order.index(later),
+                                f'wrong order: {order}')
 
     def test_a_rotation_redraws_only_when_the_count_actually_changed(self):
         """Rebuilding the pad on every resize would drop a held key and clear

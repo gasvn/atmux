@@ -230,13 +230,20 @@
      arriving on a tap instead of a drag. #hist solved exactly this by
      overlaying; this is that.
 
-     bottom: 100% puts its lower edge on #pad's upper edge, so it grows
-     upward over the terminal and #pad's own height never changes at all.
-     The cap is set in JS, from the room actually available. */
+     Its lower edge is the top of the handle, one row above the settings row,
+     and it grows upward from there -- over the keys that are already in the
+     pad first, and only then over the terminal. Measured: those rows are
+     255px of a 390x844 phone, and every one of their keys is also in the
+     list, so while the drawer is open they are showing the reader something
+     the drawer is showing them again. Opening over them costs nothing; the
+     drawer used to take 252px off the terminal for the same four rows.
+
+     #pad's own height never changes either way, so the pty is never resized.
+     Both offsets are set in JS, from what the rows actually measure. */
   #sheet { display: none; }
   body.touch #sheet.open {
     display: block;
-    position: absolute; left: 0; right: 0; bottom: 100%;
+    position: absolute; left: 0; right: 0;
     overflow-y: auto; -webkit-overflow-scrolling: touch;
     /* contain, so reaching the end of the list stops there rather than
        handing the rest of the swipe to the terminal behind it. */
@@ -370,10 +377,14 @@
     align-items: center; justify-content: center; gap: 9px;
     /* Short, but it spans the panel: the target is the full width of the
        screen, which is far more than the 44px a button would get. */
-    /* It is the pad's own top edge now, and the pad already draws a hairline
-       of light there -- a border here would be a second one. */
-    width: 100%; height: 24px; padding: 0;
+    /* The drawer's lower edge, one row above the settings row -- which is
+       both where the drawer opens from and the part of the pad a thumb
+       reaches without the hand moving. It sits above the sheet in paint
+       order, so opening the drawer never covers the way to close it. */
+    width: 100%; height: 26px; padding: 0;
     background: none; border: 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+    position: relative; z-index: 2;
     -webkit-tap-highlight-color: transparent;
     touch-action: none;
     /* The gesture is a resize; the browser must not read it as a scroll or a
@@ -630,14 +641,6 @@
   <button id="hist" type="button" hidden
           aria-live="polite" aria-label="stop reading history"></button>
   <div id="pad">
-    <!-- The seam of the drawer, and the one control that opens it.
-         It used to be a `⌄ 38` button in the settings row, four buttons away
-         from `▾`, which is a near-identical chevron meaning something else
-         entirely -- and the number beside it explained nothing. A drawer
-         opens from its edge; that is what an edge looks like, and the same
-         handle drags to whatever height you actually want. -->
-    <button id="grab" aria-expanded="false"
-            aria-label="more keys"><span></span><b id="grabcount"></b></button>
     <!-- esc, the two modifiers, tab and the arrows. Fixed, in this order, and
          nothing below may reflow it: a key that moves because the far end
          published a different number of actions is a key you have to look for
@@ -662,6 +665,14 @@
       </div>
       <div id="sheetkeys"></div>
     </div>
+    <!-- The seam of the drawer, and the one control that opens it.
+         It used to be a `⌄ 38` button in the settings row, four buttons away
+         from `▾`, which is a near-identical chevron meaning something else
+         entirely -- and the number beside it explained nothing. A drawer
+         opens from its edge; that is what an edge looks like, and the same
+         handle drags to whatever height you actually want. -->
+    <button id="grab" aria-expanded="false"
+            aria-label="more keys"><span></span><b id="grabcount"></b></button>
     <div id="tabs">
       <!-- The way out. From inside a session the only route back to the list
            was `detach`, seventh key into the drawer under `tmux` -- and this

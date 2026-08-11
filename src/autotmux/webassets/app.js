@@ -502,19 +502,50 @@
     return box > 0 ? box + 5 : 49;       // + .krow margin-bottom
   }
 
-  // The most it may ever cover. Not a percentage: #app is sized to
-  // visualViewport, so the room actually available changes with the software
-  // keyboard and with rotation, and the only honest source is the terminal
-  // box itself.
-  function sheetRoom() {
-    return Math.max(120,
-                    host.getBoundingClientRect().height - TERM_KEEP);
+  // ── the space the drawer gets for free ────────────────────────────────
+  // The pad's own key rows. Every key in them is also in the list, so while
+  // the drawer is open they are showing the reader something the drawer is
+  // showing them again -- and the drawer was taking the terminal's rows to do
+  // it. Measured on a 390x844 phone: 255px, against a drawer that cost the
+  // terminal 252px to show four rows.
+  //
+  // So the drawer opens over these first. Only what it needs beyond them
+  // comes out of the terminal.
+  function padCover() {
+    var total = 0;
+    [nav, pinRow, keys].forEach(function (box) {
+      if (box && box.style.display !== 'none') {
+        total += box.getBoundingClientRect().height;
+      }
+    });
+    return total;
   }
 
+  // Where the drawer's lower edge sits: the top of the handle, which is one
+  // row above the settings row. Expressed as an offset from the pad's bottom,
+  // because that is what `bottom` on an absolutely positioned box means here.
+  function sheetBase() {
+    if (!pad || !expander) return 0;
+    return Math.max(0, Math.round(pad.getBoundingClientRect().bottom
+                                  - expander.getBoundingClientRect().top));
+  }
+
+  // The most it may ever be. The terminal's share is not a percentage: #app
+  // is sized to visualViewport, so the room actually available changes with
+  // the software keyboard and with rotation, and the only honest source is
+  // the terminal box itself.
+  function sheetRoom() {
+    return Math.max(120, padCover()
+                    + host.getBoundingClientRect().height - TERM_KEEP);
+  }
+
+  // Open to exactly the space the pad was already spending on keys, so the
+  // default costs the terminal nothing at all. Four rows is the floor for a
+  // screen too small for that to be much.
   function sheetPeek() {
     var top = sheetTop ? sheetTop.getBoundingClientRect().height : 0;
-    return Math.min(sheetRoom(),
-                    (top || 56) + SHEET_PEEK_ROWS * sheetRowHeight());
+    var rows = (top || 56) + SHEET_PEEK_ROWS * sheetRowHeight();
+    return Math.min(sheetRoom(), Math.max(padCover(), rows));
   }
 
   // The smallest the drawer is worth being: the toolbar and one row. Below
@@ -553,8 +584,12 @@
     var want = px === undefined ? (sheetHeight || sheetPeek()) : px;
     sheetHeight = Math.max(sheetFloor(),
                            Math.min(sheetRoom(), Math.round(want)));
+    sheet.style.bottom = sheetBase() + 'px';
     sheet.style.height = sheetHeight + 'px';
-    shiftTerminal(sheetHeight);
+    // Only what the drawer needs beyond the pad's own key rows is taken from
+    // the terminal, and it is taken by sliding the terminal rather than by
+    // shortening it -- so the prompt stays visible and the pty is untouched.
+    shiftTerminal(Math.max(0, sheetHeight - padCover()));
     markSheetEnd();
   }
 
