@@ -808,14 +808,95 @@
     renderKeys();
   }
 
-  // Only the sheet scrolls, and only a key that lives in it may scroll it:
-  // the rows below it are fixed on purpose, and dragging a fixed key to move
-  // something else is a gesture nobody asked for.
+  // ── scrolling the drawer ──────────────────────────────────────────────
+  // The keys own the gesture -- touch-action: none, because handing it to the
+  // browser lets a button take focus and losing focus closes the software
+  // keyboard -- so this moves the list by hand, a pixel per pixel of finger.
+  //
+  // Which is fine until there is more list than window. Measured: 691px of
+  // keys in a 253px drawer, so 438px to scroll, and a phone gives about 250px
+  // of travel per drag. Three drags to reach the end, and a flick does exactly
+  // nothing. Worse, it was inconsistent -- a finger landing in the gap between
+  // two keys got the browser's own scroll, with weight, and a finger landing
+  // on a key got the hand crank. Same panel, two feels.
+  //
+  // So the hand crank gets weight too.
+  var glideTimer = 0, glideAt = 0, glideV = 0, glideSamples = [];
+  function clock() { return Date.now(); }
+  function frame(fn) {
+    return typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame(fn) : setTimeout(fn, 16);
+  }
+  function stopGlide() {
+    if (!glideTimer) return;
+    if (typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(glideTimer);
+    } else {
+      clearTimeout(glideTimer);
+    }
+    glideTimer = 0; glideV = 0;
+  }
+
   function scrollDrawer(button, dy) {
     if (!sheet || !sheet.classList.contains('open')) return;
     if (!button.parentNode || button.parentNode.parentNode !== sheetKeys) return;
+    stopGlide();                       // a finger down stops a glide, always
     sheet.scrollTop += dy;
+    glideSamples.push({ at: clock(), dy: dy });
+    // Bounded, so a long drag does not grow an array all the way down. The
+    // window that actually decides the throw is applied at release.
+    if (glideSamples.length > 40) glideSamples.shift();
     markSheetEnd();
+  }
+
+  // Only the last breath of the gesture counts, and the trim happens here
+  // rather than while sampling: a drag that spends a second creeping and then
+  // flicks is a flick, and averaging the whole thing turns it back into a
+  // creep. Deciding it at the point of decision also means it holds however
+  // the samples were collected.
+  var GLIDE_WINDOW = 90;                 // ms
+
+  // px per millisecond below which a release is a stop, not a throw.
+  var GLIDE_MIN = 0.22;
+  // What the speed is multiplied by every millisecond. 0.995 lands a hard
+  // flick in a little under a second, which is about what the platform does.
+  var GLIDE_DECAY = 0.995;
+
+  function releaseDrawer() {
+    var samples = glideSamples;
+    glideSamples = [];
+    if (!sheet || samples.length < 2) return;
+    var last = samples[samples.length - 1].at;
+    while (samples.length > 2 && last - samples[0].at > GLIDE_WINDOW) {
+      samples.shift();
+    }
+    var span = samples[samples.length - 1].at - samples[0].at;
+    if (span <= 0) return;
+    var moved = 0;
+    for (var i = 1; i < samples.length; i++) moved += samples[i].dy;
+    var speed = moved / span;
+    if (Math.abs(speed) < GLIDE_MIN) return;
+    glideV = speed;
+    glideAt = clock();
+    glideTimer = frame(glideStep);
+  }
+
+  function glideStep() {
+    if (!sheet || !sheet.classList.contains('open')) { stopGlide(); return; }
+    var at = clock();
+    // Clamped: a backgrounded tab resumes with a huge delta, and one frame
+    // worth thirty would jump the list to an end nobody threw it at.
+    var dt = Math.min(32, Math.max(1, at - glideAt));
+    glideAt = at;
+    var before = sheet.scrollTop;
+    sheet.scrollTop = before + glideV * dt;
+    markSheetEnd();
+    // Hit the top or the bottom: there is nowhere left to go, so stop rather
+    // than spin down against the edge.
+    if (Math.abs(sheet.scrollTop - before) < 0.5) { stopGlide(); return; }
+    glideV *= Math.pow(GLIDE_DECAY, dt);
+    if (Math.abs(glideV) < 0.02) { stopGlide(); return; }
+    glideTimer = frame(glideStep);
   }
 
   function buildModifier(entry) {
@@ -908,6 +989,11 @@
       if (live && !repeated && !dragging) {
         if (!editing) fire();
         else if (pinnable) togglePin(label);
+      } else if (dragging) {
+        // Let go of a moving list and it keeps going. Without this the drawer
+        // stopped dead under the finger, which is the one thing no other
+        // scrolling surface on the phone does.
+        releaseDrawer();
       }
       stop();
     }

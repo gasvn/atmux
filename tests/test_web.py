@@ -1707,10 +1707,10 @@ class ControlSurfaceTests(_ServedFixture):
 _DOM_STUB = r'''
 function El(tag) {
   this.tag = tag; this.children = []; this.attrs = {}; this.style = {};
-  this._text = ''; this._cls = {}; this._on = {}; this.scrollTop = 0;
+  this._text = ''; this._cls = {}; this._on = {};
   // What a scrolling box knows about itself. The sheet decides whether it is
   // showing its own last row from these, and takes the fade off when it is.
-  this.scrollHeight = 0; this.clientHeight = 0;
+  this.scrollHeight = 0; this.clientHeight = 0; this._scrollTop = 0;
   this.parentNode = null;
   var self = this;
   this.classList = {
@@ -1735,6 +1735,17 @@ Object.defineProperty(El.prototype, 'textContent', {
 });
 Object.defineProperty(El.prototype, 'childElementCount', {
   get: function () { return this.children.length; }
+});
+// Clamped, like the real thing. A plain number here let a glide keep adding
+// to a box that had nowhere left to go, so "stop at the end instead of
+// grinding on it" could not be caught -- the stub was more permissive than a
+// browser, which is the wrong direction for a stub to be wrong in.
+Object.defineProperty(El.prototype, 'scrollTop', {
+  set: function (v) {
+    var max = Math.max(0, (this.scrollHeight || 0) - (this.clientHeight || 0));
+    this._scrollTop = Math.max(0, Math.min(max, Number(v) || 0));
+  },
+  get: function () { return this._scrollTop; }
 });
 El.prototype.appendChild = function (c) {
   this.children.push(c); c.parentNode = this; return c;
@@ -1864,7 +1875,9 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'lineHeight', 'wheelReport', 'cellAt', 'duringLabel',
                  'typed', 'paintHistory', 'enterHistory',
                  'leaveHistory',
-                 'ctrlify', 'applyLatch', 'paintLatch', 'press', 'scrollDrawer',
+                 'ctrlify', 'applyLatch', 'paintLatch', 'press',
+                 'clock', 'frame', 'stopGlide', 'scrollDrawer',
+                 'releaseDrawer', 'glideStep',
                  'loadPins', 'savePins', 'togglePin', 'own', 'pinnedKeys',
                  'buildModifier', 'buildKey', 'tmuxKeys', 'groups', 'perRow',
                  'renderRows', 'recolumn', 'renderNav', 'band', 'renderPins',
@@ -1879,6 +1892,8 @@ class KeypadVocabularyTests(unittest.TestCase):
                'var TERM_KEEP =', 'var navColumns =',
                'var SHEET_PEEK_ROWS =', 'var SHEET_STATE =',
                'var sheetHeight =', 'var GRAB_SLOP =',
+               'var glideTimer =', 'var GLIDE_MIN =', 'var GLIDE_DECAY =',
+               'var GLIDE_WINDOW =',
                'var columnsUsed =', 'var latch =', 'var modButtons =',
                'var prefixSeq =', 'var PINS =',
                'var DEFAULT_PINS =', 'var pins =',
@@ -2452,10 +2467,14 @@ class KeypadVocabularyTests(unittest.TestCase):
     # ── tap versus scroll ─────────────────────────────────────────────────
 
     def gesture(self, script):
-        """An open sheet, and a finger doing something to it."""
+        """An open sheet with more in it than fits, and a finger doing
+        something to it. The sizes matter: scrollTop clamps to what there is
+        to scroll, so a box that reports nothing scrollable cannot be
+        scrolled -- which is exactly what the drawer is not."""
         return self.run_js(f'''
             keys._width = 390; current = []; expanded = true;
             renderKeys();
+            sheet.scrollHeight = 900; sheet.clientHeight = 253;
             sent = [];
             {script}''')
 
@@ -2527,6 +2546,94 @@ class KeypadVocabularyTests(unittest.TestCase):
             key.emit('pointerup', {clientX: 50, clientY: 140});
             console.log(JSON.stringify([sent, sheet.scrollTop]));'''),
             [['\x1b'], 0])
+
+    # ── letting go of a moving list ───────────────────────────────────────
+
+    def glide(self, samples):
+        """Release the drawer having just moved it the given way.
+
+        The samples are handed over directly rather than produced by a
+        synthesised drag: a drag dispatched in one tick has no time between
+        its moves, so there is no speed to read and every gesture reads as a
+        stop. That is a property of the test, not of the pad, and it hid this
+        entirely the first time.
+        """
+        return self.run_js(f'''
+            sheet.classList.add('open');
+            sheet.scrollHeight = 900; sheet.clientHeight = 300;
+            glideSamples = {json.dumps(samples)};
+            releaseDrawer();
+            console.log(JSON.stringify(
+              [Math.round(glideV * 1000) / 1000, !!glideTimer]));''')
+
+    def test_a_flick_keeps_going_after_the_finger_stops(self):
+        """Measured: 691px of keys in a 253px drawer, so 438px to scroll, and
+        a phone gives about 250px of travel per drag. Three drags to reach the
+        end, and a flick did nothing at all -- the list stopped dead under the
+        finger, which is the one thing no other scrolling surface on a phone
+        does.
+
+        Worse, it was inconsistent: a finger landing in the gap between two
+        keys got the browser's own scroll, with weight, and a finger landing
+        on a key got the hand crank. Same panel, two feels.
+        """
+        speed, running = self.glide(
+            [{'at': 0, 'dy': 0}, {'at': 16, 'dy': 26}, {'at': 32, 'dy': 28}])
+        self.assertGreater(speed, 1.0)
+        self.assertTrue(running, 'nothing is animating')
+
+    def test_a_slow_drag_is_a_search_and_does_not_throw(self):
+        """Dragging through the list looking for a key must end where you left
+        it. Throwing there would mean never being able to stop on one."""
+        speed, running = self.glide(
+            [{'at': 0, 'dy': 0}, {'at': 60, 'dy': 6}, {'at': 120, 'dy': 6}])
+        self.assertEqual(speed, 0)
+        self.assertFalse(running)
+
+    def test_only_the_end_of_the_gesture_decides_the_throw(self):
+        """A long slow drag that finishes with a flick is a flick. Averaging
+        the whole gesture would turn it back into a drag."""
+        speed, running = self.glide(
+            [{'at': 0, 'dy': 2}, {'at': 400, 'dy': 2}, {'at': 800, 'dy': 2},
+             {'at': 860, 'dy': 40}, {'at': 876, 'dy': 44}])
+        self.assertGreater(speed, 1.0, 'the flick at the end was averaged away')
+        self.assertTrue(running)
+
+    def test_a_finger_coming_down_catches_it(self):
+        """Every native scroller stops where you touch it. One that kept going
+        would make the key under your finger unreachable."""
+        self.assertEqual(self.run_js('''
+            sheet.classList.add('open');
+            sheet.scrollHeight = 900; sheet.clientHeight = 300;
+            glideSamples = [{at: 0, dy: 0}, {at: 16, dy: 30}];
+            releaseDrawer();
+            var was = !!glideTimer;
+            var key = buildKey({l: 'x', k: 'x'});
+            var row = document.createElement('div');
+            row.className = 'krow';
+            row.appendChild(key);
+            sheetKeys.appendChild(row);
+            scrollDrawer(key, 5);
+            console.log(JSON.stringify([was, !!glideTimer, glideV]));'''),
+            [True, False, 0])
+
+    def test_a_throw_stops_at_the_end_instead_of_grinding_on_it(self):
+        """scrollTop clamps itself, so a glide into the bottom would otherwise
+        keep burning frames against an edge it cannot move."""
+        self.assertEqual(self.run_js('''
+            sheet.classList.add('open');
+            sheet.scrollHeight = 300; sheet.clientHeight = 300;  // nothing to do
+            glideSamples = [{at: 0, dy: 0}, {at: 16, dy: 40}];
+            releaseDrawer();
+            glideStep();
+            console.log(JSON.stringify([!!glideTimer, glideV]));'''),
+            [False, 0])
+
+    def test_a_backgrounded_tab_does_not_resume_by_jumping_to_the_end(self):
+        """requestAnimationFrame stops while the tab is hidden and the first
+        frame back carries the whole gap. One frame worth thirty would throw
+        the list somewhere nobody aimed it."""
+        self.assertIn('Math.min(32,', _extract(self.js, 'glideStep'))
 
     def test_a_closed_drawer_has_nothing_to_scroll(self):
         self.assertEqual(self.run_js('''
