@@ -333,7 +333,12 @@
      thing it cannot carry across is colour: it is one weight of one colour,
      because it is text and not a grid of cells. */
   #selview {
-    position: absolute; inset: 0; z-index: 4;
+    /* Above the typing textarea, which is full-screen at z-index 5 while the
+       software keyboard is up. Below it, the copy view was covered by an
+       invisible field -- and dodging that by blurring the field dismissed
+       the keyboard, which changes visualViewport, which resizes #app, which
+       moved the line out from under the finger that had just pressed it. */
+    position: absolute; inset: 0; z-index: 6;
     display: flex; flex-direction: column;
     background: #121212;
   }

@@ -179,23 +179,84 @@
   // is on, which is the right trade -- you are typing, not navigating, and the
   // published keys still cover every action on the screen.
   var kbdOpen = false;
+  // ── typing on a software keyboard ───────────────────────────────────
+  // Holding delete removed one character and stopped. iOS repeats the
+  // software keyboard's delete key only while the field still has something
+  // to delete, and xterm's helper textarea is kept empty -- so the first
+  // press deleted nothing the OS could see, and the repeat never started.
+  // Measured: value.length was 0.
+  //
+  // So the field is padded while the keyboard is up, and what the platform
+  // does to that padding is read back as intent: characters gone means
+  // backspaces, characters added means text. This is how mobile terminals
+  // have always done it, and it is the only thing iOS's own repeat can act
+  // on.
+  //
+  // Only while our typing mode is on. Off it, xterm has the textarea back
+  // and behaves exactly as before -- a hardware keyboard never needed this.
+  var PAD = ' '.repeat(64);
+  var padding = false;
+
+  function repad() {
+    if (!textarea) return;
+    textarea.value = PAD;
+    try { textarea.setSelectionRange(PAD.length, PAD.length); } catch (e) {}
+  }
+
+  function onTypedInput(event) {
+    if (!padding || event.isComposing) return;
+    event.stopImmediatePropagation();     // xterm must not read the padding
+    var value = textarea.value;
+    if (value.length < PAD.length) {
+      typed('\x7f'.repeat(PAD.length - value.length));
+    } else if (value.length > PAD.length) {
+      // Whatever the platform put in, wherever it put it. Compared against
+      // the pad rather than sliced from the end: autocomplete and dictation
+      // both replace a run rather than append to it.
+      var added = value.split('').filter(function (ch) {
+        return ch !== ' ';
+      }).join('');
+      if (added) typed(added);
+    }
+    repad();
+  }
+
+  function onTypedKey(event) {
+    if (!padding) return;
+    var send = {Enter: '\r', Tab: '\t', Escape: '\x1b',
+                ArrowUp: '\x1b[A', ArrowDown: '\x1b[B',
+                ArrowRight: '\x1b[C', ArrowLeft: '\x1b[D'}[event.key];
+    if (!send) return;                    // let the field have it
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    typed(send);
+  }
+
   function setKeyboard(open) {
     if (!textarea) return;
     kbdOpen = open;
     var button = document.getElementById('kbd');
     if (button) button.classList.toggle('on', open);
     textarea.classList.toggle('atmux-typing', open);
+    padding = !!open;
     if (open) {
       textarea.removeAttribute('inputmode');
+      repad();
       // Worth a try: on a platform that does honour it this saves the tap.
       try { textarea.focus(); } catch (e) {}
       say('tap the screen to type');
     } else {
       textarea.setAttribute('inputmode', 'none');
+      textarea.value = '';
       textarea.blur();
       term.focus();
       say('keyboard off');
     }
+  }
+
+  if (textarea) {
+    textarea.addEventListener('input', onTypedInput, true);
+    textarea.addEventListener('keydown', onTypedKey, true);
   }
 
   // A button that takes focus first leaves nothing for the terminal, so every
@@ -1405,7 +1466,7 @@
       renderKeys();
     }
     try {
-      localStorage.setItem(PAD_STATE, shown ? '' : 'hidden');
+      localStorage.setItem(PAD_STATE, shown ? 'shown' : 'hidden');
     } catch (e) {}
     refit();
   }
@@ -1774,14 +1835,20 @@
       // up and a selection looks like the thing being selected.
       selText.style.fontSize = term.options.fontSize + 'px';
       selView.hidden = false;
-      // The caret must be nowhere. xterm parks an offscreen textarea and
-      // keeps it focused so the software keyboard has something to type
-      // into, and a focused editable is what a long press reaches for before
-      // it reaches for the text under the finger.
-      try {
-        var box = host.querySelector('textarea');
-        if (box) box.blur();
-      } catch (e) {}
+      // The caret must be nowhere -- xterm parks a focused textarea, and a
+      // focused editable is what a long press reaches for before it reaches
+      // for the text under the finger.
+      //
+      // Except while the software keyboard is up, where blurring dismisses
+      // it: that changes visualViewport, which resizes #app, which moves the
+      // line out from under the finger that just pressed it. The view is
+      // stacked above the field instead, so there is nothing to dodge.
+      if (!kbdOpen) {
+        try {
+          var box = host.querySelector('textarea');
+          if (box) box.blur();
+        } catch (e) {}
+      }
       // Where you were: the line you pressed, in the place you pressed it,
       // or the live end when nothing in particular was asked for.
       if (at) {
@@ -2649,7 +2716,12 @@
     setKeyboard(false);
     var stored = '';
     try { stored = localStorage.getItem(PAD_STATE) || ''; } catch (e) {}
-    if (stored === 'hidden') setPad(false);
+    // Collapsed on arrival, not expanded. Three rows of keys is 41% of a
+    // phone, and the reason you opened a session is on the other 59% -- the
+    // keys are for acting on what you read, so they can wait to be asked
+    // for. `⌃` at the bottom edge brings them back and the choice sticks,
+    // so this is a default rather than a decision taken away.
+    if (stored !== 'shown') setPad(false);
   }
 
   if (boot) boot.style.display = 'none';

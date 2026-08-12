@@ -2953,6 +2953,69 @@ class KeypadVocabularyTests(unittest.TestCase):
                 self.assertNotIn(name, self.js)
                 self.assertNotIn(name, self.html)
 
+    def test_holding_delete_deletes_more_than_one(self):
+        """iOS repeats the software keyboard's delete key only while the
+        field still has something to delete, and xterm's helper textarea is
+        kept empty -- measured, value.length was 0. So the first press
+        deleted nothing the platform could see and the repeat never started,
+        which is the opposite of what every other iOS text field does.
+
+        The field is padded while the keyboard is up, and what the platform
+        does to that padding is read back as intent. Measured: removing seven
+        characters sends seven backspaces, adding `ls -la` sends `ls -la`,
+        and the pad is refilled after each so the next hold has something to
+        chew on again.
+        """
+        source = _extract(self.js, 'onTypedInput')
+        self.assertIn('stopImmediatePropagation', source,
+                      'xterm would read the padding as typed text')
+        self.assertIn('PAD.length - value.length', source)
+        self.assertIn('repad()', source)
+        # Composition is the platform mid-sentence; diffing it would send
+        # half-formed characters.
+        self.assertIn('isComposing', source)
+        # Capture phase, or xterm's own listener runs first.
+        self.assertIn("addEventListener('input', onTypedInput, true)", self.js)
+
+    def test_the_padding_exists_only_while_the_keyboard_is_up(self):
+        """A hardware keyboard never needed any of this, and off typing mode
+        xterm has its textarea back exactly as before."""
+        source = _extract(self.js, 'setKeyboard')
+        self.assertIn('padding = !!open', source)
+        self.assertIn('repad()', source)
+        self.assertIn("textarea.value = ''", source)
+
+    def test_the_keys_wait_to_be_asked_for(self):
+        """Three rows of keys is 41% of a phone, and the reason you opened a
+        session is on the other 59%. Measured: the terminal went from 495px
+        to 818px of an 844px screen.
+
+        A default rather than a decision taken away -- `⌃` brings them back
+        and the choice sticks.
+        """
+        source = self.js[self.js.index('var stored'):]
+        source = source[:source.index('if (boot)')]
+        self.assertIn("stored !== 'shown'", source)
+        self.assertIn('setPad(false)', source)
+        self.assertIn("PAD_STATE, shown ? 'shown' : 'hidden'", self.js)
+
+    def test_the_copy_view_outranks_the_field_it_used_to_dodge(self):
+        """The typing textarea is full-screen at z-index 5 while the keyboard
+        is up. The copy view was 4, so an invisible field covered it -- and
+        dodging that by blurring dismissed the keyboard, which changes
+        visualViewport, which resizes #app, which moved the line out from
+        under the finger that had just pressed it."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        view = re.search(r'#selview \{(.*?)\}', css, re.S).group(1)
+        typing = re.search(r'\.xterm-helper-textarea\.atmux-typing \{(.*?)\}',
+                           css, re.S).group(1)
+        higher = int(re.search(r'z-index: (\d+)', view).group(1))
+        lower = int(re.search(r'z-index: (\d+)', typing).group(1))
+        self.assertGreater(higher, lower)
+        # And the blur only happens when there is no keyboard to dismiss.
+        toggle = _extract(self.js, 'setSelecting')
+        self.assertIn('if (!kbdOpen)', toggle)
+
     def test_a_scroll_that_pauses_is_still_a_scroll(self):
         """The hold used to open the copy view at the 500ms mark, which is
         irrevocable -- so resting a thumb before scrolling landed you in it.
@@ -4081,11 +4144,23 @@ That reasoning was about the clipboard, which needs a user gesture. The
             [[True, True], [False, False]])
 
     def test_the_choice_survives_a_reload(self):
+        """Both ways round, and both recorded.
+
+        Showing it used to store '' -- indistinguishable from never having
+        chosen, which was fine while the default was shown and is not now
+        that the pad arrives collapsed. A reader who asked for the keys has
+        to be told apart from one who has not asked yet.
+        """
         self.assertEqual(self.run_js('''
             setPad(false); setPad(true);
             console.log(JSON.stringify(
               [!!document.body._cls.nopad, store[PAD_STATE]]));'''),
-            [False, ''])
+            [False, 'shown'])
+        self.assertEqual(self.run_js('''
+            setPad(true); setPad(false);
+            console.log(JSON.stringify(
+              [!!document.body._cls.nopad, store[PAD_STATE]]));'''),
+            [True, 'hidden'])
 
     def test_hiding_it_leaves_exactly_one_way_back(self):
         """A hidden pad with no way back is a terminal you have to reload to
