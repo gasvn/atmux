@@ -2863,6 +2863,90 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertIn('i = 0', source.replace(' ', ' '))
         self.assertNotIn('baseY', source)
 
+    def test_press_and_hold_copies_the_line_without_any_button(self):
+        """What iOS does natively, done here because natively it does not
+        happen at all: touch selection over xterm does not work on iOS with
+        any renderer (xtermjs/xterm.js#3727, open since 2022), and no engine
+        on this machine reproduces the iOS long press either -- headless
+        Chrome and Playwright's WebKit both decline to select a bare <pre>
+        under one. A gesture resting on their recogniser could be neither
+        made to work nor shown to work, which is how two fixes shipped that
+        measured perfectly here and failed on the phone.
+
+        This gesture is our own timer instead: finger down, 500ms, no
+        movement. Measurable here, and the same code on the phone.
+
+        Measured, with real touch events: a 120ms tap copies nothing and
+        marks nothing; a 700ms hold puts that line on the clipboard and says
+        so; a hold that turns into a drag scrolls and copies nothing, and the
+        mark goes with it; a plain flick copies nothing; and a hold on a
+        blank row does nothing at all rather than appearing to work.
+        """
+        self.assertIn('LONG_PRESS_MS', self.js)
+        start = self.js[self.js.index("host.addEventListener('touchstart'"):]
+        start = start[:start.index("host.addEventListener('touchmove'")]
+        self.assertIn('pressTimer = setTimeout', start)
+        # A press that never moves never reaches touchmove, so the position
+        # has to be taken at the start or cellAt reads wherever the last
+        # gesture happened to end.
+        self.assertIn('lastX = event.touches[0].clientX', start)
+
+    def test_a_hold_that_becomes_a_drag_is_a_drag(self):
+        """Otherwise a slow scroll copies a line out from under itself. The
+        travel is measured from where the finger started, not from the last
+        frame: a slow drag never moves far in one frame and would hold its
+        way into a copy."""
+        move = self.js[self.js.index("host.addEventListener('touchmove'"):]
+        move = move[:move.index("['touchend', 'touchcancel']")]
+        self.assertIn('cancelPress()', move)
+        self.assertIn('LONG_PRESS_SLOP', move)
+        self.assertIn('pressed.from', move)
+
+    def test_the_clipboard_write_happens_on_the_lift(self):
+        """Safari wants a clipboard write inside a user gesture, and the end
+        of a touch is one where the middle of a hold is arguable. The mark
+        appears at 500ms so the wait is visible; the copy lands on release."""
+        end = self.js[self.js.index("['touchend', 'touchcancel']"):]
+        end = end[:end.index('function spread')]
+        self.assertIn("name === 'touchend'", end)
+        self.assertIn('copyLine', end)
+
+    def test_a_hold_marks_what_it_is_about_to_copy(self):
+        """A gesture with no sign it has been recognised is one people give
+        up on. The mark is drawn over the terminal rather than into it: the
+        terminal is a grid repainted from the far end, and anything written
+        into it is gone on the next frame."""
+        self.assertIn('id="lineflash"', self.html)
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        block = re.search(r'#lineflash \{(.*?)\}', css, re.S).group(1)
+        self.assertIn('position: absolute', block)
+        # It must never eat the gesture it is reporting on.
+        self.assertIn('pointer-events: none', block)
+
+    def test_a_wrapped_line_copies_whole_or_not_at_all(self):
+        """A path long enough to be worth copying is long enough to wrap, and
+        half of one is worse than none because it looks like it worked.
+
+        Worth knowing what this cannot do: under tmux the wrap has already
+        happened at the far end -- tmux repositions the cursor and writes
+        each row itself, so xterm never sees a wrap and isWrapped is false.
+        Measured: an 80-column path across two rows came back as the row that
+        was touched. The walk is still right, and free, wherever xterm did
+        the wrapping.
+        """
+        source = _extract(self.js, 'lineSpan')
+        self.assertIn('isWrapped', source)
+        # Joined, not newline-separated: the pieces are one line.
+        self.assertIn("out.join('')", source)
+
+    def test_the_gesture_is_mentioned_once_and_only_once(self):
+        """There is nothing on a terminal to hint at a gesture, and a tip
+        repeated on every attach is noise from the second time onwards."""
+        source = _extract(self.js, 'offerPressHint')
+        self.assertIn('localStorage', source)
+        self.assertIn('setItem', source)
+        self.assertIn('press and hold', source)
+
     def test_copying_does_not_need_a_gesture_to_be_recognised(self):
         """Long press is what everyone reaches for, and twice it has not
         worked on the device that matters while working in every measurement

@@ -2127,6 +2127,124 @@
   // Pinch to zoom the font. The page itself must not zoom -- a zoomed viewport
   // makes a terminal unreadable and unscrollable at once -- so this is the
   // only zoom available, and it is the one that helps.
+  // ── press and hold on the terminal ─────────────────────────────────────
+  // What iOS does natively, done here instead, because natively it does not
+  // happen at all: touch selection over xterm does not work on iOS with any
+  // renderer (xtermjs/xterm.js#3727, open since 2022), and no engine on this
+  // machine reproduces the iOS long press either -- headless Chrome and
+  // WebKit both decline to select a bare <pre> under one. So a gesture built
+  // on their recogniser could be neither made to work nor shown to work.
+  //
+  // This one is a timer of ours: finger down, 500ms, no movement. That is
+  // measurable here, exactly as measurable on the phone, and it puts the
+  // line straight on the clipboard -- which is what the system menu would
+  // have been used for anyway, minus the menu.
+  //
+  // A line, because a line is what gets copied out of a terminal: a path, a
+  // job id, a command worth running again. Anything smaller or spanning
+  // several is what the copy view is still there for.
+  var LONG_PRESS_MS = 500, LONG_PRESS_SLOP = 8;
+  var pressTimer = 0, pressed = null, lineFlash = document.getElementById('lineflash');
+
+  // Said once, ever. A gesture nobody knows about is a gesture that does not
+  // exist, and there is nothing on a terminal to hint at one -- but a tip
+  // repeated on every attach is noise from the second time onwards.
+  var PRESS_HINT = 'atmux.presshint';
+  function offerPressHint() {
+    if (!touch) return;
+    try {
+      if (localStorage.getItem(PRESS_HINT)) return;
+      localStorage.setItem(PRESS_HINT, '1');
+    } catch (e) { return; }
+    setTimeout(function () { say('press and hold a line to copy it'); }, 1200);
+  }
+
+  function rowUnder() {
+    // The rendered rows, so this lands on what is actually on screen rather
+    // than on arithmetic that has to agree with the renderer about padding.
+    var rows = host.querySelector('.xterm-rows');
+    if (!rows) return -1;
+    for (var i = 0; i < rows.children.length; i++) {
+      var box = rows.children[i].getBoundingClientRect();
+      if (lastY >= box.top && lastY <= box.bottom) return i;
+    }
+    return -1;
+  }
+
+  // The whole logical line, not the row that happened to be under the
+  // finger. A path long enough to be worth copying is a path long enough to
+  // wrap, and half of one is worse than none: it looks like it worked.
+  // xterm marks a continuation row isWrapped, so the run is found by walking
+  // out in both directions from wherever the finger landed.
+  function lineSpan(row) {
+    var buf = term.buffer.active;
+    var base = (buf.viewportY || 0) + row;
+    var first = base, last = base;
+    var line = buf.getLine(first);
+    while (line && line.isWrapped && first > 0) {
+      first -= 1;
+      line = buf.getLine(first);
+    }
+    var next = buf.getLine(last + 1);
+    while (next && next.isWrapped) {
+      last += 1;
+      next = buf.getLine(last + 1);
+    }
+    var out = [];
+    for (var i = first; i <= last; i++) {
+      var each = buf.getLine(i);
+      out.push(each ? each.translateToString(true) : '');
+    }
+    return {
+      text: out.join(''),          // joined, not newline-separated: one line
+      first: first - (buf.viewportY || 0),
+      last: last - (buf.viewportY || 0)
+    };
+  }
+
+  // Every row of the run, so what is marked is what will be copied. Marking
+  // one row of a wrapped line would promise the wrong thing.
+  function flashRows(first, last) {
+    if (!lineFlash) return;
+    var rows = host.querySelector('.xterm-rows');
+    var top = rows && rows.children[Math.max(0, first)];
+    var bottom = rows && rows.children[Math.min(rows.children.length - 1,
+                                                last)];
+    if (!top || !bottom) return;
+    var above = top.getBoundingClientRect();
+    var below = bottom.getBoundingClientRect();
+    var frame = host.getBoundingClientRect();
+    lineFlash.style.top = (above.top - frame.top) + 'px';
+    lineFlash.style.height = (below.bottom - above.top) + 'px';
+    lineFlash.style.opacity = '1';
+    lineFlash.hidden = false;
+  }
+
+  function unflash() {
+    if (!lineFlash || lineFlash.hidden) return;
+    lineFlash.style.opacity = '0';
+    setTimeout(function () { lineFlash.hidden = true; }, 220);
+  }
+
+  function cancelPress() {
+    if (pressTimer) { clearTimeout(pressTimer); pressTimer = 0; }
+    pressed = null;
+  }
+
+  function copyLine(text) {
+    var shown = text.length > 32 ? text.slice(0, 31) + '…' : text;
+    var ok = function () { say('copied  ' + shown); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(ok).catch(function () {
+        if (legacyCopy(text)) ok();
+        else say('could not reach the clipboard');
+      });
+      return;
+    }
+    if (legacyCopy(text)) ok();
+    else say('this browser has no clipboard');
+  }
+
   var pinchStart = 0, pinchFont = 0;
   var dragFrom = 0, swiped = false;
   host.addEventListener('touchstart', function (event) {
@@ -2146,6 +2264,27 @@
       moves = 0;
       scrolled = 0;
       showDebug(0);
+      // Where the finger is, now, rather than only once it has moved: a
+      // press that never moves never reaches touchmove, and this is the
+      // gesture that never moves.
+      lastX = event.touches[0].clientX;
+      lastY = event.touches[0].clientY;
+      cancelPress();
+      var from = {x: lastX, y: lastY};
+      pressTimer = setTimeout(function () {
+        pressTimer = 0;
+        var row = rowUnder();
+        if (row < 0) return;
+        var span = lineSpan(row);
+        // A blank row is not something anyone means to copy, and marking one
+        // would be the gesture appearing to work and doing nothing.
+        if (!span.text.trim()) return;
+        pressed = {row: row, text: span.text, from: from};
+        flashRows(span.first, span.last);
+        haptic();
+      }, LONG_PRESS_MS);
+    } else {
+      cancelPress();
     }
   }, { passive: true });
   host.addEventListener('touchmove', function (event) {
@@ -2159,6 +2298,23 @@
     moves += 1;
     lastX = event.touches[0].clientX;
     lastY = event.touches[0].clientY;
+    // Moved, so it is a drag and not a hold. Checked against where the
+    // finger started rather than against the last frame: a slow drag never
+    // moves far in one frame and would hold its way into a copy.
+    if (pressed || pressTimer) {
+      var start = (pressed && pressed.from) || {x: lastX, y: lastY};
+      if (pressTimer && (Math.abs(lastX - start.x) > LONG_PRESS_SLOP ||
+                         Math.abs(lastY - start.y) > LONG_PRESS_SLOP)) {
+        cancelPress();
+      } else if (pressed &&
+                 (Math.abs(lastX - pressed.from.x) > LONG_PRESS_SLOP ||
+                  Math.abs(lastY - pressed.from.y) > LONG_PRESS_SLOP)) {
+        // Already marked, and now the finger is travelling: they changed
+        // their mind into a scroll, and the mark has to go with it.
+        cancelPress();
+        unflash();
+      }
+    }
     var dy = event.touches[0].clientY - dragFrom;
     showDebug(dy);
     // Slop first, so a tap that trembles is still a tap; after that the
@@ -2179,8 +2335,27 @@
   // gesture away mid-drag, and a run of state left over from a drag that
   // never ended seeds the next one wrong -- a pinch that reads as a swipe.
   ['touchend', 'touchcancel'].forEach(function (name) {
-    host.addEventListener(name, function () {
+    host.addEventListener(name, function (event) {
       if (selecting) return;
+      // On the lift, not at the 500ms mark: Safari wants a clipboard write to
+      // sit inside a user gesture, and the end of a touch is one where the
+      // middle of a hold is arguable. The mark appears at 500ms so the wait
+      // is visible; the copy lands when the finger goes.
+      if (pressed && name === 'touchend') {
+        copyLine(pressed.text);
+        unflash();
+        cancelPress();
+        // Nothing else may treat this as a tap or a flick.
+        pinchStart = 0; swiped = false;
+        holdWrites(false);
+        scrolled = 0; pageDebt = 0; wheelDebt = 0;
+        if (owedTimer) { clearTimeout(owedTimer); owedTimer = 0; }
+        payScroll();
+        paintHistory('');
+        return;
+      }
+      cancelPress();
+      unflash();
       pinchStart = 0; swiped = false;
       holdWrites(false);
       // The count belonged to the gesture; what remains is where you are.
@@ -2416,5 +2591,6 @@
   if (boot) boot.style.display = 'none';
   connect();
   checkBuild();
+  offerPressHint();
   term.focus();
 })();

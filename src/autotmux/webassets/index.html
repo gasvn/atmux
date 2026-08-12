@@ -339,6 +339,18 @@
     -webkit-touch-callout: default;
     touch-action: auto;
   }
+  /* What a long press on the terminal marks: the line it is about to copy.
+     Drawn over the terminal rather than by changing the terminal, because
+     the terminal is a grid being repainted from the far end and anything
+     written into it is gone on the next frame. */
+  #lineflash {
+    position: absolute; left: 0; right: 0; z-index: 3;
+    background: rgba(70, 211, 164, .20);
+    border-left: 3px solid #46d3a4;
+    pointer-events: none;
+    transition: opacity 200ms ease-out;
+  }
+  #lineflash[hidden] { display: none; }
   /* One element per line, because a line is the unit people copy and a
      whole-line target is one a thumb can hit. Long-press selection still
      works across them -- they are ordinary text -- but it is no longer the
@@ -774,6 +786,8 @@
 <body>
 <div id="app">
   <div id="term">
+    <!-- Marks the line a long press is about to copy. -->
+    <div id="lineflash" hidden></div>
     <!-- The selecting layer. Empty and hidden until `copy` is tapped, and
          filled from the terminal buffer at that moment: a snapshot is what
          you want to select from, since text that reflows under a long press
