@@ -2431,7 +2431,75 @@ class WarmSlavePool:
 # A pane nobody has touched for a while is usually a finished run or a shell
 # waiting on a prompt.  Surfacing that costs nothing -- tmux already tracks the
 # last activity per session -- and saves opening each one to check.
-_IDLE_STYLES = {'idle': 'yellow', 'stale': 'red'}
+# ── colour, as tokens rather than as names ──────────────────────────────
+# It was `'yellow'` and `'red'`: sixteen-colour names, so what "yellow" meant
+# was whatever the reader's theme said, and two apps side by side agreed on
+# nothing. The shape the current writing settles on is palette -> semantic
+# token -> style, with sixteen colours as the floor and truecolour as an
+# enhancement layer rather than a replacement.
+#
+# So each token carries both, and which one is used depends on what the
+# terminal admits to. Over SSH into a cluster that is often the sixteen, and
+# the design has to be readable there -- if stripping the colour breaks it,
+# the design was leaning on decoration.
+_TRUECOLOR = str(os.environ.get('COLORTERM', '')).lower() in {
+    'truecolor', '24bit'}
+
+_TOKENS = {
+    #            truecolour   sixteen
+    'ok':       ('#3fb950',   'green'),
+    'warn':     ('#d29922',   'yellow'),
+    'danger':   ('#f85149',   'red'),
+    'quiet':    ('#8b8b95',   'bright_black'),
+    'accent':   ('#46d3a4',   'cyan'),
+}
+
+
+def tone(token: str) -> str:
+    """The style for a semantic token, in whatever this terminal has."""
+    pair = _TOKENS.get(token)
+    if not pair:
+        return ''
+    return pair[0] if _TRUECOLOR else pair[1]
+
+
+# Eighths, so a bar is precise to a fraction of a cell rather than to a whole
+# one. Six cells of these resolve forty-eight steps, which is finer than a
+# one-minute load average deserves and costs six columns.
+_EIGHTHS = ' ▏▎▍▌▋▊▉█'
+
+
+def bar(fraction: float, width: int = 6) -> str:
+    """A proportion, drawn.
+
+    `12.60/96` is a division the reader performs; a bar is the answer. This
+    is the thing the current crop of terminal apps is actually known for --
+    btop is the one everybody names, and what it does is draw the numbers.
+    """
+    if not isinstance(fraction, (int, float)) or isinstance(fraction, bool):
+        return ' ' * width
+    if not math.isfinite(fraction):
+        return ' ' * width
+    fraction = max(0.0, min(1.0, float(fraction)))
+    eighths = int(round(fraction * width * 8))
+    full, rest = divmod(eighths, 8)
+    out = '█' * full + (_EIGHTHS[rest] if rest else '')
+    return out.ljust(width)[:width]
+
+
+def load_fraction(load, cpus):
+    """How much of the machine is in use, or None if it cannot be said."""
+    try:
+        load = float(str(load).strip())
+        cpus = float(str(cpus).strip())
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(load) and math.isfinite(cpus)) or cpus <= 0:
+        return None
+    return max(0.0, load / cpus)
+
+
+_IDLE_STYLES = {'idle': tone('warn'), 'stale': tone('danger')}
 
 
 def _apply_idle_thresholds() -> None:
@@ -2573,10 +2641,59 @@ def _compose_session(r, widths, tail: str, total: int) -> rich.text.Text:
     # What the session was doing, which is the question the row raises and
     # the one no column of measurements answers. Already collected: the
     # daemon snapshots every pane on a timer for the preview.
-    room = max(0, total - (lead + name + where + 6))
+    # The two numbers that were dropped when this became one line, back as
+    # shapes and only when they have something to say. Both were columns of
+    # figures the reader had to do arithmetic on -- `12.60/96` is a division,
+    # and a walltime three days out is a number nobody acts on.
+    rail = _row_rail(r)
+    room = max(0, total - (lead + name + where + 6) - rail.cell_len)
     if tail:
         line.append(tail[:room] if len(tail) <= room else tail[:room - 1] + '…')
+    if rail.cell_len:
+        line.append(' ' * max(1, room - _visible_len(tail, room)))
+        line.append_text(rail)
     return line
+
+
+def _visible_len(text: str, room: int) -> int:
+    return min(len(text or ''), room)
+
+
+# Under this much walltime the number stops being background and starts
+# being the thing you act on. Above it, a session that ends in two days is
+# not news and the column it would cost is better spent on the output.
+_WALL_URGENT = 2 * 3600
+_WALL_CRITICAL = 30 * 60
+# And a machine is only worth remarking on when it is actually loaded.
+_LOAD_BUSY = 0.75
+
+
+def _row_rail(r) -> rich.text.Text:
+    """The right-hand rail: what is abnormal about this row, if anything.
+
+    Silence is the healthy state. A rail that always shows a load bar and a
+    walltime is six columns of "everything is fine" on every row, which is
+    the reading the bands already give for free.
+    """
+    rail = rich.text.Text()
+    if r[1] in (_OFFLINE_SESSION, _START_SHELL_SESSION):
+        # Neither number means anything here. An unreachable node's walltime
+        # is whatever it last said before it went, and a login node runs at
+        # five times its core count all day -- drawing that in red on every
+        # one of them is a warning about the normal state of the machine.
+        return rail
+    seconds = keepalive.parse_time_left(str(r[3] or '').strip())
+    if (seconds is not None and math.isfinite(seconds)
+            and seconds <= _WALL_URGENT):
+        style = tone('danger') if seconds <= _WALL_CRITICAL else tone('warn')
+        rail.append(_time_left_label(r[3]).rjust(6), style=style)
+    share = load_fraction(r[6], r[5])
+    if share is not None and share >= _LOAD_BUSY:
+        if rail.cell_len:
+            rail.append(' ')
+        rail.append(bar(share, 6),
+                    style=tone('danger') if share >= 1.0 else tone('warn'))
+    return rail
 
 
 def _heading(title: str, note: str = '', key: str = '') -> rich.text.Text:
@@ -3590,7 +3707,10 @@ class AutotmuxApp(App):
         height: 100%;
         background: $surface;
         padding: 0 1;
-        border-left: solid $primary;
+        /* Round, like every modal in this file already is. Sharp corners on
+           the one surface people spend their time in, round everywhere else,
+           was not a choice -- it was the main screen never being revisited. */
+        border-left: round $primary;
     }
     /* Which pane the arrow keys are steering. Both rules are one cell wide,
        so lighting one up never reflows anything -- the alternative, a border
@@ -3611,7 +3731,7 @@ class AutotmuxApp(App):
     #jobs_scroll {
         height: auto;
         max-height: 14;
-        border-top: solid $primary;
+        border-top: round $primary;
         padding: 0 1;
         overflow-x: auto;
     }

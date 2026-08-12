@@ -727,11 +727,15 @@ class IdleMarkerTests(unittest.TestCase):
         quiet = self._lead_cell('● 15m Active')
         stale = self._lead_cell('● 2h Active')
         self.assertEqual([(s.start, s.end) for s in quiet.spans], [(0, 1)])
-        self.assertEqual(str(quiet.spans[0].style), 'yellow')
-        self.assertEqual(str(stale.spans[0].style), 'red')
+        # The token, not the literal: which colour "warn" is depends on
+        # whether the terminal admits to truecolour. That it escalates, and
+        # that the two tiers differ, does not.
+        self.assertEqual(str(quiet.spans[0].style), autotmux.tone('warn'))
+        self.assertEqual(str(stale.spans[0].style), autotmux.tone('danger'))
+        self.assertNotEqual(autotmux.tone('warn'), autotmux.tone('danger'))
         # An hour expressed in minutes is the same tier as one expressed in h.
         self.assertEqual(str(self._lead_cell('● 60m Active').spans[0].style),
-                         'red')
+                         autotmux.tone('danger'))
 
     def test_ordinary_status_text_is_left_unstyled(self):
         for text in ('Active', 'OFFLINE: boom', 'No sessions'):

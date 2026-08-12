@@ -1453,8 +1453,14 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_idle_marker_leads_and_is_coloured_by_tier(self):
         lines = await self._lines(self.IDLE_STATE)
         self.assertTrue(str(lines['quiet']).startswith('● 15m'))
-        self.assertEqual(str(lines['quiet'].spans[0].style), 'yellow')
-        self.assertEqual(str(lines['old'].spans[0].style), 'red')
+        # The token, not the literal. Which colour "warn" is depends on
+        # whether the terminal admits to truecolour; that it escalates, and
+        # that the two differ, does not.
+        self.assertEqual(str(lines['quiet'].spans[0].style),
+                         autotmux.tone('warn'))
+        self.assertEqual(str(lines['old'].spans[0].style),
+                         autotmux.tone('danger'))
+        self.assertNotEqual(autotmux.tone('warn'), autotmux.tone('danger'))
 
     async def test_a_busy_session_leads_with_nothing(self):
         """Silence is the healthy state, so it says nothing at all."""
@@ -1506,6 +1512,59 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('gpu1', str(line))
         self.assertNotIn('<offline>', str(line))
         self.assertIn('OFFLINE', str(line))
+
+    async def test_a_proportion_is_drawn_rather_than_divided(self):
+        """`12.60/96` is a division the reader performs. This is the thing
+        the current crop of terminal apps is actually known for."""
+        self.assertEqual(autotmux.bar(0.0, 6), '      ')
+        self.assertEqual(autotmux.bar(0.5, 6), '███   ')
+        self.assertEqual(autotmux.bar(1.0, 6), '██████')
+        # Eighths, so it is precise to a fraction of a cell.
+        self.assertIn('▌', autotmux.bar(0.5 + 1 / 12, 6))
+        # Nothing off the end, whatever it is handed.
+        for odd in (1.5, -3, float('nan'), None, True, 'x'):
+            with self.subTest(value=odd):
+                self.assertEqual(len(autotmux.bar(odd, 6)), 6)
+
+    async def test_the_design_survives_sixteen_colours(self):
+        """Over SSH into a cluster, sixteen is often all there is -- and if
+        stripping the colour breaks the design, the design was leaning on
+        decoration. Each token carries both, and the terminal decides."""
+        for token in ('ok', 'warn', 'danger', 'quiet', 'accent'):
+            with self.subTest(token=token):
+                rich_, plain = autotmux._TOKENS[token]
+                self.assertTrue(rich_.startswith('#'))
+                self.assertFalse(plain.startswith('#'))
+        self.assertNotEqual(autotmux._TOKENS['warn'][1],
+                            autotmux._TOKENS['danger'][1])
+        self.assertEqual(autotmux.tone('nonsense'), '')
+
+    async def test_the_rail_stays_quiet_until_there_is_something_to_say(self):
+        """Silence is the healthy state. A load bar and a walltime on every
+        row is six columns of "everything is fine" repeated down the screen,
+        which is the reading the bands already give for free."""
+        def row(node, session, left, load, cpu):
+            return (node, session, '1', left, '', cpu, load)
+        # Nothing abnormal: no rail at all.
+        self.assertEqual(
+            autotmux._row_rail(row('gpu1', 'a', '2-00:00:00', '4.0', '96')).plain,
+            '')
+        # A walltime running out, and a machine that is full.
+        rail = autotmux._row_rail(row('gpu1', 'a', '0:22:14', '94.0', '96')).plain
+        self.assertIn('22m', rail)
+        self.assertIn('█', rail)
+
+    async def test_neither_number_means_anything_on_a_placeholder(self):
+        """An unreachable node's walltime is whatever it last said before it
+        went, and a login node runs at five times its core count all day --
+        drawing that in red on every one of them is a warning about the
+        normal state of the machine."""
+        for session in (autotmux._OFFLINE_SESSION,
+                        autotmux._START_SHELL_SESSION):
+            with self.subTest(session=session):
+                rail = autotmux._row_rail(
+                    ('login--a', session, '1', '0:10:00', '', '32', '182.0'))
+                self.assertEqual(rail.plain, '')
 
     async def test_a_narrow_screen_keeps_the_part_of_a_name_that_differs(self):
         """Cut from the right, holygpu8a15104 / 15304 / 15602 all become
