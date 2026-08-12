@@ -1513,6 +1513,70 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('<offline>', str(line))
         self.assertIn('OFFLINE', str(line))
 
+    async def test_the_top_line_answers_the_question_the_screen_is_for(self):
+        """Textual's stock Header draws a name, a clock space and a subtitle,
+        so the widest line on the screen said `atmux` and then, usually,
+        nothing -- and it read as a Textual app rather than as this one.
+
+        What belongs there is whether anything is wrong. Counted off the same
+        plan the table is built from, so the header and the bands under it
+        cannot disagree about how many things stopped.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                line = str(app.query_one('#statusline').render())
+                self.assertIn('atmux', line)
+                bands = [str(app.table.get_cell_at(Coordinate(r, 0)))
+                         for r in sorted(app.table.heading_rows)]
+                for band in bands:
+                    title = band.replace('── ', '').rsplit(' ', 1)[0].strip()
+                    if title in autotmux.AutotmuxApp._BAND_TONES:
+                        with self.subTest(band=title):
+                            self.assertIn(title, line)
+
+    async def test_a_key_is_never_hidden_by_being_switched_off(self):
+        """Filtering the footer by focus took `z`, `s` and `g` out of service
+        whenever the keyboard was on the list, because Textual's False means
+        disabled as well as hidden and there is no "works but is not
+        advertised". A key that stops working because you looked at another
+        pane is a worse bug than a long footer.
+
+        So the footer is short by demotion, and check_action only ever
+        retires a key that would genuinely do nothing where it is.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                for pane in ('1', '2', '3'):
+                    await pilot.press(pane)
+                    await pilot.pause()
+                    for action in ('cycle_layout', 'open_shell',
+                                   'manage_connections', 'toggle_jobs_view'):
+                        with self.subTest(pane=pane, action=action):
+                            self.assertIsNot(
+                                app.check_action(action, ()), False,
+                                f'{action} was switched off in pane {pane}')
+
+    async def test_escape_is_retired_only_where_it_would_do_nothing(self):
+        """There is no back from the list; everywhere else it is the way
+        out, and the footer says so there and not here."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await pilot.press('1')
+                await pilot.pause()
+                self.assertFalse(app.check_action('focus_table', ()))
+                await pilot.press('2')
+                await pilot.pause()
+                self.assertTrue(app.check_action('focus_table', ()))
+
     async def test_a_proportion_is_drawn_rather_than_divided(self):
         """`12.60/96` is a division the reader performs. This is the thing
         the current crop of terminal apps is actually known for."""
@@ -2169,15 +2233,24 @@ class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
 
     def test_every_footer_label_names_what_it_acts_on(self):
         """"Shell" and "Local Shell" gave no clue which machine they land on."""
-        shown = {b.key: b.description
-                 for b in autotmux.AutotmuxApp.BINDINGS if b.show}
-        self.assertEqual(shown['s'], 'SSH to node')
+        # Every label, not only the advertised ones: a key demoted out of the
+        # footer still appears in `?`, and that is where it has to read well.
+        labelled = {b.key: b.description for b in autotmux.AutotmuxApp.BINDINGS}
+        self.assertEqual(labelled['s'], 'SSH to node')
         # Shortened from "Attach in new window", which alone pushed the footer
         # past 120 columns and made Textual clip "q Quit" to "q Q".
-        self.assertEqual(shown['o'], 'New window')
-        self.assertEqual(shown['k'], 'Auto-renew job')
-        self.assertEqual(shown['g'], 'Clusters')
-        for description in shown.values():
+        self.assertEqual(labelled['o'], 'New window')
+        self.assertEqual(labelled['k'], 'Auto-renew job')
+        self.assertEqual(labelled['g'], 'Clusters')
+        shown = {b.key: b.description
+                 for b in autotmux.AutotmuxApp.BINDINGS if b.show}
+        # Six eligible, and never six at once: `esc` is retired by
+        # check_action on the list, where there is no back from the list. So
+        # five are drawn, which is where the current writing lands -- and the
+        # other fifteen are in `?` and all of them still work.
+        self.assertLessEqual(len(shown), 6)
+        self.assertIn('escape', shown)
+        for description in labelled.values():
             self.assertEqual(description, description.strip())
             self.assertTrue(description[:1].isupper() or description[:1] == '↑')
 

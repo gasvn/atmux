@@ -2731,6 +2731,42 @@ def _band_cells(title: str, count: int) -> tuple:
     """
     return _heading(title, str(count))
 
+class StatusLine(Static):
+    """The top line, replacing Textual's stock Header.
+
+    The stock one draws a name, a clock space and a subtitle -- so the widest
+    line on the screen said `atmux` and then, most of the time, nothing. It
+    also reads as a Textual app rather than as this one, which is what stock
+    chrome always reads as.
+
+    What belongs there is the answer to the question the screen exists for:
+    is anything wrong. The bands below already sort by it; this counts them,
+    so "four things stopped" arrives before any row is read.
+    """
+
+    DEFAULT_CSS = """
+    StatusLine {
+        dock: top;
+        height: 1;
+        padding: 0 1;
+        background: $panel;
+    }
+    """
+
+    def show(self, counts, warning: str = '') -> None:
+        line = rich.text.Text()
+        line.append('atmux', style='bold')
+        for title, count, token in counts:
+            line.append('   ')
+            line.append(f'{count} ', style=tone(token))
+            line.append(title, style=tone('quiet'))
+        if warning:
+            line.append('   ')
+            line.append(warning, style=tone(
+                'danger' if '⚠' in warning else 'quiet'))
+        self.update(line)
+
+
 class ClickToAttachDataTable(DataTable):
     """A DataTable where a *single* mouse click selects the clicked row.
 
@@ -3763,14 +3799,20 @@ class AutotmuxApp(App):
     # Rarely-used keys are hidden from the footer and listed in help instead,
     # so the visible row stays readable on a narrow terminal.
     BINDINGS = [
-        Binding("s", "open_shell", "SSH to node"),
+        Binding("s", "open_shell", "SSH to node", show=False),
         Binding("o", "new_window", "New window"),
         Binding("k", "toggle_keepalive", "Auto-renew job"),
         # Hidden, not demoted: the jobs panel prints "[j: switch view]" in its
         # own title, so the key is advertised exactly where it applies. That
         # buys the footer the room for `z`, which has nowhere else to appear.
-        Binding("j", "toggle_jobs_view", "Jobs panel", show=False),
-        Binding("z", "cycle_layout", "Layout"),
+        # Shown, and then hidden by check_action everywhere it does not
+        # apply. A key that is only advertised where it works is the whole
+        # point; `show=False` made it invisible even in the one pane it acts
+        # on, which is why the queue's own title had to advertise it.
+        # Advertised in the queue's own title instead of the footer: it acts
+        # on one pane, and a heading is nearer that pane than the footer is.
+        Binding("j", "toggle_jobs_view", "Running / pending", show=False),
+        Binding("z", "cycle_layout", "Layout", show=False),
         # Which pane the arrows steer. Tab is Textual's own, bound again here
         # only so the footer says so: a pane you cannot reach is the same as a
         # pane that is not there, and for the preview and the queue that was
@@ -3784,12 +3826,12 @@ class AutotmuxApp(App):
         Binding("tab", "focus_next", "Panes", priority=True),
         Binding("shift+tab", "focus_previous", "Panes", show=False,
                 priority=True),
-        Binding("escape", "focus_table", "Back to sessions", show=False),
+        Binding("escape", "focus_table", "Back to list"),
         Binding("1", "focus_pane('table')", "Sessions pane", show=False),
         Binding("2", "focus_pane('jobs')", "Jobs pane", show=False),
         Binding("3", "focus_pane('preview')", "Preview pane", show=False),
         Binding("w", "web_dashboard", "Web", show=False),
-        Binding("g", "manage_connections", "Clusters"),
+        Binding("g", "manage_connections", "Clusters", show=False),
         Binding("e", "edit_note", "Note", show=False),
         Binding("n", "new_session", "New session", show=False),
         Binding("x", "kill_session", "Kill session", show=False),
@@ -3918,7 +3960,7 @@ class AutotmuxApp(App):
         # remote/SSH terminal is a constant trickle of redraws even while the
         # app is idle. Keeping the header static makes an idle atmux silent on
         # the wire.
-        yield Header()
+        yield StatusLine(id='statusline')
         # The queue belongs under the list, not under both panes.
         #
         # It used to be a child of the screen, so it ran the full width while
@@ -4403,6 +4445,7 @@ class AutotmuxApp(App):
         if sig == self._last_rows_sig:
             # Nothing changed at all — just refresh the subtitle.
             self.sub_title = self._status_subtitle(state, rows, updated)
+            self._paint_status(rows, state, updated)
             # Warm slaves can die without any daemon-state change. Recheck so
             # the fast attach path is eventually replenished.
             if rows:
@@ -4444,6 +4487,7 @@ class AutotmuxApp(App):
             # next structural change.
             self._last_rows_sig = sig if ok else None
             self.sub_title = self._status_subtitle(state, rows, updated)
+            self._paint_status(rows, state, updated)
             self._dispatch_warm(rows)
             return
         self._last_rows_sig = sig
@@ -4525,6 +4569,7 @@ class AutotmuxApp(App):
             self.log_view.update("")
 
         self.sub_title = self._status_subtitle(state, rows, updated)
+        self._paint_status(rows, state, updated)
         self._dispatch_warm(rows)
 
     # ── keep-alive display ───────────────────────────────────────────────────
@@ -4743,6 +4788,33 @@ class AutotmuxApp(App):
                         timeout=7, markup=False)
         finally:
             self._recovery_inflight = False
+
+    # Which token each band is counted in. The bands already say how much a
+    # row wants a decision; this is the same judgement, coloured.
+    _BAND_TONES = {'not reachable': 'danger', 'just stopped': 'warn',
+                   'working': 'ok', 'quiet a while': 'quiet'}
+
+    def _paint_status(self, rows, state, updated) -> None:
+        """The top line, from the same plan the table is built from.
+
+        Counted off the plan rather than recomputed, so the header and the
+        bands under it cannot disagree about how many things stopped.
+        """
+        try:
+            line = self.query_one('#statusline', StatusLine)
+        except Exception:
+            return
+        counts = []
+        for entry in plan_rows(rows):
+            if entry[0] != 'band' or entry[1] not in self._BAND_TONES:
+                continue
+            counts.append((entry[1], entry[2], self._BAND_TONES[entry[1]]))
+        warning = self._status_subtitle(state, rows, updated)
+        # The healthy subtitle is a count of sessions, which the bands now
+        # say better. Only what is wrong earns a place up here.
+        if '⚠' not in warning and 'daemon' not in warning.lower():
+            warning = ''
+        line.show(counts, warning)
 
     def _status_subtitle(self, state, rows, updated) -> str:
         gateway_info = state.get('gateway') if isinstance(state, dict) else None
@@ -4968,8 +5040,7 @@ class AutotmuxApp(App):
             when = f'  ⚠ {fmt_age(age)} old'
         else:
             when = f'  {fmt_age(age)} old'
-        head = _heading(title[0], (title[1] + when).strip(),
-                        'j: switch · 2: scroll')
+        head = _heading(title[0], (title[1] + when).strip(), 'j: switch')
         self.jobs_view.update(head + rich.text.Text('\n' + text))
 
     async def action_toggle_jobs_view(self) -> None:
@@ -5168,6 +5239,32 @@ class AutotmuxApp(App):
         except Exception as error:
             self.notify(f'could not open the web dashboard · {error}',
                         severity='error', timeout=6, markup=False)
+
+    # ── what the footer shows ────────────────────────────────────────────
+    # Five, not eight. The current writing settles on three to five in the
+    # footer and everything in `?`, and eight of twenty-one was neither.
+    #
+    # Done by demoting keys rather than by check_action. False there means
+    # disabled *and* hidden -- there is no "works but is not advertised" --
+    # so filtering the footer by focus took `z`, `s` and `g` out of service
+    # whenever the keyboard was on the list. A key that stops working
+    # because you looked at another pane is a worse bug than a long footer.
+    #
+    # Demoted keys lose nothing but the advertisement: they still work from
+    # anywhere, `?` lists all twenty-one, and the panes that own a key still
+    # get it in their own footer through check_action below.
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        """Whether a binding applies where the keyboard currently is.
+
+        Only ever used to retire a key that would do nothing here -- never to
+        tidy the footer, because False disables as well as hides.
+        """
+        if action == 'focus_table':
+            # `esc` goes back to the list, and there is no back from the
+            # list. Everywhere else it is the way out.
+            return getattr(self.focused, 'id', None) != 'left_pane'
+        return True
 
     # ── which pane the keyboard is pointed at ────────────────────────────
     # Tab cycles; the digits are for going straight there, which is what you
