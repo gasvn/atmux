@@ -1411,23 +1411,30 @@ def _notify_started_jobs(node_infos: dict) -> None:
             log.warning(f'could not start notice thread: {error}')
 
 
-def _idle_tail(entry: dict) -> str:
-    """The line the session stopped on, or '' if it cannot be had cheaply.
+def _idle_tail(entry: dict) -> list:
+    """The lines the session stopped on, or [] if they cannot be had cheaply.
 
     Runs on the delivery thread, once per quiet spell rather than per poll, and
     under the same per-node network budget as everything else -- so a node that
-    is already struggling spends nothing here. A notice with no quoted line is
+    is already struggling spends nothing here. A notice with no quoted lines is
     the old notice, which is still worth sending; a notice delayed behind a
     hanging capture is not.
+
+    The capture costs the same whether one line is kept or twenty: it is one
+    pane, already fetched. Only the message gets longer.
     """
     if not _notify_cfg.get('idle_tail'):
-        return ''
+        return []
+    count = int(_notify_cfg.get('idle_tail_lines',
+                                config.NOTIFY_DEFAULTS['idle_tail_lines']))
+    if count <= 0:
+        return []
     try:
         content = _capture_pane(entry['node'], entry['session'], 'idle-notice')
-        return notify.last_output_line(content)
+        return notify.last_output_lines(content, count)
     except Exception as error:
         log.warning(f'idle notice tail unavailable: {error}')
-        return ''
+        return []
 
 
 def _notify_idle_sessions(node: str, info: dict) -> None:

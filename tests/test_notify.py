@@ -288,6 +288,161 @@ class LastOutputLineTests(unittest.TestCase):
         self.assertEqual(notify.last_output_line(pane), 'old')
 
 
+class LastOutputLinesTests(unittest.TestCase):
+    """Several lines, cleaned the same way one was, and in reading order."""
+
+    def test_returns_them_oldest_first(self):
+        pane = 'one\ntwo\nthree\nfour\n'
+        self.assertEqual(notify.last_output_lines(pane, 3),
+                         ['two', 'three', 'four'])
+
+    def test_blank_padding_below_the_output_is_not_content(self):
+        """A pane is a fixed-height grid, so the space under the last line is
+        padding. Quoting it would spend the whole budget on nothing."""
+        pane = 'one\ntwo\n\n   \n\n'
+        self.assertEqual(notify.last_output_lines(pane, 4), ['one', 'two'])
+
+    def test_asking_for_more_than_there_is_returns_what_there_is(self):
+        self.assertEqual(notify.last_output_lines('only\n', 10), ['only'])
+
+    def test_a_block_of_furniture_is_still_skipped(self):
+        """The same rule as for one line: a status block under the pane's
+        last separator is what the program is, not what it has been doing."""
+        pane = ('real work here\n'
+                'more real work\n'
+                '────────────────────────\n'
+                '│ auto mode on · ✓ ready │\n'
+                '│ ▪ 3 files · ❯ ready    │\n')
+        self.assertEqual(notify.last_output_lines(pane, 2),
+                         ['real work here', 'more real work'])
+
+    def test_several_lines_reach_past_furniture_one_line_cannot(self):
+        """A single status line below the rule is deliberately kept -- with
+        one line to spend, discarding a real last line is worse than quoting
+        a status bar, so `_strip_trailing_chrome` leaves it.
+
+        That trade is what made the one-line notice weak for a full-screen
+        program, and it is the thing this fixes: the status bar is still
+        quoted, and now the work above it comes too.
+        """
+        pane = ('Epoch 39/40 loss 0.31\n'
+                'Epoch 40/40 done\n'
+                '────────────────────────\n'
+                '│ auto mode on          │\n')
+        self.assertEqual(notify.last_output_line(pane), '│ auto mode on │')
+        self.assertEqual(
+            notify.last_output_lines(pane, 3),
+            ['Epoch 39/40 loss 0.31', 'Epoch 40/40 done', '│ auto mode on │'])
+
+    def test_every_line_is_capped_not_just_the_message(self):
+        pane = 'short\n' + 'x' * 500
+        got = notify.last_output_lines(pane, 2)
+        self.assertEqual(len(got[-1]), notify.TAIL_LIMIT)
+        self.assertTrue(got[-1].endswith('…'))
+
+    def test_one_line_agrees_with_the_singular_helper(self):
+        """They are the same code now; the singular one is the plural one
+        asked for one. A second implementation would drift."""
+        for pane in ('a\nb\nc\n', '', 'x' * 500, '\x1b[31mred\x1b[0m\n'):
+            with self.subTest(pane=pane[:12]):
+                found = notify.last_output_lines(pane, 1)
+                self.assertEqual(found[-1] if found else '',
+                                 notify.last_output_line(pane))
+
+    def test_indentation_is_kept_because_a_block_can_show_it(self):
+        """A traceback, a diff, a YAML dump and a tree listing all say
+        something in their indentation, and these land in a code block, which
+        preserves it. Runs of padding a terminal used to reach a column say
+        nothing and would push the text off a phone, so those still go."""
+        pane = ('Traceback (most recent call last):\n'
+                '  File "train.py", line 61, in main\n'
+                '    opt   =    build(cfg["lr"])\n'
+                "KeyError: 'lr'\n")
+        self.assertEqual(notify.last_output_lines(pane, 4), [
+            'Traceback (most recent call last):',
+            '  File "train.py", line 61, in main',
+            '    opt = build(cfg["lr"])',
+            "KeyError: 'lr'",
+        ])
+
+    def test_the_singular_helper_has_no_indent_to_show(self):
+        """It goes inline into a sentence -- "Last line: ..." -- where a
+        leading indent is a gap rather than a shape."""
+        self.assertEqual(notify.last_output_line('    indented\n'), 'indented')
+
+    def test_an_absurd_indent_does_not_eat_the_width(self):
+        deep = ' ' * 40 + 'still readable'
+        self.assertEqual(notify.last_output_lines(deep, 1),
+                         [' ' * notify._MAX_INDENT + 'still readable'])
+
+    def test_a_silly_count_still_returns_something_sane(self):
+        for count in (0, -3):
+            with self.subTest(count=count):
+                self.assertEqual(notify.last_output_lines('a\nb\n', count),
+                                 ['b'])
+
+
+class FencedMessageTests(unittest.TestCase):
+    """What several lines have to survive on the way into a chat client."""
+
+    ENTRY = {'session': 'train', 'node': 'gpu1', 'idle': 900}
+
+    def test_a_block_is_closed_and_the_links_are_outside_it(self):
+        """The links are appended to the last line, and with a block that
+        line is the closing fence -- so a link put there lands inside the
+        fence and stops it closing."""
+        entry = dict(self.ENTRY, tail=['first', 'second'])
+        text = notify.build_idle_message(
+            entry, link=True, web='https://host.example')
+        self.assertEqual(text.count('```'), 2)
+        body = text[text.index('```') + 3:text.rindex('```')]
+        self.assertNotIn('|Attach>', body)
+        self.assertNotIn('|Browser>', body)
+        self.assertIn('|Browser>', text)
+
+    def test_truncation_never_leaves_a_fence_open(self):
+        """A message cut between the markers arrives with one ``` and renders
+        the rest of the conversation as code -- not just the rest of itself.
+        """
+        entry = dict(self.ENTRY,
+                     tail=[f'line {n} ' + 'y' * 100 for n in range(60)])
+        text = notify.build_idle_message(entry)
+        self.assertLessEqual(len(text), notify._MAX_TEXT)
+        self.assertEqual(text.count('```') % 2, 0,
+                         'a fence was left open by the cut')
+
+    def test_the_indentation_survives_into_the_message(self):
+        """The helper kept it and the message then stripped it off again --
+        invisibly, because the helper's own tests passed the whole time. They
+        tested the helper, not the thing it ends up in. This tests the thing
+        it ends up in.
+        """
+        entry = dict(self.ENTRY, tail=[
+            'Traceback (most recent call last):',
+            '  File "train.py", line 61, in main',
+            '    opt = build(cfg["lr"])',
+            "KeyError: 'lr'",
+        ])
+        text = notify.build_idle_message(entry)
+        block = text[text.index('```') + 4:text.rindex('```')]
+        self.assertIn('  File "train.py", line 61, in main', block)
+        self.assertIn('    opt = build(cfg["lr"])', block)
+
+    def test_a_plain_string_tail_still_works(self):
+        """The field used to be a string, and a daemon that has not been
+        restarted still sends one."""
+        text = notify.build_idle_message(dict(self.ENTRY, tail='CUDA OOM'))
+        self.assertIn('Last line: CUDA OOM', text)
+        self.assertNotIn('```', text)
+
+    def test_no_tail_says_nothing_about_lines(self):
+        for empty in ([], '', None):
+            with self.subTest(tail=empty):
+                text = notify.build_idle_message(dict(self.ENTRY, tail=empty))
+                self.assertNotIn('Last', text)
+                self.assertNotIn('```', text)
+
+
 class WebAttachUrlTests(unittest.TestCase):
     """The link a phone can actually follow.
 
@@ -609,11 +764,48 @@ class IdleAnnouncementTests(unittest.TestCase):
         self._poll(900)
         self.assertEqual(len(self.sent), 1)
 
-    def test_the_notice_quotes_the_line_the_session_stopped_on(self):
+    def test_the_notice_quotes_what_the_session_stopped_on(self):
+        """Several lines, not one.
+
+        One line answers "did it finish or did it break" only when the answer
+        fits on one line -- a traceback's last line is `KeyError: 'lr'` and
+        the useful part is the frames above it. The capture costs the same
+        either way: it is one pane, already fetched, and only the message
+        gets longer.
+        """
         with mock.patch.object(daemon, '_capture_pane',
                                return_value='setup\n\x1b[31mCUDA OOM\x1b[0m\n'):
             self._poll(900)
+        # Fenced, because several lines read as output rather than as a
+        # sentence -- and a fence keeps the alignment and stops a line
+        # starting with # or > being eaten as chat markdown.
+        self.assertIn('Last 2 lines:\n```\nsetup\nCUDA OOM\n```', self.sent[0])
+
+    def test_one_line_is_still_a_sentence_rather_than_a_block(self):
+        """A code block around a single line is ceremony: three lines of
+        message for one line of content."""
+        daemon._notify_cfg['idle_tail_lines'] = 1
+        with mock.patch.object(daemon, '_capture_pane',
+                               return_value='setup\nCUDA OOM\n'):
+            self._poll(900)
         self.assertIn('Last line: CUDA OOM', self.sent[0])
+        self.assertNotIn('```', self.sent[0])
+
+    def test_how_many_lines_is_a_setting(self):
+        daemon._notify_cfg['idle_tail_lines'] = 3
+        pane = '\n'.join(f'row {n}' for n in range(20))
+        with mock.patch.object(daemon, '_capture_pane', return_value=pane):
+            self._poll(900)
+        self.assertIn('Last 3 lines:\n```\nrow 17\nrow 18\nrow 19\n```',
+                      self.sent[0])
+
+    def test_zero_lines_quotes_nothing_without_disabling_the_notice(self):
+        daemon._notify_cfg['idle_tail_lines'] = 0
+        with mock.patch.object(daemon, '_capture_pane') as capture:
+            self._poll(900)
+        capture.assert_not_called()
+        self.assertIn('finished or stalled', self.sent[0])
+        self.assertNotIn('Last', self.sent[0])
 
     def test_idle_tail_can_be_turned_off(self):
         """One line of terminal output leaving the cluster is its own decision,

@@ -130,6 +130,12 @@ NOTIFY_DEFAULTS = {
     # session left quiet is announced once, not every poll.
     'idle_notify': 300,
     'idle_cooldown': 3600,  # shortest gap between notices for one session
+    # How many lines of the stopped pane the notice quotes. One is a sentence
+    # and answers "did it finish or did it break" only when the answer fits on
+    # one line -- a traceback's last line is `KeyError: 'lr'` and the useful
+    # part is the frames above it. Several arrive as a code block instead.
+    # 1 is the old behaviour; 0 quotes nothing, as idle_tail = false does.
+    'idle_tail_lines': 8,
     # Append a clickable atmux:// link. Opt-in: the scheme only resolves where
     # the URL handler is installed, and a dead link is worse than none.
     'attach_link': False,
@@ -165,6 +171,10 @@ _NOTIFY_NUMBER_RULES = {
     # disable the webhook that job-expiry reminders also use.
     'idle_notify': (float, 0.0, 86_400.0),
     'idle_cooldown': (float, 60.0, 604_800.0),
+    # An int, and capped: the notice is a chat message, and past a couple of
+    # dozen lines it stops being a summary someone reads on a phone and
+    # becomes a wall that hides the sentence above it. 0 quotes nothing.
+    'idle_tail_lines': (int, 0.0, 40.0),
 }
 
 # The browser client.  Empty by default, which is the historical behaviour:

@@ -472,6 +472,67 @@ def _strip_trailing_chrome(lines: list[str]) -> list[str]:
     return lines[:cut] if furniture / len(below) >= 0.6 else lines
 
 
+# How far a line may be indented before the indent is costing more than it
+# says. Deep enough for a traceback frame or a nested YAML key; not deep
+# enough for a wrapped line that begins in the middle of a phone's width.
+_MAX_INDENT = 12
+
+
+def _clean_line(raw: str) -> str:
+    """One pane line, with everything a chat client cannot show removed.
+
+    Leading whitespace is kept and the rest collapsed. A traceback, a diff, a
+    YAML dump and a tree listing all say something in their indentation, and
+    the message these end up in is a code block, which preserves it -- while
+    the runs of padding a terminal uses to reach a column say nothing and
+    would push the useful text off the right of a phone.
+    """
+    flat = _CONTROL_RE.sub('', _ANSI_RE.sub('', raw)).expandtabs(4)
+    body = ' '.join(flat.split())
+    if not body:
+        return ''
+    indent = len(flat) - len(flat.lstrip())
+    return ' ' * min(indent, _MAX_INDENT) + body
+
+
+def last_output_lines(content, count: int = 1,
+                      limit: int = TAIL_LIMIT) -> list[str]:
+    """The last ``count`` lines of a pane that actually say something.
+
+    One line is often not enough to answer the question the notice raises.
+    A traceback's last line is ``KeyError: 'lr'`` and the useful part is the
+    three frames above it; a training run's last line is the epoch and the
+    interesting part is the loss trend before it. Reading a screen also means
+    the single last line of a full-screen program is its status bar no matter
+    what it has been doing -- and while several lines cannot fix that, they
+    do reach past it to the output underneath.
+
+    Blank lines are dropped rather than kept: a pane is a fixed-height grid,
+    so the space below the last output is padding, not content, and quoting
+    it would spend the whole budget on nothing.
+    """
+    if not isinstance(content, str) or not content:
+        return []
+    count = max(1, int(count))
+    limit = max(8, int(limit))
+    lines = [_clean_line(raw) for raw in content.splitlines()[-200:]]
+    kept: list[str] = []
+    for line in reversed(_strip_trailing_chrome(lines)):
+        # Require a letter or a digit somewhere, and reject separators even
+        # when a program has centred a word inside one. Rules, borders,
+        # spinners and bare prompts are the last thing on screen often enough
+        # to be worth stepping over, and none of them say anything.
+        if not line or not any(ch.isalnum() for ch in line):
+            continue
+        if _looks_like_rule(line):
+            continue
+        kept.append(line if len(line) <= limit else line[:limit - 1] + '…')
+        if len(kept) >= count:
+            break
+    kept.reverse()
+    return kept
+
+
 def last_output_line(content, limit: int = TAIL_LIMIT) -> str:
     """The last line of a pane that actually says something.
 
@@ -488,19 +549,26 @@ def last_output_line(content, limit: int = TAIL_LIMIT) -> str:
     line is a status bar no matter what it has been doing.  There is no fixing
     that from here: for a TUI the last line genuinely is the status bar.
     """
-    if not isinstance(content, str) or not content:
-        return ''
-    lines = [' '.join(_CONTROL_RE.sub('', _ANSI_RE.sub('', raw)).split())
-             for raw in content.splitlines()[-200:]]
-    for line in reversed(_strip_trailing_chrome(lines)):
-        # Require a letter or a digit somewhere, and reject separators even
-        # when a program has centred a word inside one. Rules, borders,
-        # spinners and bare prompts are the last thing on screen often enough
-        # to be worth stepping over, and none of them say anything.
-        if line and any(ch.isalnum() for ch in line) and not _looks_like_rule(line):
-            limit = max(8, int(limit))
-            return line if len(line) <= limit else line[:limit - 1] + '…'
-    return ''
+    # Stripped, unlike the plural: this one goes inline into a sentence
+    # ("Last line: ..."), where a leading indent is a gap rather than a shape.
+    found = last_output_lines(content, 1, limit)
+    return found[-1].lstrip() if found else ''
+
+
+def _fit(text: str, limit: int = _MAX_TEXT) -> str:
+    """Cut to the endpoint's limit without leaving a fence unclosed.
+
+    A plain slice can land between the two ``` markers, and a message with an
+    opening fence and no closing one renders everything after it as code --
+    in Slack that is the rest of the conversation, not just the rest of the
+    message. So if the cut leaves an odd number of fences, one is added back.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    if cut.count('```') % 2:
+        cut = cut[:limit - 4].rstrip() + '\n```'
+    return cut
 
 
 def build_idle_message(entry: dict, *, link: bool = False,
@@ -518,13 +586,32 @@ def build_idle_message(entry: dict, *, link: bool = False,
     job_part = f' (job {job})' if job else ''
     text = (f'AutoTmux: tmux session {session} on {node}{job_part} has shown '
             f'no output for {quiet} — it has probably finished or stalled.')
-    tail = str(entry.get('tail') or '').strip()
-    if tail:
-        text += f'\nLast line: {tail}'
+    # One line reads as a sentence; several read as output, and want to look
+    # like it. A fenced block is monospace in Slack, Discord and Teams alike,
+    # it keeps the alignment that makes a traceback or a table legible, and it
+    # stops a line beginning with # or > being eaten as chat markdown.
+    tail = entry.get('tail')
+    if isinstance(tail, (list, tuple)):
+        # rstrip, not strip: the leading whitespace is the shape of a
+        # traceback or a diff, and a code block is the one place it survives.
+        # Stripping it here undid the work of keeping it, invisibly -- the
+        # helper's tests passed the whole time, because they tested the
+        # helper and not the message it ends up in.
+        quoted = [str(line).rstrip() for line in tail if str(line).strip()]
+    else:
+        quoted = [str(tail).strip()] if str(tail or '').strip() else []
+    fenced = False
+    if len(quoted) == 1:
+        text += f'\nLast line: {quoted[0]}'
+    elif quoted:
+        body = '\n'.join(quoted)
+        text += f'\nLast {len(quoted)} lines:\n```\n{body}\n```'
+        fenced = True
+    links = []
     if link:
         url = attach_url(node, session)
         if url:
-            text += f'  <{url}|Attach>'
+            links.append(f'<{url}|Attach>')
     # Offered alongside rather than instead: the scheme link is the better one
     # on the machine that has the handler, and the browser link is the only one
     # that works anywhere else. Which device is reading cannot be told from
@@ -534,8 +621,16 @@ def build_idle_message(entry: dict, *, link: bool = False,
     if web:
         url = web_attach_url(web, node, session)
         if url:
-            text += f'  <{url}|Browser>'
-    return text[:_MAX_TEXT]
+            links.append(f'<{url}|Browser>')
+    if links:
+        # Appended to the last line, except after a block -- where the last
+        # line is the closing fence, so a link put there would land inside it
+        # and stop it closing.
+        text += ('\n' if fenced else '  ') + '  '.join(links)
+    # Truncated to fit the endpoint's limit, and never mid-block: a message
+    # cut between the fences arrives with one ``` and renders the rest of the
+    # chat as code.
+    return _fit(text)
 
 
 def release_claim(directory: str, key: str) -> None:
