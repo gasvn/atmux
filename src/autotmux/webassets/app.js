@@ -1746,15 +1746,34 @@
     if (selButton) selButton.classList.toggle('on', selecting);
     if (!selView) return;
     if (selecting) {
-      // Reading is over: a selection made in copy-mode would be of a screen
-      // that is not live and cannot be typed into afterwards.
-      if (scrolledBack) leaveHistory();
-      renderPickable(bufferLines());
+      // Read the screen FIRST, and do not leave the history to do it.
+      //
+      // This used to call leaveHistory() here, from when selecting was a
+      // mode you entered from a button and the worry was being left on a
+      // screen that cannot be typed into. Under a press it is exactly
+      // backwards: scrolling up to find the thing you want to copy is the
+      // whole workflow, and leaving the history first sent tmux back to the
+      // live screen and took the snapshot mid-repaint. Measured: pressing a
+      // line reached by scrolling back opened a copy view with no lines in
+      // it at all, because every row was momentarily blank and the trailing
+      // blanks are trimmed.
+      //
+      // Where the reader is is where the snapshot comes from. The history
+      // bar is still up underneath, and still the way back to live.
+      var lines = bufferLines();
+      if (!lines.length) {
+        // Nothing to show is not a view worth opening.
+        selecting = false;
+        document.body.classList.remove('selecting');
+        if (selButton) selButton.classList.remove('on');
+        say('nothing on screen to copy');
+        return;
+      }
+      renderPickable(lines);
       // Same size as the terminal it is standing in for, so the columns line
       // up and a selection looks like the thing being selected.
       selText.style.fontSize = term.options.fontSize + 'px';
       selView.hidden = false;
-      paintPicked();
       // The caret must be nowhere. xterm parks an offscreen textarea and
       // keeps it focused so the software keyboard has something to type
       // into, and a focused editable is what a long press reaches for before
@@ -1767,10 +1786,11 @@
       // or the live end when nothing in particular was asked for.
       if (at) {
         revealLine(at.index, at.screenY);
-        if (selHint) selHint.textContent = 'drag the handles · or tap lines';
       } else {
         selText.scrollTop = selText.scrollHeight;
       }
+      // Once, and after the selection exists: painted before it, this says
+      // there is nothing to copy and then has to be corrected.
       paintPicked();
     } else {
       selView.hidden = true;
@@ -2200,7 +2220,7 @@
   // job id, a command worth running again. Anything smaller or spanning
   // several is what the copy view is still there for.
   var LONG_PRESS_MS = 500, LONG_PRESS_SLOP = 8;
-  var pressTimer = 0, pressed = null, lineFlash = document.getElementById('lineflash');
+  var pressTimer = 0, pressed = null;
 
   // Said once, ever. A gesture nobody knows about is a gesture that does not
   // exist, and there is nothing on a terminal to hint at one -- but a tip
@@ -2212,7 +2232,9 @@
       if (localStorage.getItem(PRESS_HINT)) return;
       localStorage.setItem(PRESS_HINT, '1');
     } catch (e) { return; }
-    setTimeout(function () { say('press and hold a line to copy it'); }, 1200);
+    // What the gesture does, not what it used to do: it hands you a
+    // selection to adjust, it does not copy a line behind your back.
+    setTimeout(function () { say('press and hold a line to select it'); }, 1200);
   }
 
   function rowUnder() {
@@ -2258,30 +2280,6 @@
     };
   }
 
-  // Every row of the run, so what is marked is what will be copied. Marking
-  // one row of a wrapped line would promise the wrong thing.
-  function flashRows(first, last) {
-    if (!lineFlash) return;
-    var rows = host.querySelector('.xterm-rows');
-    var top = rows && rows.children[Math.max(0, first)];
-    var bottom = rows && rows.children[Math.min(rows.children.length - 1,
-                                                last)];
-    if (!top || !bottom) return;
-    var above = top.getBoundingClientRect();
-    var below = bottom.getBoundingClientRect();
-    var frame = host.getBoundingClientRect();
-    lineFlash.style.top = (above.top - frame.top) + 'px';
-    lineFlash.style.height = (below.bottom - above.top) + 'px';
-    lineFlash.style.opacity = '1';
-    lineFlash.hidden = false;
-  }
-
-  function unflash() {
-    if (!lineFlash || lineFlash.hidden) return;
-    lineFlash.style.opacity = '0';
-    setTimeout(function () { lineFlash.hidden = true; }, 220);
-  }
-
   function cancelPress() {
     if (pressTimer) { clearTimeout(pressTimer); pressTimer = 0; }
     pressed = null;
@@ -2321,7 +2319,7 @@
         // A blank row is not something anyone means to copy, and marking one
         // would be the gesture appearing to work and doing nothing.
         if (!span.text.trim()) return;
-        pressed = {row: row, text: span.text, from: from};
+        pressed = {from: from};
         haptic();
         // Hand over to the text, rather than copying the line and calling it
         // done. Copying a whole line is coarse -- it cannot give you half a
@@ -2373,7 +2371,6 @@
         // Already marked, and now the finger is travelling: they changed
         // their mind into a scroll, and the mark has to go with it.
         cancelPress();
-        unflash();
       }
     }
     var dy = event.touches[0].clientY - dragFrom;
@@ -2406,7 +2403,6 @@
       // stop this being read as a tap or a flick as well -- and this runs for
       // touchcancel too, which is the whole point.
       if (pressed) {
-        unflash();
         cancelPress();
         pinchStart = 0; swiped = false;
         holdWrites(false);
@@ -2417,7 +2413,6 @@
         return;
       }
       cancelPress();
-      unflash();
       pinchStart = 0; swiped = false;
       holdWrites(false);
       // The count belonged to the gesture; what remains is where you are.

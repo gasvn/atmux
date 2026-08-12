@@ -2902,6 +2902,57 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertIn('selectNodeContents', reveal)
         self.assertIn('addRange', reveal)
 
+    def test_pressing_a_line_you_scrolled_back_to_find_keeps_it(self):
+        """The workflow the gesture exists for: scroll up, find the thing,
+        press it.
+
+        setSelecting used to call leaveHistory() before reading the screen --
+        from when selecting was a mode reached from a button, where the worry
+        was being left somewhere that cannot be typed into. Under a press it
+        is backwards: having scrolled up IS the reason you are pressing, and
+        going back to live first takes the snapshot of a screen the reader
+        has already scrolled away from.
+
+        Measured: scrolled back from line-3961 to line-3920, pressed
+        line-3924, and the view opens on the scrolled-back screen -- first
+        line 3920 -- with 3924 selected.
+        """
+        source = _extract(self.js, 'setSelecting')
+        # Comments stripped first. The reason this changed is written in one,
+        # and matching it would pass whatever the code went on to do -- the
+        # same mistake as reading CSS by selector instead of by declaration.
+        code = re.sub(r'//[^\n]*', '', source)
+        self.assertNotIn('leaveHistory', code,
+                         'it still jumps to live before reading the screen')
+        # And read before anything else can repaint it.
+        self.assertLess(code.index('bufferLines()'),
+                        code.index('renderPickable'))
+
+    def test_an_empty_screen_does_not_open_an_empty_view(self):
+        """A view with nothing in it is worse than no view: there is nothing
+        to select and no sign of why."""
+        source = _extract(self.js, 'setSelecting')
+        self.assertIn('!lines.length', source)
+        self.assertIn('nothing on screen to copy', source)
+
+    def test_nothing_is_left_overlaying_the_rows_it_just_aligned(self):
+        """#hist and the build notice sit at z-index 15 over a view at 4, so
+        they cover its first rows -- the very rows a press has just been
+        careful to put back where they were. They are about the terminal, and
+        while this view is up the terminal is not what is being read."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        self.assertIn('body.selecting #overlays { display: none; }', css)
+
+    def test_the_gesture_left_nothing_behind_it_no_longer_uses(self):
+        """The line-flash marked which line was about to be copied, and
+        nothing is copied on the press any more -- the selection is the
+        feedback now. Dead CSS and a dead element are the same trap as a dead
+        clipboard path: they rot, and they read as features."""
+        for name in ('lineflash', 'flashRows', 'unflash'):
+            with self.subTest(gone=name):
+                self.assertNotIn(name, self.js)
+                self.assertNotIn(name, self.html)
+
     def test_the_selectable_layer_stands_where_the_terminal_stood(self):
         """Arriving in it has to read as "the text went selectable", not as a
         screen that opened over what you were reading. Same background, same
@@ -3001,18 +3052,6 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertIn('cancelPress()', move)
         self.assertIn('LONG_PRESS_SLOP', move)
         self.assertIn('pressed.from', move)
-
-    def test_a_hold_marks_what_it_is_about_to_copy(self):
-        """A gesture with no sign it has been recognised is one people give
-        up on. The mark is drawn over the terminal rather than into it: the
-        terminal is a grid repainted from the far end, and anything written
-        into it is gone on the next frame."""
-        self.assertIn('id="lineflash"', self.html)
-        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
-        block = re.search(r'#lineflash \{(.*?)\}', css, re.S).group(1)
-        self.assertIn('position: absolute', block)
-        # It must never eat the gesture it is reporting on.
-        self.assertIn('pointer-events: none', block)
 
     def test_a_wrapped_line_copies_whole_or_not_at_all(self):
         """A path long enough to be worth copying is long enough to wrap, and
