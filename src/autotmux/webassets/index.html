@@ -309,16 +309,23 @@
      and copy for twenty years. It reaches further than the screen too: the
      scrollback is in there, so a line that has already scrolled past can
      still be selected -- which the terminal itself could never offer. */
+  /* The terminal's own background, not a panel's. This layer stands in for
+     the terminal at the same font size, the same line height and the same
+     scroll position, so arriving in it reads as "the text went selectable"
+     rather than as a screen that opened over what you were reading. The one
+     thing it cannot carry across is colour: it is one weight of one colour,
+     because it is text and not a grid of cells. */
   #selview {
     position: absolute; inset: 0; z-index: 4;
     display: flex; flex-direction: column;
-    background: #101014;
+    background: #121212;
   }
   #selview[hidden] { display: none; }
   #selbar {
     flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
-    padding: 7px 9px; background: var(--panel-top);
-    border-bottom: 1px solid #2a2a32;
+    padding: 7px 9px calc(7px + env(safe-area-inset-bottom));
+    background: var(--panel-top);
+    border-top: 1px solid #2a2a32;
     /* The one part of this layer that must NOT be selectable. A drag that
        starts a little high otherwise picks up the instructions along with
        the line you were after, and pastes them into whatever you paste into
@@ -344,7 +351,10 @@
   #seltext {
     flex: 1 1 auto; margin: 0; overflow: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 6px 0 calc(6px + env(safe-area-inset-bottom));
+    /* None at all: the rows have to start where the terminal's rows start,
+       or every line is offset by however much this added. The bar below
+       carries the safe area. */
+    padding: 0;
     color: #d8d8dc;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     /* Everything a terminal has to switch off in order to be a terminal.
@@ -370,8 +380,12 @@
      whole-line target is one a thumb can hit. Long-press selection still
      works across them -- they are ordinary text -- but it is no longer the
      only way in. */
+  /* One element per line, and exactly one terminal row tall -- app.js sets
+     the height from the same measurement the terminal is drawn with, so a
+     line is where it was and a selection lands on what it looks like it is
+     landing on. */
   .sline {
-    padding: 2px 10px; white-space: pre; min-height: 22px;
+    padding: 0 10px; white-space: pre;
     border-left: 3px solid transparent;
   }
   .sline.picked {
@@ -808,13 +822,18 @@
          you want to select from, since text that reflows under a long press
          is text you cannot get hold of. -->
     <div id="selview" hidden>
+      <!-- The text first, so it starts where the terminal's own rows start.
+           With the bar above it, a line near the top of the screen could not
+           be put back where it was pressed -- there was a toolbar in the way
+           -- and it landed 6px off. The controls are better down here
+           anyway: this is a phone, and that is where the thumb is. -->
+      <div id="seltext"></div>
       <div id="selbar">
         <span id="selhint">tap lines to copy</span>
         <button id="selcopy" type="button">copy</button>
         <button id="selpaste" type="button">paste</button>
         <button id="seldone" type="button">done</button>
       </div>
-      <div id="seltext"></div>
     </div>
   </div>
   <!-- Two sources, and the split is the design. What the *app* can do is

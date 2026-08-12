@@ -2873,32 +2873,84 @@ class KeypadVocabularyTests(unittest.TestCase):
         # gesture happened to end.
         self.assertIn('lastX = event.touches[0].clientX', start)
 
-    def test_the_copy_happens_while_the_finger_is_still_down(self):
-        """The bug that made the whole gesture do nothing on the phone.
+    def test_a_press_hands_over_to_the_text_rather_than_copying_a_line(self):
+        """Copying a whole line is coarse: it cannot give you half a path or
+        two words out of a command. A line was what the gesture could reach,
+        not what anyone wanted -- the terminal itself cannot be selected on
+        iOS, so a line was the largest unit that needed no selection at all.
 
-        It was written to copy on touchend -- and this file already knows,
-        in the comment directly above that handler, that iOS fires
-        touchcancel instead when the system takes a gesture away. A finger
-        held still for half a second over text is exactly when iOS starts
-        its own callout and magnifier, so touchend was the one event not
-        guaranteed to arrive, and `name === 'touchend'` excluded precisely
-        the case that does.
+        The text can be selected. So a press lands in the same text, at the
+        same size, in the same place, with the pressed line already selected,
+        and from there it is the system's own selection: its handles, and the
+        menu it offers over one. Which is also what iOS does natively --
+        press, adjust, copy. It was never one gesture there either.
 
-        Copying from inside the timer is also still inside a user gesture:
-        the pointerdown that began the touch grants transient activation and
-        Safari's window is seconds, not milliseconds.
-
-        Measured: the clipboard holds the line while the finger is still
-        down, and a touch that ends in touchCancel has copied it too.
+        Measured at 390x844 against a 39-row screen: pressing the first,
+        middle and last row on screen each put that line back at exactly the
+        offset it was pressed at -- 0px of drift in all three -- at the same
+        row height as the terminal and on the terminal's own background. And
+        the thing a line could never do: selecting '/to/file' out of the
+        middle of a path and copying it puts '/to/file' on the clipboard.
         """
         start = self.js[self.js.index("host.addEventListener('touchstart'"):]
         start = start[:start.index("host.addEventListener('touchmove'")]
-        self.assertIn('copyLine(span.text)', start,
-                      'the copy is not inside the timer')
+        self.assertIn('setSelecting(true, {', start)
+        self.assertNotIn('copyLine(span.text)', start,
+                         'still copying a line instead of handing over')
+        reveal = _extract(self.js, 'revealLine')
+        self.assertIn('scrollTop', reveal)
+        self.assertIn('selectNodeContents', reveal)
+        self.assertIn('addRange', reveal)
+
+    def test_the_selectable_layer_stands_where_the_terminal_stood(self):
+        """Arriving in it has to read as "the text went selectable", not as a
+        screen that opened over what you were reading. Same background, same
+        font size, and rows the height of the terminal's own."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        view = re.search(r'#selview \{(.*?)\}', css, re.S).group(1)
+        term = re.search(r'#term \{(.*?)\}', css, re.S).group(1)
+        found = re.search(r'background: (#[0-9a-fA-F]{3,6})', term).group(1)
+        self.assertIn('background: ' + found, view,
+                      'the layer is a different colour from the terminal')
+        # Rows are sized from the same measurement the terminal is drawn
+        # with, or a selection lands off what it looks like it is landing on.
+        self.assertIn('lineHeight()', _extract(self.js, 'renderPickable'))
+        # And nothing above the text, or a line near the top of the screen
+        # cannot be put back where it was pressed. Measured: 6px off.
+        seltext = re.search(r'#seltext \{(.*?)\}', css, re.S).group(1)
+        self.assertRegex(seltext, r'padding: 0;')
+        page = self.html
+        self.assertLess(page.index('id="seltext"'), page.index('id="selbar"'),
+                        'the bar is above the text again')
+
+    def test_the_release_is_not_waited_for_because_it_may_not_come(self):
+        """The bug that made the whole gesture do nothing on the phone.
+
+        It hung its work on touchend -- and this file already says, in the
+        comment directly above that handler, that iOS fires touchcancel
+        instead when the system takes a gesture away. A finger held still for
+        half a second over text is exactly when iOS starts its own callout
+        and magnifier, so touchend was the one event not guaranteed to
+        arrive, and `name === 'touchend'` excluded precisely the case that
+        does.
+
+        Nothing waits for the release now: the handover happens in the timer,
+        and the release handler only tidies up -- for touchcancel too.
+        """
         end = self.js[self.js.index("['touchend', 'touchcancel']"):]
         end = end[:end.index('function spread')]
         self.assertNotIn("name === 'touchend'", end,
                          'the cancel case is excluded again')
+        start = self.js[self.js.index("host.addEventListener('touchstart'"):]
+        start = start[:start.index("host.addEventListener('touchmove'")]
+        self.assertIn('setSelecting(true, {', start)
+
+    def test_there_is_one_way_to_reach_the_clipboard_and_it_is_used(self):
+        """A second clipboard path that nothing calls is a trap: it rots,
+        and the next person to need one finds two and picks wrong. The line
+        copier went with the gesture that used it."""
+        self.assertNotIn('copyLine', self.js)
+        self.assertIn('legacyCopy', _extract(self.js, 'copyPicked'))
 
     def test_ios_is_told_to_keep_its_own_long_press_off_the_terminal(self):
         """Starting the system callout is how the web touch gets taken away,

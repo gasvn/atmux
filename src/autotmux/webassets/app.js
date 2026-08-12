@@ -1577,7 +1577,9 @@
       native = (window.getSelection && window.getSelection().toString()) || '';
     } catch (e) {}
     if (native.trim()) {
-      selHint.textContent = 'selected text ready';
+      // Says what to do with it, not that it exists -- the highlight already
+      // says that, and the handles are the part nobody expects to be there.
+      selHint.textContent = 'drag the handles · then copy';
     } else if (picked) {
       selHint.textContent = picked === 1 ? '1 line' : picked + ' lines';
     } else {
@@ -1588,18 +1590,45 @@
 
   function renderPickable(lines) {
     selText.textContent = '';
+    // The terminal's own row height, so this layer lands line for line on
+    // what it is standing in front of.
+    var unit = lineHeight();
     var frag = document.createDocumentFragment();
     for (var i = 0; i < lines.length; i++) {
       var row = document.createElement('div');
       row.className = 'sline';
+      row.style.height = unit + 'px';
+      row.style.lineHeight = unit + 'px';
       // A blank line still has to be tappable, or the gaps in a log are dead
-      // spots. A zero-width space keeps the box without adding a character
-      // to what gets copied -- textContent of '​' would.
+      // spots. A non-breaking space keeps the box without adding a character
+      // to what gets copied -- textContent would.
       row.textContent = lines[i];
       if (!lines[i]) row.innerHTML = '&nbsp;';
       frag.appendChild(row);
     }
     selText.appendChild(frag);
+  }
+
+  // Put the line that was pressed where it already was on screen, and select
+  // it. iOS draws its handles on the selection it finds, so what a press
+  // lands you in is the same text, in the same place, already selected --
+  // which is what the system does natively, and is as close to it as a page
+  // that cannot use the system's own selection can get.
+  function revealLine(index, screenY) {
+    var rows = selText.querySelectorAll('.sline');
+    var row = rows[index];
+    if (!row) return;
+    // Same position on screen as the row it is replacing, so nothing appears
+    // to jump at the moment of the press.
+    var frame = selText.getBoundingClientRect();
+    selText.scrollTop = row.offsetTop - (screenY - frame.top);
+    try {
+      var range = document.createRange();
+      range.selectNodeContents(row);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } catch (e) {}
   }
 
   // A tap, not the end of a drag: dragging across these lines is how the
@@ -1709,7 +1738,9 @@
     }
   }
 
-  function setSelecting(on) {
+  // `at` is set when a press put us here: {index, screenY} of the line that
+  // was under the finger.
+  function setSelecting(on, at) {
     selecting = !!on;
     document.body.classList.toggle('selecting', selecting);
     if (selButton) selButton.classList.toggle('on', selecting);
@@ -1732,8 +1763,15 @@
         var box = host.querySelector('textarea');
         if (box) box.blur();
       } catch (e) {}
-      // Where you were, which is the live end.
-      selText.scrollTop = selText.scrollHeight;
+      // Where you were: the line you pressed, in the place you pressed it,
+      // or the live end when nothing in particular was asked for.
+      if (at) {
+        revealLine(at.index, at.screenY);
+        if (selHint) selHint.textContent = 'drag the handles · or tap lines';
+      } else {
+        selText.scrollTop = selText.scrollHeight;
+      }
+      paintPicked();
     } else {
       selView.hidden = true;
       try {
@@ -2249,20 +2287,6 @@
     pressed = null;
   }
 
-  function copyLine(text) {
-    var shown = text.length > 32 ? text.slice(0, 31) + '…' : text;
-    var ok = function () { say('copied  ' + shown); };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(ok).catch(function () {
-        if (legacyCopy(text)) ok();
-        else say('could not reach the clipboard');
-      });
-      return;
-    }
-    if (legacyCopy(text)) ok();
-    else say('this browser has no clipboard');
-  }
-
   var pinchStart = 0, pinchFont = 0;
   var dragFrom = 0, swiped = false;
   host.addEventListener('touchstart', function (event) {
@@ -2298,20 +2322,27 @@
         // would be the gesture appearing to work and doing nothing.
         if (!span.text.trim()) return;
         pressed = {row: row, text: span.text, from: from};
-        flashRows(span.first, span.last);
         haptic();
-        // Here, not on the lift. This file already knows that iOS fires
-        // touchcancel when the system takes a gesture away -- it says so
-        // above the touchend handler -- and a finger held still for half a
-        // second over text is exactly when iOS decides to do something of
-        // its own. Waiting for touchend meant waiting for the one event
-        // that is not guaranteed to come.
+        // Hand over to the text, rather than copying the line and calling it
+        // done. Copying a whole line is coarse -- it cannot give you half a
+        // path, or two words out of a command -- and the reason it was doing
+        // that is that the terminal cannot be selected, not that a line is
+        // what anyone wanted.
         //
-        // Still inside a user gesture: the pointerdown that started this
-        // grants transient activation, and Safari's window is seconds, not
-        // milliseconds. So the clipboard is reachable from here -- and from
-        // here it is reachable before anything can intervene.
-        copyLine(span.text);
+        // The text can be. So a press lands in the same text, at the same
+        // size, in the same place, with the pressed line already selected,
+        // and from there it is the system's own selection: drag the handles,
+        // and the menu iOS offers over a selection is the real one.
+        //
+        // Which is also what iOS does natively -- press, and a selection
+        // appears that you then adjust and copy. It was never one gesture
+        // there either.
+        var here = host.querySelector('.xterm-rows');
+        var mark = here && here.children[Math.max(0, span.first)];
+        setSelecting(true, {
+          index: (term.buffer.active.viewportY || 0) + span.first,
+          screenY: mark ? mark.getBoundingClientRect().top : lastY
+        });
       }, LONG_PRESS_MS);
     } else {
       cancelPress();
