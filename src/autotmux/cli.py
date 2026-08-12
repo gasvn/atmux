@@ -174,6 +174,37 @@ def _next_preview_cadence(unchanged: bool,
     return streak, delay
 
 
+def fmt_age(seconds) -> str:
+    """A duration, in the largest unit that still says something.
+
+    Every age on this screen was printed in raw seconds, which is fine for
+    the first minute and unreadable after it: a stale daemon reported
+    "stale (19313589s old)", which is a number nobody converts in their head
+    and which reads as a fault in the display rather than in the daemon. The
+    browser client has always said "5m ago" for the same quantity, so the two
+    halves of the same tool disagreed about how to say the same thing.
+
+    Kept coarse on purpose. These are all "how out of date is this", and past
+    a minute the answer is a magnitude, not a measurement.
+    """
+    if seconds is None:
+        return '?'
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return '?'
+    if not math.isfinite(value):
+        return '?'
+    value = max(0.0, value)
+    if value < 60:
+        return f'{value:.0f}s'
+    if value < 3600:
+        return f'{value / 60:.0f}m'
+    if value < 86400:
+        return f'{value / 3600:.0f}h'
+    return f'{value / 86400:.0f}d'
+
+
 def _snapshot_age_seconds(snapshot: dict) -> float | None:
     if not isinstance(snapshot, dict):
         return None
@@ -4352,8 +4383,8 @@ class AutotmuxApp(App):
             if gateway_mode:
                 cached = ' · cached' if gateway_info.get('cached') else ''
                 via = f' via {gateway_active}' if gateway_active else ''
-                return f"⚠ remote daemon stale ({stale:.0f}s){via}{cached}"
-            return f"⚠ daemon stale ({stale:.0f}s old) · run `atd status`"
+                return f"⚠ remote daemon stale ({fmt_age(stale)}){via}{cached}"
+            return f"⚠ daemon stale ({fmt_age(stale)} old) · run `atd status`"
         # Count real sessions, not offline/start-shell placeholder rows.
         real = sum(1 for r in rows if r[1] not in (
             _OFFLINE_SESSION, _START_SHELL_SESSION))
@@ -4398,10 +4429,10 @@ class AutotmuxApp(App):
                 elif (health.get('in_progress')
                       and attempt_age is not None and attempt_age > stale_after):
                     health_warning = (
-                        f'⚠ keep-alive check stalled ({attempt_age:.0f}s)')
+                        f'⚠ keep-alive check stalled ({fmt_age(attempt_age)})')
                 elif success_age is not None and success_age > stale_after:
                     health_warning = (
-                        f'⚠ keep-alive checks stale ({success_age:.0f}s)')
+                        f'⚠ keep-alive checks stale ({fmt_age(success_age)})')
         if health_warning:
             extra = f' · {health_warning}'
         elif paused:
@@ -4528,11 +4559,18 @@ class AutotmuxApp(App):
         age = self._daemon_age_seconds(
             updated, state.get('squeue_updated_monotonic'),
             state.get('monotonic_clock_id'))
-        if age is None and updated != '?':
-            stale = '  ⚠ timestamp unavailable'
+        # How old, not when. An absolute timestamp and a relative age said the
+        # same thing twice in a title that is already the widest line in the
+        # panel -- and "updated 2026-01-01 00:00:00" is 19 columns spent on
+        # the form of the answer nobody was asking for. The question here is
+        # only ever "is this current", which is an age.
+        if age is None:
+            when = '  timestamp unavailable' if updated != '?' else ''
+        elif age > 90:
+            when = f'  ⚠ {fmt_age(age)} old'
         else:
-            stale = f'  ⚠ stale {age:.0f}s' if age is not None and age > 90 else ''
-        self.jobs_view.update(f'{title}  updated {updated}{stale}\n{text}')
+            when = f'  {fmt_age(age)} old'
+        self.jobs_view.update(f'{title}{when}\n{text}')
 
     async def action_toggle_jobs_view(self) -> None:
         self.jobs_view_mode = 'pending' if self.jobs_view_mode == 'long' else 'long'
@@ -4797,6 +4835,24 @@ class AutotmuxApp(App):
                     and str(self.log_view.render()).startswith('Loading preview')):
                 self._render_preview_now()
 
+    def _preview_title(self, node: str, session: str,
+                       note: str = 'live') -> 'rich.text.Text':
+        """What this pane is showing, and how to steer it.
+
+        It showed a screenful of someone else's output with nothing at all to
+        say whose it was -- the only clue was the table cursor beside it, and
+        that clue got weaker the moment the keyboard could move into this
+        pane and the cursor dimmed. The queue below has carried its own
+        title, and its own key, all along; this is the same thing, so the two
+        secondary panes read as siblings rather than as one titled panel and
+        one anonymous slab.
+
+        `2: scroll` for the same reason the queue prints `j: switch`: a key
+        belongs next to the thing it acts on.
+        """
+        return rich.text.Text(
+            f'── {node}:{session} ─ {note}  [2: scroll] ──\n', style='dim')
+
     def _show_cached_snapshot(self, node: str, session: str) -> bool:
         snap = self.snapshots.get(f'{node}:{session}')
         if not isinstance(snap, dict):
@@ -4815,14 +4871,10 @@ class AutotmuxApp(App):
         rendered = self._rendered_cache.pop(cache_key, None)
         if rendered is None:
             base = rich.text.Text.from_ansi(text)
-            if age is None:
-                age_note = 'age unknown'
-            elif age < 60:
-                age_note = f'{age:.0f}s old'
-            else:
-                age_note = f'⚠ {age / 60:.1f}m old'
-            rendered = rich.text.Text(
-                f'(cached snapshot · {age_note} · {ts})\n', style='dim') + base
+            warn = '⚠ ' if age is not None and age >= 60 else ''
+            note = 'age unknown' if age is None else f'{warn}{fmt_age(age)} old'
+            rendered = self._preview_title(
+                node, session, f'cached · {note}') + base
         self._rendered_cache[cache_key] = rendered
         # Keep cache bounded — evict the LEAST recently used (head of dict).
         if len(self._rendered_cache) > 64:
@@ -4876,7 +4928,9 @@ class AutotmuxApp(App):
             self.log_view.update("")
             return
         if not self._show_cached_snapshot(node, sess):
-            self.log_view.update(f"Loading preview  {node}:{sess} …")
+            # Titled like every other state of this pane, so the heading does
+            # not appear and disappear as the first snapshot lands.
+            self.log_view.update(self._preview_title(node, sess, 'connecting…'))
 
     async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # Emitted by Enter and by a single mouse click (see
@@ -5004,7 +5058,8 @@ class AutotmuxApp(App):
                                 node, sess, reason, retry_after=retry_after)
                         elif not self._show_cached_snapshot(node, sess):
                             self.log_view.update(
-                                f'Live preview waiting ({reason}).')
+                                self._preview_title(node, sess, 'waiting')
+                                + rich.text.Text(reason))
                         continue
                     content = response.get('content')
                     if not isinstance(content, str):
@@ -5026,7 +5081,9 @@ class AutotmuxApp(App):
                         False, unchanged_streak)
                     next_probe_at = _time.monotonic() + delay
                     last_key, last_hash = key, h
-                    self.log_view.update(rich.text.Text.from_ansi(content))
+                    self.log_view.update(
+                        self._preview_title(node, sess)
+                        + rich.text.Text.from_ansi(content))
                 except asyncio.TimeoutError:
                     n = timeout_counts.get(node, 0) + 1
                     timeout_counts[node] = n

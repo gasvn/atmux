@@ -253,7 +253,12 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 state = dict(SYNTH_STATE)
                 state['squeue_updated_monotonic'] = time.monotonic() - 100
                 app._refresh_jobs(state)
-                self.assertIn('⚠ stale', str(app.jobs_view.render()))
+                # The mark, and how far out of date -- the word "stale" went
+                # with the absolute timestamp beside it. ⚠ plus an age says
+                # the same thing in a title that is the widest line here.
+                head = str(app.jobs_view.render()).splitlines()[0]
+                self.assertIn('⚠', head)
+                self.assertRegex(head, r'\d+[smhd] old')
 
     async def test_manual_refresh_reloads_snapshots_off_loop(self):
         with tempfile.TemporaryDirectory() as td:
@@ -566,6 +571,89 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                         await pilot.press(key)
                         await pilot.pause()
                         self.assertEqual(app.focused.id, want)
+
+    async def test_the_preview_says_whose_output_it_is_showing(self):
+        """It showed a screenful of someone's output with nothing to say
+        whose. The only clue was the table cursor beside it -- and that clue
+        got weaker the moment the keyboard could move into this pane and the
+        cursor dimmed.
+
+        The queue below has carried its own title, and its own key, all
+        along. This is the same, so the two secondary panes read as siblings
+        rather than as one titled panel and one anonymous slab.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                app.snapshots['gpu1:train'] = {
+                    'lines': 'epoch 1\nepoch 2\n', 'ts': '12:00:00',
+                    'captured_monotonic': autotmux.time.monotonic(),
+                    'monotonic_clock_id': autotmux._CLOCK_ID,
+                }
+                self.assertTrue(app._show_cached_snapshot('gpu1', 'train'))
+                await pilot.pause()
+                text = str(app.log_view.render())
+                head = text.splitlines()[0]
+                self.assertIn('gpu1:train', head)
+                # The key belongs beside the thing it acts on, which is the
+                # rule the queue's own title already follows.
+                self.assertIn('2: scroll', head)
+                self.assertIn('epoch 1', text)
+
+    async def test_every_state_of_the_preview_carries_the_same_heading(self):
+        """A heading that appears when the first snapshot lands, and is
+        absent before it, is a heading that moves the text under it."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                app.selected_node, app.selected_session = 'gpu1', 'train'
+                app.snapshots.clear()
+                app._render_preview_now()
+                await pilot.pause()
+                text = str(app.log_view.render())
+                self.assertIn('gpu1:train', text)
+                self.assertIn('connecting', text)
+
+    async def test_ages_are_read_at_a_glance_rather_than_converted(self):
+        """Every age on this screen was raw seconds, which is fine for the
+        first minute and unreadable after it: a stale daemon reported
+        "stale (19313589s old)", a number nobody converts in their head and
+        which reads as a fault in the display rather than in the daemon.
+
+        The browser client has always said "5m ago" for the same quantity, so
+        the two halves of one tool disagreed about how to say one thing.
+        """
+        cases = [(0, '0s'), (45, '45s'), (90, '2m'), (300, '5m'),
+                 (3600, '1h'), (7200, '2h'), (86400, '1d'),
+                 (19313589, '224d'), (None, '?'), (float('nan'), '?')]
+        for seconds, want in cases:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(autotmux.fmt_age(seconds), want)
+        # Negative clock skew is not a duration; it must not print one.
+        self.assertEqual(autotmux.fmt_age(-5), '0s')
+
+    async def test_the_queue_says_how_old_rather_than_when(self):
+        """An absolute timestamp and a relative age said the same thing twice
+        in the widest line of the panel, and "updated 2026-01-01 00:00:00" is
+        19 columns spent on the form of the answer nobody wanted. The
+        question is only ever "is this current"."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                app._refresh_jobs(app._last_state or {})
+                await pilot.pause()
+                text = str(app.jobs_view.render())
+                head = text.splitlines()[0]
+                self.assertNotIn('updated 2026-01-01', head)
+                self.assertRegex(head, r'\d+[smhd] old')
+                # And the key still rides its own title.
+                self.assertIn('j: switch', head)
 
     async def test_a_pane_with_the_keyboard_actually_scrolls(self):
         """Reaching it is only half. Measured after: the preview takes down,
