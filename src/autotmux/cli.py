@@ -2579,6 +2579,30 @@ def _compose_session(r, widths, tail: str, total: int) -> rich.text.Text:
     return line
 
 
+def _heading(title: str, note: str = '', key: str = '') -> rich.text.Text:
+    """The one heading this app draws, wherever it draws one.
+
+    There were three shapes of the same idea and no two agreed: the bands
+    wrote `── just stopped 3`, the preview wrote
+    `── node:session ─ live  [2: scroll] ──` with dashes at both ends, and
+    the queue wrote `── ALL JOBS (squeue -l)  [j: switch · 3: scroll] ──
+    4s old` -- caps, brackets, parentheses and a trailing rule, all in one
+    line. Three panes that are peers should not each invent their own
+    furniture.
+
+    One rule at the front, the title, then what is true of it, then the key
+    that acts on it. Nothing at the end: a trailing rule has to be measured
+    against a width, and none of these three know theirs.
+    """
+    line = rich.text.Text('── ', style='dim')
+    line.append(title, style='dim')
+    if note:
+        line.append('  ' + note, style='dim')
+    if key:
+        line.append('  ' + key, style='dim')
+    return line
+
+
 def _band_cells(title: str, count: int) -> tuple:
     """A band heading, as the six cells a DataTable row is made of.
 
@@ -2588,10 +2612,7 @@ def _band_cells(title: str, count: int) -> tuple:
     is the sentence somebody came to the screen for, and reading it should
     not require counting rows.
     """
-    head = rich.text.Text('── ', style='dim')
-    head.append(title, style='dim')
-    head.append(f' {count}', style='dim bold')
-    return head
+    return _heading(title, str(count))
 
 class ClickToAttachDataTable(DataTable):
     """A DataTable where a *single* mouse click selects the clicked row.
@@ -3544,11 +3565,16 @@ class AutotmuxApp(App):
     #upper {
         height: 1fr;
     }
-    #left_pane {
-        /* Seven columns need ~66 cells. At 45% they did not get them, so the
-           table silently clipped LOAD and STATUS off the right edge. */
+    /* The list and the queue, stacked. One box so the preview beside them
+       runs the whole height instead of stopping on top of a queue that ran
+       the full width -- which was a T rather than a grid. */
+    #left_column {
         width: 56%;
         height: 100%;
+    }
+    #left_pane {
+        width: 100%;
+        height: 1fr;
     }
     /* Layout modes (`z`). The divider belongs to the preview, not the table:
        a rule down the right edge of a full-width table is a frame, not a
@@ -3556,11 +3582,12 @@ class AutotmuxApp(App):
        exists when there is something to divide, it simply leaves with it --
        and it is also where this pane says whether it has the keyboard, which
        is a thing it must say without costing a column to say it. */
-    #left_pane.-full {
+    #left_column.-full {
         width: 100%;
     }
     #right_pane_scroll {
         width: 44%;
+        height: 100%;
         background: $surface;
         padding: 0 1;
         border-left: solid $primary;
@@ -3579,9 +3606,10 @@ class AutotmuxApp(App):
         width: 100%;
         height: auto;
     }
+    /* Sized to what it holds, up to a cap. It was a fixed 35% -- fourteen
+       lines standing over the three or four rows a queue usually has. */
     #jobs_scroll {
-        height: 35%;
-        min-height: 6;
+        height: auto;
         max-height: 14;
         border-top: solid $primary;
         padding: 0 1;
@@ -3638,8 +3666,8 @@ class AutotmuxApp(App):
                 priority=True),
         Binding("escape", "focus_table", "Back to sessions", show=False),
         Binding("1", "focus_pane('table')", "Sessions pane", show=False),
-        Binding("2", "focus_pane('preview')", "Preview pane", show=False),
-        Binding("3", "focus_pane('jobs')", "Jobs pane", show=False),
+        Binding("2", "focus_pane('jobs')", "Jobs pane", show=False),
+        Binding("3", "focus_pane('preview')", "Preview pane", show=False),
         Binding("w", "web_dashboard", "Web", show=False),
         Binding("g", "manage_connections", "Clusters"),
         Binding("e", "edit_note", "Note", show=False),
@@ -3690,8 +3718,8 @@ class AutotmuxApp(App):
             ("tab", "Move the keyboard to the next pane", "lights up"),
             ("shift+tab", "The same, backwards", "wraps"),
             ("1", "The session list", "arrows select"),
-            ("2", "The preview", "arrows scroll"),
-            ("3", "The job queue", "← → too"),
+            ("2", "The job queue", "← → too"),
+            ("3", "The preview", "arrows scroll"),
             ("escape", "Back to the session list", "from any pane"),
         ]),
         ("View", [
@@ -3771,16 +3799,26 @@ class AutotmuxApp(App):
         # app is idle. Keeping the header static makes an idle atmux silent on
         # the wire.
         yield Header()
+        # The queue belongs under the list, not under both panes.
+        #
+        # It used to be a child of the screen, so it ran the full width while
+        # the preview was a column stopping on top of it -- a T, not a grid.
+        # Nesting it with the list makes the preview one column to the bottom
+        # and puts the queue under the thing it is about: the queue's rows and
+        # the list's rows are the same machines in Slurm's vocabulary.
         with Horizontal(id="upper"):
-            yield ClickToAttachDataTable(id="left_pane")
+            with Vertical(id="left_column"):
+                yield ClickToAttachDataTable(id="left_pane")
+                # squeue output contains user-controlled job names and array
+                # syntax; render it literally rather than treating ``[...]``
+                # as Rich markup. The scroller is a container so the expanded
+                # layout can hand the queue the arrow keys; a bare Static
+                # scrolls by mouse only.
+                with VerticalScroll(id="jobs_scroll"):
+                    yield Static("(loading squeue...)", id="jobs_panel",
+                                 markup=False)
             with VerticalScroll(id="right_pane_scroll"):
                 yield Static("", id="right_pane", markup=False)
-        # squeue output contains user-controlled job names and array syntax;
-        # render it literally rather than treating ``[...]`` as Rich markup.
-        # The scroller is a container so that the expanded layout can hand the
-        # queue the arrow keys; a bare Static scrolls by mouse only.
-        with VerticalScroll(id="jobs_scroll"):
-            yield Static("(loading squeue...)", id="jobs_panel", markup=False)
         # Whoever can draw the controls, draws them once. A browser client
         # renders the same bindings as real buttons outside the grid, so the
         # footer there is a second, smaller, less complete copy of what is
@@ -4788,10 +4826,10 @@ class AutotmuxApp(App):
             state = {}
         if self.jobs_view_mode == 'pending':
             text = str(state.get('squeue_pending', '') or '')
-            title = '── PENDING JOBS (squeue --start)  [j: switch · 3: scroll] ──'
+            title = ('pending jobs', 'squeue --start')
         else:
             text = str(state.get('squeue_long', '') or '')
-            title = '── ALL JOBS (squeue -l)  [j: switch · 3: scroll] ──'
+            title = ('queue', 'squeue -l')
         text = _dedent_block(text)
         if not text.strip():
             text = '(no squeue data yet — daemon may still be starting)'
@@ -4810,7 +4848,9 @@ class AutotmuxApp(App):
             when = f'  ⚠ {fmt_age(age)} old'
         else:
             when = f'  {fmt_age(age)} old'
-        self.jobs_view.update(f'{title}{when}\n{text}')
+        head = _heading(title[0], (title[1] + when).strip(),
+                        'j: switch · 2: scroll')
+        self.jobs_view.update(head + rich.text.Text('\n' + text))
 
     async def action_toggle_jobs_view(self) -> None:
         self.jobs_view_mode = 'pending' if self.jobs_view_mode == 'long' else 'long'
@@ -4919,11 +4959,16 @@ class AutotmuxApp(App):
         show_preview = spec['preview'] and self._room_for_preview()
 
         # #upper is 1fr high: leaving it displayed with both children hidden
-        # would reserve the whole body to draw nothing in.
-        upper.display = spec['table'] or show_preview
+        # would reserve the whole body to draw nothing in. The queue lives in
+        # the left column now, so it counts towards that column being worth
+        # showing.
+        column = self.query_one('#left_column')
+        show_left = spec['table'] or spec['jobs']
+        upper.display = show_left or show_preview
+        column.display = show_left
         table.display = spec['table']
         preview.display = show_preview
-        table.set_class(not show_preview, '-full')
+        column.set_class(not show_preview, '-full')
         jobs.display = spec['jobs']
         jobs.set_class(spec['expand_jobs'], '-full')
         table_arrived = bool(spec['table']) and not was_table
@@ -5008,8 +5053,13 @@ class AutotmuxApp(App):
     # Tab cycles; the digits are for going straight there, which is what you
     # want the second time. Both only ever land on a pane that is on screen,
     # because the focus chain is rebuilt from the layout (see _apply_layout).
-    _PANES = {'table': '#left_pane', 'preview': '#right_pane_scroll',
-              'jobs': '#jobs_scroll'}
+    # Numbered in the order Tab walks them, which is the order the grid
+    # reads: the left column top to bottom, then the column beside it. They
+    # disagreed for one commit -- Tab went list, queue, preview while the
+    # digits went list, preview, queue -- and a key that lands somewhere Tab
+    # would not is worse than no key.
+    _PANES = {'table': '#left_pane', 'jobs': '#jobs_scroll',
+              'preview': '#right_pane_scroll'}
 
     def action_focus_pane(self, name: str) -> None:
         selector = self._PANES.get(name)
@@ -5088,10 +5138,20 @@ class AutotmuxApp(App):
         one anonymous slab.
 
         `2: scroll` for the same reason the queue prints `j: switch`: a key
-        belongs next to the thing it acts on.
+        belongs next to the thing it acts on -- but only while it fits. This
+        pane is the narrow one, and a heading that wraps onto a second line
+        pushes the output down and stops looking like a heading at all. The
+        hint is the part worth losing: the name is what the pane is for.
         """
-        return rich.text.Text(
-            f'── {node}:{session} ─ {note}  [2: scroll] ──\n', style='dim')
+        title = f'{node}:{session}'
+        try:
+            room = int(self.query_one('#right_pane_scroll').size.width) - 2
+        except Exception:
+            room = 0
+        key = '3: scroll'
+        if room and len(title) + len(note) + len(key) + 9 > room:
+            key = ''
+        return _heading(title, note, key) + rich.text.Text('\n')
 
     def _show_cached_snapshot(self, node: str, session: str) -> bool:
         snap = self.snapshots.get(f'{node}:{session}')

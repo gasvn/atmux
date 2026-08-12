@@ -144,9 +144,13 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(80, 24)) as pilot:
                 await pilot.pause()
                 upper = app.query_one('#upper').region
+                # The column, not the table: the queue is the table's sibling
+                # inside it now, so the two of them share this height.
+                column = app.query_one('#left_column').region
                 table = app.query_one('#left_pane').region
                 jobs = app.query_one('#jobs_scroll').region
-                self.assertEqual(table.height, upper.height)
+                self.assertEqual(column.height, upper.height)
+                self.assertEqual(table.height + jobs.height, column.height)
                 self.assertGreaterEqual(upper.height, 12)
                 self.assertLessEqual(jobs.height, 8)
 
@@ -573,9 +577,11 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
             app = autotmux.AutotmuxApp()
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.pause()
+                # The order the grid reads: the left column top to bottom,
+                # then the column beside it.
                 self.assertEqual([w.id for w in app.screen.focus_chain],
-                                 ['left_pane', 'right_pane_scroll',
-                                  'jobs_scroll'],
+                                 ['left_pane', 'jobs_scroll',
+                                  'right_pane_scroll'],
                                  'every visible pane, in the order it is read')
                 # Tab walks them and comes back round.
                 seen = []
@@ -583,12 +589,14 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                     await pilot.press('tab')
                     await pilot.pause()
                     seen.append(app.focused.id)
-                self.assertEqual(seen, ['right_pane_scroll', 'jobs_scroll',
+                self.assertEqual(seen, ['jobs_scroll', 'right_pane_scroll',
                                         'left_pane'])
                 # And the digits go straight there, which is what you want the
                 # second time.
-                for key, want in (('2', 'right_pane_scroll'),
-                                  ('3', 'jobs_scroll'), ('1', 'left_pane')):
+                # The digits agree with Tab, which is the point of them.
+                for key, want in (('2', 'jobs_scroll'),
+                                  ('3', 'right_pane_scroll'),
+                                  ('1', 'left_pane')):
                     with self.subTest(key=key):
                         await pilot.press(key)
                         await pilot.pause()
@@ -687,7 +695,7 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('gpu1:train', head)
                 # The key belongs beside the thing it acts on, which is the
                 # rule the queue's own title already follows.
-                self.assertIn('2: scroll', head)
+                self.assertIn('3: scroll', head)
                 self.assertIn('epoch 1', text)
 
     async def test_every_state_of_the_preview_carries_the_same_heading(self):
@@ -759,7 +767,7 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 preview = app.query_one('#right_pane_scroll')
                 self.assertGreater(preview.max_scroll_y, 20,
                                    'nothing hidden, so nothing proved')
-                await pilot.press('2')
+                await pilot.press('3')
                 await pilot.pause()
                 await pilot.press('down')
                 await pilot.pause()
@@ -797,7 +805,7 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
             app = autotmux.AutotmuxApp()
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.pause()
-                await pilot.press('2')
+                await pilot.press('3')
                 await pilot.pause()
                 self.assertEqual(app.focused.id, 'right_pane_scroll')
                 app.layout_mode = 'table'          # preview and queue gone
@@ -1597,10 +1605,11 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
                             preview)
                         self.assertEqual(
                             bool(app.query_one('#jobs_scroll').display), jobs)
-                        # An empty #upper still reserves 1fr of the body.
+                        # An empty #upper still reserves 1fr of the body --
+                        # and the queue is inside it now, so it counts.
                         self.assertEqual(
                             bool(app.query_one('#upper').display),
-                            table or preview)
+                            table or preview or jobs)
 
     async def test_a_table_with_no_preview_uses_the_whole_width(self):
         """Hiding the preview is pointless if the table keeps its 56%."""
@@ -1835,10 +1844,14 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
             app = autotmux.AutotmuxApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                self.assertIn('[j:', str(app.jobs_view.render()))
+                # The bracket went with the three-shapes-of-one-heading
+                # cleanup; being advertised where it acts did not.
+                self.assertIn('j: switch', str(app.jobs_view.render()))
                 await pilot.press('j')
                 await pilot.pause()
-                self.assertIn('[j:', str(app.jobs_view.render()))
+                # The bracket went with the three-shapes-of-one-heading
+                # cleanup; being advertised where it acts did not.
+                self.assertIn('j: switch', str(app.jobs_view.render()))
 
     def test_only_the_jobs_only_mode_expands_the_queue(self):
         """Expanding it while the table is up would push the table out."""
