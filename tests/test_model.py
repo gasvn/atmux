@@ -52,6 +52,100 @@ class NodeLabelTests(unittest.TestCase):
         self.assertEqual(rows[0]['node_label'], 'login:zgx')
 
 
+class BandPlanTests(unittest.TestCase):
+    """The ranks have always sorted this table and have never been drawn.
+
+    A sort you cannot see is not a sort: ten rows rendered identically make
+    the reader re-derive, by reading every one, the judgement the daemon had
+    already made. These are the bands that judgement becomes.
+    """
+
+    # (node, session, wins, time_left, status, cpu, load)
+    def row(self, node, session, status=''):
+        return (node, session, '1', '1-00:00:00', status, '96', '3.0')
+
+    def offer(self, node):
+        """A login node: a place to start a shell, holding no allocation."""
+        return (node, model._START_SHELL_SESSION, '-', '-', '', '32', '4.0')
+
+    def test_a_band_is_only_drawn_when_something_is_in_it(self):
+        """A heading over nothing is furniture. Measured against the live
+        state: two bands for six sessions, because nothing was broken and
+        nothing was actively working."""
+        rows = [self.row('gpu1', 'a', '● 5m'), self.row('gpu2', 'b', '● 5m')]
+        plan = model.plan_rows(rows)
+        titles = [p[1] for p in plan if p[0] == 'band']
+        self.assertEqual(titles, ['just stopped'])
+
+    def test_every_row_survives_the_plan_exactly_once(self):
+        """The plan is what the table is built from. A row that fell out of
+        it is a session you can no longer reach."""
+        rows = [self.row('gpu1', 'a', '● 5m'),
+                self.row('gpu2', 'b'),
+                self.row('gpu3', 'c', '● 3h'),
+                self.row('gpu4', model._OFFLINE_SESSION, 'OFFLINE: timeout')]
+        plan = model.plan_rows(rows)
+        planned = [p[1] for p in plan if p[0] == 'row']
+        self.assertEqual(len(planned), len(rows))
+        self.assertEqual({r[1] for r in planned}, {r[1] for r in rows})
+
+    def test_the_bands_keep_the_order_the_ranks_already_chose(self):
+        """The ordering is deliberately slow-moving -- a table that re-sorts
+        under the cursor is worse than one merely ordered badly -- so the
+        bands must not invent an order of their own."""
+        rows = [self.row('gpu1', 'quiet', '● 3h'),
+                # rank 0 is either the offline placeholder or a DEGRADED
+                # status -- a status that merely *reads* OFFLINE is not it.
+                self.row('gpu2', 'broken', 'DEGRADED: ssh flapping'),
+                self.row('gpu3', 'stopped', '● 5m')]
+        plan = model.plan_rows(rows)
+        self.assertEqual([p[1] for p in plan if p[0] == 'band'],
+                         ['not reachable', 'just stopped', 'quiet a while'])
+
+    def test_the_offers_get_a_band_and_keep_their_keys(self):
+        """Folding them to one line was the first attempt, and it deleted two
+        capabilities: `s` opens a shell on the *selected* node and `k` puts
+        the *selected* node's job on auto-renew, so a row you cannot select
+        is a node you can no longer reach or keep alive.
+
+        A band gets what folding was for -- they stop being interleaved with
+        things you can attach to -- and costs nothing.
+        """
+        rows = [self.row('gpu1', 'real', '● 5m'),
+                self.offer('login--a'), self.offer('login--b')]
+        plan = model.plan_rows(rows)
+        self.assertEqual([p[1] for p in plan if p[0] == 'band'],
+                         ['just stopped', 'start a shell here'])
+        # Still there, still selectable, and last.
+        self.assertEqual([p[1][0] for p in plan if p[0] == 'row'],
+                         ['gpu1', 'login--a', 'login--b'])
+
+    def test_an_allocation_with_no_session_in_it_is_still_reachable(self):
+        """A `<shell>` row on a compute node is an allocation with no session
+        in it yet, and that row is the only place `k` can put its job on
+        auto-renew. It sits with the other offers -- last, under a heading --
+        but it is still a row the cursor can reach.
+        """
+        rows = [self.row('gpu1', 'real', '● 5m'),
+                self.offer('login--a'),
+                self.row('gpu2', model._START_SHELL_SESSION)]
+        plan = model.plan_rows(rows)
+        reachable = [p[1][0] for p in plan if p[0] == 'row']
+        self.assertEqual(sorted(reachable), ['gpu1', 'gpu2', 'login--a'])
+        self.assertEqual([p[1] for p in plan if p[0] == 'band'][-1],
+                         'start a shell here')
+
+    def test_nothing_at_all_plans_to_nothing_at_all(self):
+        self.assertEqual(model.plan_rows([]), [])
+
+    def test_a_band_counts_what_is_under_it(self):
+        rows = [self.row('gpu1', 'a', '● 5m'), self.row('gpu2', 'b', '● 5m'),
+                self.row('gpu3', 'c', '● 3h')]
+        plan = model.plan_rows(rows)
+        counts = {p[1]: p[2] for p in plan if p[0] == 'band'}
+        self.assertEqual(counts, {'just stopped': 2, 'quiet a while': 1})
+
+
 class SessionRecordTests(unittest.TestCase):
     def test_a_session_carries_the_fields_a_list_needs(self):
         rows = model.sessions(state(n1=node([('train', 2, 0)])))

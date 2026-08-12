@@ -69,6 +69,62 @@ def _attention_rank(row) -> int:
     return 2
 
 
+# The bands the ranks are drawn as. The ranks have always existed and have
+# always sorted the table; nothing on screen ever said so, so the reader
+# re-derived the judgement the daemon had already made by reading every row.
+# A sort you cannot see is not a sort.
+#
+# Four titles for five ranks: the last rank is not somebody's work and leaves
+# the list entirely. Only non-empty bands are drawn, so the usual screen has
+# two -- few bands over many rows, which is the ratio grouping needs. (Grouping
+# by node is the other way round: eight nodes over ten rows, so the headings
+# would outnumber what they head.)
+BANDS = (
+    (0, 'not reachable'),
+    (1, 'just stopped'),
+    (2, 'working'),
+    (3, 'quiet a while'),
+)
+BAND_TITLES = dict(BANDS)
+# Rank 4 -- the "start a shell here" offers. Real, but not sessions, and
+# mixing an offer into a list of states is what made 40% of the rows things
+# you cannot attach to.
+OFFER_RANK = 4
+
+
+def session_rank(row) -> int:
+    """How much this row wants a decision. See _attention_rank."""
+    return _attention_rank(row)
+
+
+def plan_rows(rows):
+    """Lay rows out as bands, in the order they already sort in.
+
+    Returns a flat list of ('band', title, count) and ('row', row), which is
+    what the table is built from -- and, deliberately, a pure function of the
+    rows, so the layout can be checked without a terminal.
+
+    The offers get a band of their own rather than leaving the list. Folding
+    them to a single line was the first attempt and it was wrong twice over:
+    `s` opens a shell on the *selected* node and `k` puts the *selected*
+    node's job on auto-renew, so a row you cannot select is a node you can no
+    longer SSH to or keep alive. rank 4 calls them "not somebody's work",
+    which is true of the session and not of the machine.
+
+    A band gets the separation that was the point -- they stop being
+    interleaved with things you can attach to -- and costs nothing.
+    """
+    ranked = [(session_rank(r), r) for r in rows]
+    plan = []
+    for rank, title in BANDS + ((OFFER_RANK, 'start a shell here'),):
+        band = [r for got, r in ranked if got == rank]
+        if not band:
+            continue                    # an empty band is a heading over nothing
+        plan.append(('band', title, len(band)))
+        plan.extend(('row', r) for r in band)
+    return plan
+
+
 def _coerce_idle_seconds(value):
     """Accept only a real, finite, non-negative idle count."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):

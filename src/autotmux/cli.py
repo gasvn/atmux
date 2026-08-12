@@ -64,7 +64,7 @@ from autotmux.model import (                                    # noqa: F401
     _IDLE_DOT, _OFFLINE_SESSION, _START_SHELL_SESSION,
     _attention_rank, _coerce_idle_seconds, _format_idle, _idle_marker,
     _idle_tier, _looks_stale, _session_label, _split_idle_marker,
-    build_session_rows,
+    build_session_rows, plan_rows, session_rank,
 )
 
 STATE_FILE = paths.STATE_FILE
@@ -2491,6 +2491,24 @@ def _idle_cell(marker) -> rich.text.Text:
 
 
 
+def _band_cells(title: str, count: int) -> tuple:
+    """A band heading, as the six cells a DataTable row is made of.
+
+    Dim and lower-case, so it reads as furniture rather than as another
+    session -- the whole point is that the rows under it stand out, not that
+    the heading does. The count goes in the heading because "just stopped 4"
+    is the sentence somebody came to the screen for, and reading it should
+    not require counting rows.
+    """
+    head = rich.text.Text(f'{title} ', style='dim')
+    head.append(str(count), style='bold')
+    # The lead cell carries the rule so the band starts at the left edge of
+    # the table. In the NODE column alone it began one column in, which reads
+    # as an indented node name rather than as a heading over what follows.
+    return (rich.text.Text('──', style='dim'), head,
+            rich.text.Text(''), rich.text.Text(''),
+            rich.text.Text(''), rich.text.Text(''))
+
 class ClickToAttachDataTable(DataTable):
     """A DataTable where a *single* mouse click selects the clicked row.
 
@@ -2516,6 +2534,50 @@ class ClickToAttachDataTable(DataTable):
     # with a name that says what it does.
     BINDINGS = [Binding("enter", "select_cursor", "Attach", show=True)]
 
+    # ── band headings the cursor walks over ──────────────────────────────
+    # The table draws its attention bands as rows, because a DataTable has no
+    # other way to put a heading between rows. A heading is not somewhere the
+    # cursor may rest: landing on one leaves `selected_session` pointing at
+    # nothing, so attach, preview and `k` would all act on the row before it.
+    #
+    # Skipping is done here rather than by correcting afterwards in
+    # RowHighlighted, because by then the cursor has already stopped and the
+    # direction it was travelling is gone. Whoever owns the rows sets this.
+    def is_heading(self, row: int) -> bool:
+        check = getattr(self, 'heading_rows', None)
+        return bool(check) and row in check
+
+    def _step_over_headings(self, came_from: int, step: int) -> None:
+        """Carry on past a heading, or go back to where the move started.
+
+        Going back matters at the ends. The first row of the table is a
+        heading, so `up` from the row below it lands on one with nothing
+        above -- and leaving the cursor there is exactly the state this
+        exists to prevent: no selection, and `k`/attach/preview all acting on
+        nothing. Measured before the fix: seven presses of `up` all rested on
+        row 0.
+        """
+        row = self.cursor_row
+        while self.is_heading(row):
+            row += step
+            if not 0 <= row < self.row_count:
+                self.move_cursor(row=came_from)
+                return
+        if row != self.cursor_row:
+            self.move_cursor(row=row)
+
+    def action_cursor_down(self) -> None:
+        came_from = self.cursor_row
+        super().action_cursor_down()
+        self._step_over_headings(came_from, 1)
+
+    def action_cursor_up(self) -> None:
+        came_from = self.cursor_row
+        super().action_cursor_up()
+        # Up, and then up again: a heading belongs to what is *below* it, so
+        # arriving on one from below means the reader wanted the band above.
+        self._step_over_headings(came_from, -1)
+
     async def _on_click(self, event: events.Click) -> None:
         meta = event.style.meta
         if "row" not in meta or "column" not in meta:
@@ -2523,6 +2585,13 @@ class ClickToAttachDataTable(DataTable):
         row_index = meta["row"]
         column_index = meta["column"]
         if row_index < 0 or column_index < 0:
+            return
+        # A heading is not a row you can attach to, and this class exists to
+        # make a single click attach. Swallowed rather than redirected: a
+        # click that jumped somewhere the finger was not is worse than one
+        # that did nothing.
+        if self.is_heading(row_index):
+            event.stop()
             return
         if self.show_cursor and self.cursor_type != "none":
             self.cursor_coordinate = Coordinate(row_index, column_index)
@@ -3679,6 +3748,13 @@ class AutotmuxApp(App):
             self.set_interval(0.25, self._sync_touch_bar)
 
         self.all_sessions: list = []
+        # Index-for-index with the *table*, which the session list is not:
+        # a band heading takes a row of its own and holds None here. Kept
+        # separate rather than threading Nones through all_sessions, because
+        # `all_sessions` means the sessions and everything reading it expects
+        # exactly that -- quietly changing what a name means is how a rename
+        # becomes a bug somewhere it was never edited.
+        self.row_targets: list = []
         # The row the cursor should land on. _refresh_table restores the
         # cursor by (node, session) on every rebuild, so seeding it here is
         # the whole of --select: the first paint already has the right row
@@ -4044,17 +4120,36 @@ class AutotmuxApp(App):
                 self._dispatch_warm(rows)
             return
 
-        structural = tuple((r[0], r[1]) for r in rows)
+        # The bands are part of the structure: a session moving from "working"
+        # to "just stopped" changes no (node, session) pair but does change
+        # which heading it sits under, and the in-place path cannot move a row
+        # between bands. Including the rank forces the rebuild that can.
+        structural = tuple((r[0], r[1], session_rank(r)) for r in rows)
         if (structural == self._last_structural_sig
-                and len(rows) == self.table.row_count):
-            # Same (node, session) rows in the same order; only volatile cells
-            # (time/cpu/load/win/status) changed. Update them in place instead
-            # of clear()+add_row — the latter resets the cursor and churns
-            # RowHighlighted every 5s because the load average ticks constantly.
-            self.all_sessions = rows
+                and len(self.row_targets) == self.table.row_count):
+            # Same (node, session) rows, in the same order and the same bands;
+            # only volatile cells (time/cpu/load/win/status) changed. Update
+            # them in place instead of clear()+add_row — the latter resets the
+            # cursor and churns RowHighlighted every 5s because the load
+            # average ticks constantly.
+            #
+            # Walked against the placed list rather than by enumerating rows:
+            # the table row index and the session index stopped being the same
+            # number the moment headings took slots of their own.
+            fresh = iter(rows)
+            placed = list(self.row_targets)
             ok = True
-            for i, r in enumerate(rows):
+            for i, slot in enumerate(placed):
+                if slot is None:
+                    continue            # a heading has nothing volatile in it
+                r = next(fresh, None)
+                if r is None:
+                    ok = False
+                    break
+                placed[i] = r
                 ok = self._update_row_cells(i, r) and ok
+            self.row_targets = placed
+            self.all_sessions = rows
             # Only cache the sig if the screen actually matches it — otherwise a
             # swallowed cell-write failure would stick a stale cell until the
             # next structural change.
@@ -4074,23 +4169,40 @@ class AutotmuxApp(App):
         # ever arrives. Held separately until it does.
         if getattr(self, '_select', None):
             previous = self._select
-        self.all_sessions = rows
+        # The bands. A heading is a table row of its own, so the table stops
+        # being index-for-index with the session list; `row_targets` is the
+        # one that stays aligned with the table, and holds None where a
+        # heading sits.
+        plan = plan_rows(rows)
+        placed = []
+        headings = set()
         self.table.clear()
-        for r in rows:
+        for entry in plan:
+            if entry[0] == 'band':
+                headings.add(len(placed))
+                placed.append(None)
+                self.table.add_row(*_band_cells(entry[1], entry[2]))
+                continue
+            r = entry[1]
             # row layout: (node, session, wins, time, status, cpu, load)
             marker, status = _split_idle_marker(r[4])
             status = self._status_or_note(r[1], _status_text(status))
+            placed.append(r)
             self.table.add_row(
                 _idle_cell(marker),
                 *(_literal_cell(value) for value in (
                     _node_label(r[0]), _session_cell(r[1], r[2]),
                     _time_left_label(r[3]), _load_label(r[6], r[5]), status)),
             )
+        self.table.heading_rows = headings
+        self.row_targets = placed
+        self.all_sessions = [r for r in placed if r is not None]
+        rows = self.all_sessions
 
         if rows:
-            new_idx = 0
-            for i, r in enumerate(rows):
-                if (r[0], r[1]) == previous:
+            new_idx = next((i for i, r in enumerate(placed) if r is not None), 0)
+            for i, r in enumerate(placed):
+                if r is not None and (r[0], r[1]) == previous:
                     new_idx = i
                     # Granted. From here it is an ordinary selection and
                     # moves like one.
@@ -4103,7 +4215,10 @@ class AutotmuxApp(App):
             # cursor falls back to row 0), which would otherwise leave
             # selected_node/session pointing at a gone row — so `k`/attach/preview
             # would act on the wrong job.
-            self.selected_node, self.selected_session = rows[new_idx][0], rows[new_idx][1]
+            # `placed`, not `rows`: new_idx is a table row, and the table has
+            # headings in it that the session list does not.
+            landed = placed[new_idx]
+            self.selected_node, self.selected_session = landed[0], landed[1]
             if (self.selected_node, self.selected_session) != previous:
                 self._selection_changed_at = time.monotonic()
                 if self._preview_render_timer is not None:
@@ -4894,9 +5009,15 @@ class AutotmuxApp(App):
             idx = self.table.get_row_index(row_key)
         except Exception:
             return None
-        if not (0 <= idx < len(self.all_sessions)):
+        if not (0 <= idx < len(self.row_targets)):
             return None
-        return self.all_sessions[idx][0], self.all_sessions[idx][1]
+        row = self.row_targets[idx]
+        # A band heading holds a slot so the list stays index-for-index with
+        # the table, and it is not a target: attach, preview and `k` must all
+        # decline rather than act on whatever row happens to be adjacent.
+        if row is None:
+            return None
+        return row[0], row[1]
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         target = self._row_target(event.row_key)

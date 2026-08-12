@@ -67,6 +67,20 @@ def _setup_state(tmpdir):
     return state_path, snap_path
 
 
+def table_row(app, session):
+    """Which table row a session sits on.
+
+    Not its index in all_sessions, and not a constant: the table carries
+    band headings of its own, so row 0 is a heading rather than the first
+    session. Tests that hard-code a row number are testing the layout of
+    the day they were written.
+    """
+    for i, r in enumerate(app.row_targets):
+        if r is not None and r[1] == session:
+            return i
+    raise AssertionError(f'{session!r} is not on the table')
+
+
 class MouseMotionTrackingTests(unittest.TestCase):
     """Any-motion mouse tracking (1003h) reports an escape sequence per mouse
     move, which floods a slow/remote (SSH) terminal's input and buries
@@ -479,8 +493,8 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 # LOAD is display column 4 and carries load/cpus. Find the
                 # row rather than assuming index 0: attention ordering puts
                 # an offline node above a healthy one.
-                row = next(i for i, r in enumerate(app.all_sessions)
-                           if r[0] == 'gpu1')
+                row = next(i for i, r in enumerate(app.row_targets)
+                           if r is not None and r[0] == 'gpu1')
                 self.assertEqual(
                     str(app.table.get_cell_at(Coordinate(row, 4))), '7.8')
                 self.assertEqual(app._last_structural_sig, sig_before,
@@ -505,7 +519,8 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }
                 app._refresh_table(state)
-                cell = app.table.get_cell_at(Coordinate(0, 2))
+                cell = app.table.get_cell_at(
+                    Coordinate(table_row(app, '[bold]literal[/bold]'), 2))
                 self.assertIsInstance(cell, autotmux.rich.text.Text)
                 self.assertEqual(cell.plain, '[bold]literal[/bold]')
 
@@ -571,6 +586,71 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                         await pilot.press(key)
                         await pilot.pause()
                         self.assertEqual(app.focused.id, want)
+
+    async def test_the_cursor_never_rests_on_a_band_heading(self):
+        """A heading is a table row because a DataTable has no other way to
+        put one between rows -- and it is not somewhere the cursor may stop:
+        attach, preview and `k` all read the selected row, and a heading is
+        not a row you can act on.
+
+        The ends are where this goes wrong. The first row of the table is a
+        heading, so `up` from the row below lands on one with nothing above.
+        Measured before the fix: seven presses of `up` all rested on row 0.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                heads = set(app.table.heading_rows)
+                self.assertTrue(heads, 'no bands, so nothing is proved')
+                for key in ('down', 'up'):
+                    for _ in range(app.table.row_count + 3):
+                        await pilot.press(key)
+                        await pilot.pause()
+                        with self.subTest(key=key, row=app.table.cursor_row):
+                            self.assertNotIn(app.table.cursor_row, heads)
+                            self.assertTrue(app.selected_session)
+
+    async def test_a_heading_is_not_a_target_even_if_something_lands_on_it(self):
+        """Belt as well as braces: the cursor is kept off them, and asking
+        what one points at answers nothing rather than the adjacent row."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                keys = list(app.table.rows)
+                for row in sorted(app.table.heading_rows):
+                    with self.subTest(row=row):
+                        self.assertIsNone(app._row_target(keys[row]))
+
+    async def test_the_bands_are_drawn_and_the_offers_come_last(self):
+        """The ranks have always sorted this table and were never drawn."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                titles = [str(app.table.get_cell_at(Coordinate(r, 1)))
+                          for r in sorted(app.table.heading_rows)]
+                self.assertTrue(titles)
+                # Every heading counts what is under it, so "just stopped 4"
+                # can be read without counting rows.
+                for title in titles:
+                    with self.subTest(title=title):
+                        self.assertRegex(title, r' \d+$')
+                # The bands keep the order the ranks already chose; they must
+                # not invent one. Asserted as an ordering rather than as a
+                # fixed list, because which bands exist depends on what is
+                # running -- an empty band is never drawn.
+                order = [t for t, _ in autotmux.model.BANDS]
+                order = [autotmux.model.BAND_TITLES[r] for r in order]
+                order.append('start a shell here')
+                seen = [next(i for i, o in enumerate(order)
+                             if t.startswith(o)) for t in titles]
+                self.assertEqual(seen, sorted(seen),
+                                 f'bands out of order: {titles}')
 
     async def test_the_preview_says_whose_output_it_is_showing(self):
         """It showed a screenful of someone's output with nothing to say
@@ -1331,7 +1411,11 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             headers = [str(c.label) for c in app.table.columns.values()]
             rows = {}
-            for i, r in enumerate(app.all_sessions):
+            # row_targets, not all_sessions: the table carries band headings
+            # of its own, so its row numbers stopped being session numbers.
+            for i, r in enumerate(app.row_targets):
+                if r is None:
+                    continue
                 cells = [app.table.get_cell_at(Coordinate(i, c))
                          for c in range(len(headers))]
                 rows[r[1]] = cells
@@ -1378,20 +1462,33 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(rows['old'][0].spans[0].style), 'red')
         self.assertEqual(rows['busy'][0].spans, [])
 
-    async def test_in_place_updates_keep_the_columns_aligned(self):
-        """The fast path writes cells by index; a stale mapping would put the
-        load average in STATUS."""
+    async def test_updates_keep_the_columns_aligned(self):
+        """A stale mapping would put the load average in STATUS.
+
+        Both paths are exercised here, and which one runs is the point. A
+        load average ticking changes no band, so it is written in place --
+        that path exists because a rebuild every 5s resets the cursor. A tier
+        change does move the row to another band, and the in-place path
+        cannot move a row, so the rank is part of the structural signature
+        and this rebuilds instead.
+        """
         app = autotmux.AutotmuxApp()
         async with app.run_test() as pilot:
             app._refresh_table(self.IDLE_STATE)
             await pilot.pause()
-            moved = json.loads(json.dumps(self.IDLE_STATE))
-            moved['nodes']['gpu1']['info']['load'] = '9.99'
-            moved['nodes']['gpu1']['sessions'][0][2] = 7200   # quiet -> stale
-            app._refresh_table(moved)
+            ticked = json.loads(json.dumps(self.IDLE_STATE))
+            ticked['nodes']['gpu1']['info']['load'] = '9.99'
+            app._refresh_table(ticked)                    # in place
             await pilot.pause()
-            names = [r[1] for r in app.all_sessions]
-            row = names.index('quiet')
+            self.assertEqual(
+                str(app.table.get_cell_at(
+                    Coordinate(table_row(app, 'quiet'), 4))), '10.0')
+
+            moved = json.loads(json.dumps(ticked))
+            moved['nodes']['gpu1']['sessions'][0][2] = 7200   # quiet -> stale
+            app._refresh_table(moved)                     # rebuild
+            await pilot.pause()
+            row = table_row(app, 'quiet')
             self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 0))),
                              '● 2h')
             self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 4))),
