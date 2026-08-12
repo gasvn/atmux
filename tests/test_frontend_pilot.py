@@ -360,9 +360,12 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                     attached.append((app.selected_node, app.selected_session))
 
                 app.action_attach_session = fake_attach
-                # Cursor starts on row 0; click a *different* row (index 1).
-                # Header occupies y=0, so data row 1 is at y=2.
-                await pilot.click(app.table, offset=(3, 2))
+                # Computed, not counted. There is no header row any more and
+                # the bands take rows of their own, so which y is a session
+                # is a question only the table can answer.
+                want = [i for i, r in enumerate(app.row_targets)
+                        if r is not None][-1]
+                await pilot.click(app.table, offset=(3, want))
                 await pilot.pause()
 
                 self.assertEqual(len(attached), 1,
@@ -475,31 +478,32 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                     await app._reload_snapshots_async()
                 self.assertIn('gpu1:train', app.snapshots)
 
-    async def test_load_change_updates_cell_in_place(self):
-        """When only a volatile field (load average) changes, the table is
-        updated in place — the LOAD cell reflects the new value and no full
-        structural rebuild happens (keeps the 5s tick smooth)."""
-        from textual.coordinate import Coordinate
+    async def test_a_tick_of_the_clock_updates_in_place(self):
+        """The in-place path exists because clear()+add_row resets the
+        cursor, and something on these rows changes every five seconds. What
+        it rewrites is the whole line now -- one cell, composed -- rather
+        than four cells of a grid.
+        """
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)
             app = autotmux.AutotmuxApp()
-            async with app.run_test() as pilot:
+            async with app.run_test(size=(120, 30)) as pilot:
                 await pilot.pause()
-                sig_before = app._last_structural_sig
-                new_state = json.loads(json.dumps(SYNTH_STATE))
-                new_state['nodes']['gpu1']['info']['load'] = '7.77'
-                app._refresh_table(new_state)
+                state = {'updated': 'now', 'nodes': {'gpu1': {
+                    'alive': True, 'socket': '/tmp/x', 'last_error': '',
+                    'info': {'time': '1-00:00:00'},
+                    'sessions': [['train', '1', 400]]}}}
+                app._refresh_table(state)
                 await pilot.pause()
-                # LOAD is display column 4 and carries load/cpus. Find the
-                # row rather than assuming index 0: attention ordering puts
-                # an offline node above a healthy one.
-                row = next(i for i, r in enumerate(app.row_targets)
-                           if r is not None and r[0] == 'gpu1')
-                self.assertEqual(
-                    str(app.table.get_cell_at(Coordinate(row, 4))), '7.8')
-                self.assertEqual(app._last_structural_sig, sig_before,
-                                 "load-only change must not trigger a structural rebuild")
-
+                before = str(app.table.get_cell_at(
+                    Coordinate(table_row(app, 'train'), 0)))
+                state['nodes']['gpu1']['sessions'][0][2] = 500
+                app._refresh_table(state)
+                await pilot.pause()
+                after = str(app.table.get_cell_at(
+                    Coordinate(table_row(app, 'train'), 0)))
+                self.assertNotEqual(before, after)
+                self.assertIn('train', after)
     async def test_dynamic_table_cells_are_literal_not_rich_markup(self):
         from textual.coordinate import Coordinate
         with tempfile.TemporaryDirectory() as td:
@@ -520,9 +524,12 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 }
                 app._refresh_table(state)
                 cell = app.table.get_cell_at(
-                    Coordinate(table_row(app, '[bold]literal[/bold]'), 2))
+                    Coordinate(table_row(app, '[bold]literal[/bold]'), 0))
                 self.assertIsInstance(cell, autotmux.rich.text.Text)
-                self.assertEqual(cell.plain, '[bold]literal[/bold]')
+                # Composed, so the markup has to survive inside the line
+                # rather than as a cell of its own -- Text.append() never
+                # parses it, which is the property being guarded.
+                self.assertIn('[bold]literal[/bold]', cell.plain)
 
     async def test_the_arrows_move_the_table_while_the_table_has_the_keyboard(self):
         """The concern that once emptied the focus chain, kept.
@@ -632,7 +639,8 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
             app = autotmux.AutotmuxApp()
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.pause()
-                titles = [str(app.table.get_cell_at(Coordinate(r, 1)))
+                titles = [str(app.table.get_cell_at(Coordinate(r, 0)))
+                          .replace('── ', '')
                           for r in sorted(app.table.heading_rows)]
                 self.assertTrue(titles)
                 # Every heading counts what is under it, so "just stopped 4"
@@ -1383,10 +1391,16 @@ class ExpiringJobWarningTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.all_sessions)
 
 
-class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
-    """The idle hint leads the table. STATUS is the first column a narrow
-    terminal truncates, so a hint parked there is invisible exactly when the
-    table is crowded — which is when it matters."""
+class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
+    """Each row is one composed line, not six cells.
+
+    A grid is the wrong shape for rows meant to read as sentences: every
+    column is shared by everything in it, so a band heading had to be
+    squeezed into one of them, and one wide value set a column's width for
+    every row. Composing the line lets the last field take whatever is left
+    -- which is where the output goes, and the output is the thing that says
+    whether a stopped session finished or broke.
+    """
 
     IDLE_STATE = {
         'updated': '2026-01-01 00:00:00',
@@ -1404,98 +1418,113 @@ class IdleColumnLayoutTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         autotmux._launch_daemon = self._saved_launch
 
-    async def _render(self, state):
+    async def _lines(self, state, snapshots=None):
+        """The composed line for each session, by session name."""
         app = autotmux.AutotmuxApp()
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(120, 30)) as pilot:
+            if snapshots:
+                app.snapshots = snapshots
             app._refresh_table(state)
             await pilot.pause()
-            headers = [str(c.label) for c in app.table.columns.values()]
-            rows = {}
-            # row_targets, not all_sessions: the table carries band headings
-            # of its own, so its row numbers stopped being session numbers.
+            out = {}
             for i, r in enumerate(app.row_targets):
                 if r is None:
                     continue
-                cells = [app.table.get_cell_at(Coordinate(i, c))
-                         for c in range(len(headers))]
-                rows[r[1]] = cells
-            return headers, rows
+                out[r[1]] = app.table.get_cell_at(Coordinate(i, 0))
+            return out
 
-    async def test_idle_is_the_first_column(self):
-        headers, _ = await self._render(self.IDLE_STATE)
-        self.assertEqual(headers[0], 'IDLE')
-        self.assertEqual(
-            headers,
-            ['IDLE', 'NODE', 'SESSION', 'LEFT', 'LOAD', 'STATUS'])
+    async def test_the_table_is_one_column_with_no_header(self):
+        """A header names columns, and there are none to name. The bands say
+        what each group is, which is the heading that was actually missing."""
+        app = autotmux.AutotmuxApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(len(app.table.columns), 1)
+            self.assertFalse(app.table.show_header)
 
-    async def test_marker_moves_out_of_status_into_the_lead_cell(self):
-        _, rows = await self._render(self.IDLE_STATE)
-        self.assertEqual(str(rows['quiet'][0]), '● 15m')
-        # Not duplicated, and a healthy row leaves STATUS empty.
-        self.assertEqual(str(rows['quiet'][-1]), '')
+    async def test_the_idle_marker_leads_and_is_coloured_by_tier(self):
+        lines = await self._lines(self.IDLE_STATE)
+        self.assertTrue(str(lines['quiet']).startswith('● 15m'))
+        self.assertEqual(str(lines['quiet'].spans[0].style), 'yellow')
+        self.assertEqual(str(lines['old'].spans[0].style), 'red')
 
-    async def test_a_troubled_row_still_reports_in_status(self):
-        """Quieting the healthy baseline must not quiet the rows that matter."""
+    async def test_a_busy_session_leads_with_nothing(self):
+        """Silence is the healthy state, so it says nothing at all."""
+        lines = await self._lines(self.IDLE_STATE)
+        self.assertTrue(str(lines['busy']).startswith(' '))
+        self.assertNotIn('●', str(lines['busy']))
+
+    async def test_the_name_comes_before_the_machine(self):
+        """It is what the reader navigates by. It used to be third, behind a
+        dot, a duration and a machine name."""
+        lines = await self._lines(self.IDLE_STATE)
+        text = str(lines['quiet'])
+        self.assertLess(text.index('quiet'), text.index('gpu1'))
+
+    async def test_the_line_ends_with_what_the_session_was_doing(self):
+        """The half of the design that was missing, and the reason the bands
+        alone read as furniture: a band says four things stopped, and only
+        this says which one broke."""
+        lines = await self._lines(self.IDLE_STATE, snapshots={
+            'gpu1:quiet': {'lines': 'collected 214 items\n1264 passed\n'},
+            'gpu1:old': {'lines': "Traceback (most recent call last):\nKeyError: 'lr'\n"},
+        })
+        self.assertTrue(str(lines['quiet']).rstrip().endswith('1264 passed'))
+        self.assertTrue(str(lines['old']).rstrip().endswith("KeyError: 'lr'"))
+
+    async def test_a_session_with_no_snapshot_yet_says_nothing(self):
+        """Rather than an apology. The snapshot loop fills in on its own."""
+        lines = await self._lines(self.IDLE_STATE)
+        self.assertEqual(str(lines['busy']).split(), ['busy', 'gpu1'])
+
+    async def test_a_troubled_row_reports_instead_of_its_output(self):
+        """Quieting the healthy baseline must not quiet the rows that
+        matter: DEGRADED is worth more than the last line of the pane."""
         state = json.loads(json.dumps(self.IDLE_STATE))
         state['nodes']['gpu1']['last_error'] = 'connect timeout'
-        _, rows = await self._render(state)
-        self.assertIn('DEGRADED', str(rows['quiet'][-1]))
-        self.assertIn('connect timeout', str(rows['quiet'][-1]))
+        lines = await self._lines(state)
+        self.assertIn('DEGRADED', str(lines['quiet']))
+        self.assertIn('connect timeout', str(lines['quiet']))
 
-    async def test_an_offline_node_still_reports_in_status(self):
+    async def test_an_offline_node_names_the_machine_not_a_placeholder(self):
+        """`<offline>` under a heading that reads "not reachable" is the
+        repetition the bands were meant to remove. For these rows the
+        machine is the identity: there is no session to name."""
         state = json.loads(json.dumps(self.IDLE_STATE))
         state['nodes']['gpu1']['alive'] = False
         state['nodes']['gpu1']['last_error'] = 'master down'
-        _, rows = await self._render(state)
-        offline = next(cells for name, cells in rows.items()
-                       if 'offline' in name)
-        self.assertIn('OFFLINE', str(offline[-1]))
+        lines = await self._lines(state)
+        line = next(v for k, v in lines.items() if 'offline' in k)
+        self.assertIn('gpu1', str(line))
+        self.assertNotIn('<offline>', str(line))
+        self.assertIn('OFFLINE', str(line))
 
-    async def test_a_busy_session_has_an_empty_lead_cell(self):
-        _, rows = await self._render(self.IDLE_STATE)
-        self.assertEqual(str(rows['busy'][0]), '')
-        self.assertEqual(str(rows['busy'][-1]), '')
+    async def test_a_narrow_screen_keeps_the_part_of_a_name_that_differs(self):
+        """Cut from the right, holygpu8a15104 / 15304 / 15602 all become
+        `holygpu8a1` -- the part every node in the cluster shares, and none
+        of the part that says which one. Machine names distinguish at the
+        end, so that is the end to keep."""
+        self.assertEqual(autotmux._fit_node('holygpu8a15304', 10), '…pu8a15304')
+        self.assertEqual(autotmux._fit_node('localhost', 12), 'localhost   ')
+        # Distinguishable is the whole point: two nodes must not collide.
+        cut = {autotmux._fit_node(n, 10) for n in
+               ('holygpu8a15104', 'holygpu8a15304', 'holygpu8a15602')}
+        self.assertEqual(len(cut), 3)
 
-    async def test_the_dot_is_coloured_by_tier(self):
-        _, rows = await self._render(self.IDLE_STATE)
-        self.assertEqual(str(rows['quiet'][0].spans[0].style), 'yellow')
-        self.assertEqual(str(rows['old'][0].spans[0].style), 'red')
-        self.assertEqual(rows['busy'][0].spans, [])
-
-    async def test_updates_keep_the_columns_aligned(self):
-        """A stale mapping would put the load average in STATUS.
-
-        Both paths are exercised here, and which one runs is the point. A
-        load average ticking changes no band, so it is written in place --
-        that path exists because a rebuild every 5s resets the cursor. A tier
-        change does move the row to another band, and the in-place path
-        cannot move a row, so the rank is part of the structural signature
-        and this rebuilds instead.
-        """
+    async def test_updates_in_place_keep_the_line_correct(self):
+        """The in-place path exists because a rebuild every five seconds
+        resets the cursor, and the load average ticks that often."""
         app = autotmux.AutotmuxApp()
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(120, 30)) as pilot:
             app._refresh_table(self.IDLE_STATE)
             await pilot.pause()
-            ticked = json.loads(json.dumps(self.IDLE_STATE))
-            ticked['nodes']['gpu1']['info']['load'] = '9.99'
-            app._refresh_table(ticked)                    # in place
-            await pilot.pause()
-            self.assertEqual(
-                str(app.table.get_cell_at(
-                    Coordinate(table_row(app, 'quiet'), 4))), '10.0')
-
-            moved = json.loads(json.dumps(ticked))
+            moved = json.loads(json.dumps(self.IDLE_STATE))
             moved['nodes']['gpu1']['sessions'][0][2] = 7200   # quiet -> stale
-            app._refresh_table(moved)                     # rebuild
+            app._refresh_table(moved)
             await pilot.pause()
             row = table_row(app, 'quiet')
-            self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 0))),
-                             '● 2h')
-            self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 4))),
-                             '10.0')
-            self.assertEqual(str(app.table.get_cell_at(Coordinate(row, 5))),
-                             '')
-
+            self.assertTrue(
+                str(app.table.get_cell_at(Coordinate(row, 0))).startswith('● 2h'))
 
 class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
     """`z` trades panes for room.

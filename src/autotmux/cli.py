@@ -2491,6 +2491,94 @@ def _idle_cell(marker) -> rich.text.Text:
 
 
 
+# ── one column, composed by hand ────────────────────────────────────────
+# The table was six columns, and a grid is the wrong shape for rows that
+# are meant to read as sentences. Every column was shared by everything in
+# it, so a band heading had to live in one of them -- it ended up as a `──`
+# stub stranded in IDLE with its title starting one column in, reading as a
+# value rather than as a heading -- and one folded 60-character line set the
+# width of NODE for every row in the table.
+#
+# One column, padded here, costs the alignment that a grid gives for free and
+# buys back the thing the design needs: a line whose last field takes whatever
+# width is left, which is where the output goes.
+_TAIL_MIN = 24
+
+
+def _row_widths(rows, total: int) -> tuple:
+    """How wide the fixed fields are, from the rows actually present.
+
+    Measured per rebuild rather than fixed, because these are names and a
+    fixed guess is either padding or truncation on somebody's cluster.
+    """
+    lead = max([6] + [len(_idle_marker_text(r)) for r in rows])
+    name = max([7] + [len(_session_cell(r[1], r[2])) for r in rows])
+    where = max([4] + [len(_node_label(r[0])) for r in rows])
+    # The output takes what is left, and the names give way before it does:
+    # a truncated session name is still recognisable, and a truncated
+    # traceback is not.
+    spare = total - (lead + name + where + 6)
+    if spare < _TAIL_MIN:
+        where = max(4, where - (_TAIL_MIN - spare))
+    return lead, name, where
+
+
+def _fit_node(label: str, width: int) -> str:
+    """A machine name in `width` columns, keeping the end.
+
+    Cut from the right, holygpu8a15104 / holygpu8a15304 / holygpu8a15602 all
+    become `holygpu8a1` -- the part that is the same on every node in the
+    cluster, and none of the part that says which one. Machine names
+    distinguish at the end, so that is the end to keep.
+    """
+    if len(label) <= width:
+        return label.ljust(width)
+    return '…' + label[-(width - 1):] if width > 1 else label[-width:]
+
+
+def _idle_marker_text(r) -> str:
+    marker, _rest = _split_idle_marker(r[4])
+    return str(marker)
+
+
+def _compose_session(r, widths, tail: str, total: int) -> rich.text.Text:
+    """One session, as a line.
+
+    The name comes first now. It is what the reader navigates by -- the
+    artefact that argued for this said so while leaving it in column three,
+    behind a dot, a duration and a machine name.
+    """
+    lead, name, where = widths
+    marker = _idle_marker_text(r)
+    line = rich.text.Text()
+    if marker.startswith(_IDLE_DOT):
+        tier = 'stale' if _looks_stale(marker) else 'idle'
+        line.append(_IDLE_DOT, style=_IDLE_STYLES[tier])
+        line.append(marker[len(_IDLE_DOT):].ljust(lead - len(_IDLE_DOT)))
+    else:
+        line.append(' ' * lead)
+    line.append('  ')
+    if r[1] in (_OFFLINE_SESSION, _START_SHELL_SESSION):
+        # For these the machine is the identity: there is no session to name,
+        # and the band above already says what the row is -- printing
+        # `<offline>` under a heading that reads "not reachable" is the
+        # repetition the bands were meant to remove.
+        line.append(_node_label(r[0]).ljust(name + where + 2)[:name + where + 2],
+                    style='dim')
+    else:
+        line.append(_session_cell(r[1], r[2]).ljust(name)[:name], style='bold')
+        line.append('  ')
+        line.append(_fit_node(_node_label(r[0]), where), style='dim')
+    line.append('  ')
+    # What the session was doing, which is the question the row raises and
+    # the one no column of measurements answers. Already collected: the
+    # daemon snapshots every pane on a timer for the preview.
+    room = max(0, total - (lead + name + where + 6))
+    if tail:
+        line.append(tail[:room] if len(tail) <= room else tail[:room - 1] + '…')
+    return line
+
+
 def _band_cells(title: str, count: int) -> tuple:
     """A band heading, as the six cells a DataTable row is made of.
 
@@ -2500,14 +2588,10 @@ def _band_cells(title: str, count: int) -> tuple:
     is the sentence somebody came to the screen for, and reading it should
     not require counting rows.
     """
-    head = rich.text.Text(f'{title} ', style='dim')
-    head.append(str(count), style='bold')
-    # The lead cell carries the rule so the band starts at the left edge of
-    # the table. In the NODE column alone it began one column in, which reads
-    # as an indented node name rather than as a heading over what follows.
-    return (rich.text.Text('──', style='dim'), head,
-            rich.text.Text(''), rich.text.Text(''),
-            rich.text.Text(''), rich.text.Text(''))
+    head = rich.text.Text('── ', style='dim')
+    head.append(title, style='dim')
+    head.append(f' {count}', style='dim bold')
+    return head
 
 class ClickToAttachDataTable(DataTable):
     """A DataTable where a *single* mouse click selects the clicked row.
@@ -3711,14 +3795,21 @@ class AutotmuxApp(App):
     async def on_mount(self) -> None:
         self.table = self.query_one(DataTable)
         self.table.cursor_type = "row"
-        # IDLE leads: STATUS is the first thing a narrow terminal truncates, so
-        # a hint parked there is invisible exactly when the table is crowded.
-        # Six columns. CPU folds into LOAD as "load/cpus", the only form
-        # either number is read in; the window count rides on SESSION, since
-        # it is 1 for virtually every session and a whole column for a
-        # constant is width the table does not have to spend.
-        self.table.add_columns(
-            "IDLE", "NODE", "SESSION", "LEFT", "LOAD", "STATUS")
+        # One column, and the line inside it composed by hand.
+        #
+        # It was six, and a grid is the wrong shape for rows meant to read as
+        # sentences: every column is shared by everything in it, so a band
+        # heading had to be squeezed into one of them, and one wide value set
+        # a column's width for every row. Composing the line means the last
+        # field can take whatever width is left, which is where the output
+        # goes -- and the output is the thing that says whether a stopped
+        # session finished or broke.
+        #
+        # No header either. A header names columns, and there are none to
+        # name; the bands say what each group is, which is the heading that
+        # was actually missing.
+        self.table.add_columns("SESSIONS")
+        self.table.show_header = False
 
         self.log_view = self.query_one("#right_pane", Static)
         self.jobs_view = self.query_one("#jobs_panel", Static)
@@ -3991,25 +4082,65 @@ class AutotmuxApp(App):
             return status
         return self._notes.get(str(session), '')
 
+    def _row_width(self) -> int:
+        """How wide a row may be. The table is one column now, so nothing
+        else decides this for us."""
+        try:
+            width = int(self.table.size.width)
+        except Exception:
+            width = 0
+        return max(48, width - 2 if width else 78)
+
+    def _row_tail(self, r) -> str:
+        """What this session was last doing.
+
+        Free: the daemon already snapshots every pane on a timer so the
+        preview has something to show instantly, and the notice path already
+        knows how to pick the one line out of a screen that says something.
+        Nothing here is fetched.
+        """
+        session = r[1]
+        # A warning outranks the output. DEGRADED, an escape-time or a
+        # network state is about whether this row can be reached at all, and
+        # the last line of a pane you cannot reach is not the news. Dropping
+        # it here made every warning the table had invisible.
+        _marker, status = _split_idle_marker(r[4])
+        note = self._status_or_note(session, _status_text(status))
+        if note:
+            return note
+        if session in (_OFFLINE_SESSION, _START_SHELL_SESSION):
+            return ''
+        snap = self.snapshots.get(f'{r[0]}:{session}')
+        if not isinstance(snap, dict):
+            return ''
+        try:
+            return notify.last_output_line(snap.get('lines') or '')
+        except Exception:
+            return ''
+
     def _update_row_cells(self, i: int, r) -> bool:
-        """Update only the volatile cells of row i in place. Display columns
-        are IDLE0 NODE1 SESSION2 LEFT3 LOAD4 STATUS5, mapped from the row
-        tuple (node, session, wins, time, status, cpu, load). Returns False
-        if any cell write raised (so the caller can avoid caching a sig that
-        doesn't match what's actually on screen)."""
-        marker, status = _split_idle_marker(r[4])
-        status = self._status_or_note(r[1], _status_text(status))
-        ok = True
-        for col, val in ((0, marker), (3, _time_left_label(r[3])),
-                         (4, _load_label(r[6], r[5])), (5, status)):
-            coord = Coordinate(i, col)
-            cell = _idle_cell(val) if col == 0 else _literal_cell(val)
-            try:
-                if str(self.table.get_cell_at(coord)) != str(val):
-                    self.table.update_cell_at(coord, cell)
-            except Exception:
-                ok = False
-        return ok
+        """Rewrite row i in place, without rebuilding the table.
+
+        One cell now: the row is a composed line rather than six cells, so
+        there is nothing to update selectively. It still exists because the
+        reason it existed has not changed -- clear()+add_row resets the
+        cursor, and the load average ticks every five seconds.
+
+        Returns False if the write raised, so the caller can avoid caching a
+        signature that does not match what is on screen.
+        """
+        try:
+            widths = _row_widths(
+                [x for x in self.row_targets if x is not None],
+                self._row_width())
+            line = _compose_session(r, widths, self._row_tail(r),
+                                    self._row_width())
+            coord = Coordinate(i, 0)
+            if str(self.table.get_cell_at(coord)) != str(line):
+                self.table.update_cell_at(coord, line)
+            return True
+        except Exception:
+            return False
 
     # Cap background handshakes.  These are ordinary no-PTY `ssh ... true`
     # channels that leave only a short-lived ControlMaster behind; bounding the
@@ -4176,24 +4307,18 @@ class AutotmuxApp(App):
         plan = plan_rows(rows)
         placed = []
         headings = set()
+        widths = _row_widths(rows, self._row_width())
         self.table.clear()
         for entry in plan:
             if entry[0] == 'band':
                 headings.add(len(placed))
                 placed.append(None)
-                self.table.add_row(*_band_cells(entry[1], entry[2]))
+                self.table.add_row(_band_cells(entry[1], entry[2]))
                 continue
             r = entry[1]
-            # row layout: (node, session, wins, time, status, cpu, load)
-            marker, status = _split_idle_marker(r[4])
-            status = self._status_or_note(r[1], _status_text(status))
             placed.append(r)
-            self.table.add_row(
-                _idle_cell(marker),
-                *(_literal_cell(value) for value in (
-                    _node_label(r[0]), _session_cell(r[1], r[2]),
-                    _time_left_label(r[3]), _load_label(r[6], r[5]), status)),
-            )
+            self.table.add_row(_compose_session(
+                r, widths, self._row_tail(r), self._row_width()))
         self.table.heading_rows = headings
         self.row_targets = placed
         self.all_sessions = [r for r in placed if r is not None]
