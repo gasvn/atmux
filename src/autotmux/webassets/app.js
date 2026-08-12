@@ -1515,12 +1515,13 @@
   var selView = document.getElementById('selview');
   var selText = document.getElementById('seltext');
   var selHint = document.getElementById('selhint');
+  var selCopy = document.getElementById('selcopy');
 
   // Everything the terminal is holding, scrollback first. buffer.active runs
   // from the oldest retained line to the bottom of the screen, so this is
   // strictly more than the terminal can show -- and being able to select a
   // line that has already scrolled past is the part people actually want.
-  function bufferText() {
+  function bufferLines() {
     var buf = term.buffer.active;
     var out = [];
     for (var i = 0; i < buf.length; i++) {
@@ -1530,7 +1531,164 @@
     // The unwritten tail of the screen is not content; it is just the part
     // of the grid nothing has been printed on.
     while (out.length && !out[out.length - 1]) out.pop();
+    return out;
+  }
+
+  // ── picking lines ──────────────────────────────────────────────────────
+  // Long press is the gesture everyone reaches for, and twice now it has not
+  // worked on the device that matters while working in every measurement I
+  // could take. A harness that cannot reproduce a failure cannot confirm a
+  // fix either, so this stops being the only way in.
+  //
+  // Tapping a line picks it. That is an ordinary click on an ordinary
+  // element -- no gesture recognition, nothing for a platform to disagree
+  // about -- and `copy` writes the picked lines with the clipboard API
+  // rather than waiting for the system menu to be offered. A line is also
+  // the unit people actually copy out of a terminal: a path, a job id, a
+  // command to run again.
+  //
+  // The native long press still works on top of this, and when it has
+  // produced a selection that selection wins: someone who went to the
+  // trouble of dragging out half a line means that half line.
+  function pickedText() {
+    try {
+      var native = window.getSelection && window.getSelection().toString();
+      if (native && native.trim()) return native;
+    } catch (e) {}
+    if (!selText) return '';
+    var out = [];
+    var rows = selText.querySelectorAll('.sline.picked');
+    for (var i = 0; i < rows.length; i++) out.push(rows[i].textContent);
     return out.join('\n');
+  }
+
+  // Clearing the picks after a copy drops the selection, which fires
+  // selectionchange, which repaints the bar -- so the word "copied" was
+  // written and then overwritten within the same tick, and the one action
+  // with nothing on screen to confirm it was the one whose whole result is
+  // invisible. It outranks the count until it has been read.
+  var copiedUntil = 0;
+  function paintPicked() {
+    if (!selHint) return;
+    if (clock() < copiedUntil) return;
+    var picked = selText ? selText.querySelectorAll('.sline.picked').length : 0;
+    var native = '';
+    try {
+      native = (window.getSelection && window.getSelection().toString()) || '';
+    } catch (e) {}
+    if (native.trim()) {
+      selHint.textContent = 'selected text ready';
+    } else if (picked) {
+      selHint.textContent = picked === 1 ? '1 line' : picked + ' lines';
+    } else {
+      selHint.textContent = 'tap lines to copy';
+    }
+    if (selCopy) selCopy.disabled = !picked && !native.trim();
+  }
+
+  function renderPickable(lines) {
+    selText.textContent = '';
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < lines.length; i++) {
+      var row = document.createElement('div');
+      row.className = 'sline';
+      // A blank line still has to be tappable, or the gaps in a log are dead
+      // spots. A zero-width space keeps the box without adding a character
+      // to what gets copied -- textContent of '​' would.
+      row.textContent = lines[i];
+      if (!lines[i]) row.innerHTML = '&nbsp;';
+      frag.appendChild(row);
+    }
+    selText.appendChild(frag);
+  }
+
+  // A tap, not the end of a drag: dragging across these lines is how the
+  // native selection is made, and toggling a line under it would fight the
+  // very gesture this exists to back up.
+  var pickFrom = null;
+  if (selText) {
+    selText.addEventListener('pointerdown', function (event) {
+      pickFrom = {x: event.clientX, y: event.clientY};
+    });
+    selText.addEventListener('pointerup', function (event) {
+      var row = event.target.closest && event.target.closest('.sline');
+      var from = pickFrom;
+      pickFrom = null;
+      if (!row || !from) return;
+      if (Math.abs(event.clientX - from.x) > 8 ||
+          Math.abs(event.clientY - from.y) > 8) return;
+      // A tap after a native selection means "start over with lines", not
+      // "add a line to the text I already dragged out".
+      try {
+        var sel = window.getSelection && window.getSelection();
+        if (sel && sel.toString().trim()) sel.removeAllRanges();
+      } catch (e) {}
+      row.classList.toggle('picked');
+      paintPicked();
+    });
+    // The count has to follow a native selection too, or the button says
+    // nothing to copy while the screen is showing a highlight.
+    document.addEventListener('selectionchange', function () {
+      if (selecting) paintPicked();
+    });
+  }
+
+  function copyPicked() {
+    var text = pickedText();
+    if (!text) return;
+    var done = function () {
+      var lines = text.split('\n').length;
+      if (selHint) {
+        selHint.textContent = lines > 1 ? 'copied ' + lines + ' lines'
+                                        : 'copied';
+      }
+      copiedUntil = clock() + 1600;
+      setTimeout(function () { copiedUntil = 0; paintPicked(); }, 1600);
+      // The picks have served their purpose; leaving them lit invites a
+      // second copy of the same thing.
+      if (selText) {
+        var lit = selText.querySelectorAll('.sline.picked');
+        for (var i = 0; i < lit.length; i++) lit[i].classList.remove('picked');
+      }
+      try {
+        var sel = window.getSelection && window.getSelection();
+        if (sel) sel.removeAllRanges();
+      } catch (e) {}
+      if (selCopy) selCopy.disabled = true;
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(function () {
+        if (!legacyCopy(text)) {
+          if (selHint) selHint.textContent = 'the browser refused the clipboard';
+          return;
+        }
+        done();
+      });
+      return;
+    }
+    if (legacyCopy(text)) done();
+    else if (selHint) selHint.textContent = 'this browser has no clipboard';
+  }
+
+  // execCommand is deprecated and still the only thing that works without a
+  // secure context or a permission -- which is what an http:// tailnet
+  // address or an older iOS falls back to.
+  function legacyCopy(text) {
+    try {
+      var box = document.createElement('textarea');
+      box.value = text;
+      box.setAttribute('readonly', '');
+      box.style.position = 'fixed';
+      box.style.opacity = '0';
+      document.body.appendChild(box);
+      box.select();
+      box.setSelectionRange(0, text.length);
+      var ok = document.execCommand('copy');
+      document.body.removeChild(box);
+      return ok;
+    } catch (e) {
+      return false;
+    }
   }
 
   function setSelecting(on) {
@@ -1542,11 +1700,12 @@
       // Reading is over: a selection made in copy-mode would be of a screen
       // that is not live and cannot be typed into afterwards.
       if (scrolledBack) leaveHistory();
-      selText.textContent = bufferText();
+      renderPickable(bufferLines());
       // Same size as the terminal it is standing in for, so the columns line
       // up and a selection looks like the thing being selected.
       selText.style.fontSize = term.options.fontSize + 'px';
       selView.hidden = false;
+      paintPicked();
       // The caret must be nowhere. xterm parks an offscreen textarea and
       // keeps it focused so the software keyboard has something to type
       // into, and a focused editable is what a long press reaches for before
@@ -1557,7 +1716,6 @@
       } catch (e) {}
       // Where you were, which is the live end.
       selText.scrollTop = selText.scrollHeight;
-      if (selHint) selHint.textContent = 'press and hold to select';
     } else {
       selView.hidden = true;
       try {
@@ -1596,6 +1754,10 @@
 
   var selPaste = document.getElementById('selpaste');
   var selDone = document.getElementById('seldone');
+  if (selCopy) selCopy.addEventListener('click', function (event) {
+    event.preventDefault();
+    copyPicked();
+  });
   if (selPaste) selPaste.addEventListener('click', function (event) {
     event.preventDefault();
     pasteFromClipboard();

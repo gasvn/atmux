@@ -319,11 +319,18 @@
     -webkit-tap-highlight-color: transparent;
   }
   #selbar button:active { background: #30303a; }
+  /* #term is an ANCESTOR of this layer and carries touch-action: none, and
+     the effective touch behaviour is the intersection down the ancestor
+     chain -- so declaring auto on the layer alone is not the same as the
+     layer being auto. The rule that used to say this went out with the code
+     it was written for. getComputedStyle reports the specified value, not
+     the intersected one, which is exactly why a probe said this was fine. */
+  body.selecting #term { touch-action: auto; }
   #seltext {
     flex: 1 1 auto; margin: 0; overflow: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 6px 10px calc(6px + env(safe-area-inset-bottom));
-    color: #d8d8dc; white-space: pre;
+    padding: 6px 0 calc(6px + env(safe-area-inset-bottom));
+    color: #d8d8dc;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     /* Everything a terminal has to switch off in order to be a terminal.
        This is not a terminal, so it switches all of it back on -- including
@@ -332,6 +339,20 @@
     -webkit-touch-callout: default;
     touch-action: auto;
   }
+  /* One element per line, because a line is the unit people copy and a
+     whole-line target is one a thumb can hit. Long-press selection still
+     works across them -- they are ordinary text -- but it is no longer the
+     only way in. */
+  .sline {
+    padding: 2px 10px; white-space: pre; min-height: 22px;
+    border-left: 3px solid transparent;
+  }
+  .sline.picked {
+    background: #143a2e; border-left-color: #46d3a4; color: #eafff7;
+  }
+  /* Nothing to copy is a state worth showing, so the count sits where the
+     hint was and the button says what it will act on. */
+  #selbar button[disabled] { opacity: .45; }
   /* Says which mode the terminal is in without covering anything: the pad is
      the only thing that changes colour, and it is not what you are reading. */
   body.selecting #pad { box-shadow: inset 0 2px 0 #46d3a4; }
@@ -759,11 +780,12 @@
          is text you cannot get hold of. -->
     <div id="selview" hidden>
       <div id="selbar">
-        <span id="selhint">press and hold to select</span>
+        <span id="selhint">tap lines to copy</span>
+        <button id="selcopy" type="button">copy</button>
         <button id="selpaste" type="button">paste</button>
         <button id="seldone" type="button">done</button>
       </div>
-      <pre id="seltext"></pre>
+      <div id="seltext"></div>
     </div>
   </div>
   <!-- Two sources, and the split is the design. What the *app* can do is

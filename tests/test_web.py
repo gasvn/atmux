@@ -2828,10 +2828,25 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertIsNotNone(block, 'there is no selectable layer')
         body = block.group(1)
         for rule in ('user-select: text', '-webkit-user-select: text',
-                     '-webkit-touch-callout: default', 'touch-action: auto',
-                     'white-space: pre'):
+                     '-webkit-touch-callout: default', 'touch-action: auto'):
             with self.subTest(rule=rule):
                 self.assertIn(rule, body)
+        # The columns are per line now, so the line is what holds them.
+        self.assertRegex(css, r'\.sline \{[^}]*white-space: pre')
+
+    def test_the_ancestor_is_let_go_of_too_and_not_only_the_layer(self):
+        """#term carries touch-action: none and the layer is INSIDE it. The
+        effective touch behaviour is the intersection down the ancestor
+        chain, so declaring auto on the layer alone is not the same as the
+        layer being auto -- and getComputedStyle reports the specified value,
+        not the intersected one, which is exactly why a probe called this
+        fine while the phone could not select a thing.
+
+        The rule existed, for this reason, and went out with the code it was
+        written against.
+        """
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        self.assertIn('body.selecting #term { touch-action: auto; }', css)
         # And the terminal's own gesture handlers stand down while it is on,
         # or the first drag pages the scrollback out from under the selection.
         self.assertEqual(self.js.count('if (selecting) return;'), 3)
@@ -2840,13 +2855,67 @@ class KeypadVocabularyTests(unittest.TestCase):
         """buffer.active starts at the oldest retained line, not at the top of
         the screen -- so what you can select from includes the scrollback,
         which is the part the terminal itself could never offer a finger."""
-        source = _extract(self.js, 'bufferText')
+        source = _extract(self.js, 'bufferLines')
         self.assertIn('term.buffer.active', source)
         self.assertIn('translateToString', source)
         # From 0, not from baseY: starting at the viewport would leave the
         # scrollback out and this would only ever be the visible screen.
         self.assertIn('i = 0', source.replace(' ', ' '))
         self.assertNotIn('baseY', source)
+
+    def test_copying_does_not_need_a_gesture_to_be_recognised(self):
+        """Long press is what everyone reaches for, and twice it has not
+        worked on the device that matters while working in every measurement
+        available here -- and a harness that cannot reproduce a failure
+        cannot confirm a fix either. So it is no longer the only way in.
+
+        A tap picks a line; `copy` writes the picked lines with the clipboard
+        API. Both are ordinary clicks with no gesture recognition anywhere in
+        the path. Measured with real touch taps: one tap reads '1 line', two
+        read '2 lines', and the clipboard afterwards holds both lines joined
+        by a newline.
+        """
+        page = self.html
+        self.assertIn('id="selcopy"', page)
+        source = _extract(self.js, 'copyPicked')
+        self.assertIn('navigator.clipboard', source)
+        self.assertIn('writeText', source)
+        # A tailnet address served over http, or an older iOS, has no
+        # clipboard API at all -- and then the deprecated call is the only
+        # thing left that works.
+        self.assertIn('legacyCopy', source)
+        self.assertIn('execCommand', _extract(self.js, 'legacyCopy'))
+
+    def test_a_drag_is_a_selection_and_a_tap_is_a_line(self):
+        """Dragging across these lines is how the native selection is made,
+        so toggling a line at the end of one would fight the very gesture
+        this exists to back up. Measured: a drag the width of a line leaves
+        nothing picked; a tap on the same line picks it, and again unpicks."""
+        source = self.js[self.js.index('selText.addEventListener(\'pointerup\''):]
+        source = source[:source.index('document.addEventListener')]
+        self.assertIn('> 8', source, 'no slop, so a drag counts as a tap')
+        self.assertIn("classList.toggle('picked')", source)
+
+    def test_a_dragged_selection_outranks_the_tapped_lines(self):
+        """Someone who went to the trouble of dragging out half a line means
+        that half line, not the whole one underneath it."""
+        source = _extract(self.js, 'pickedText')
+        # `.sline.picked`, not `picked` -- the function is called pickedText,
+        # so the loose substring matches its own name and the assertion holds
+        # no matter which order the body is in.
+        self.assertLess(source.index('getSelection'),
+                        source.index('.sline.picked'),
+                        'the picked lines are consulted first')
+
+    def test_the_one_action_with_an_invisible_result_confirms_itself(self):
+        """Clearing the picks after a copy drops the selection, which fires
+        selectionchange, which repaints the bar -- so 'copied' was written
+        and overwritten inside one tick, and the only action whose whole
+        result is off-screen was the one with nothing to show for it."""
+        self.assertIn('copiedUntil', _extract(self.js, 'paintPicked'))
+        source = _extract(self.js, 'copyPicked')
+        self.assertIn('copiedUntil', source)
+        self.assertIn('copied', source)
 
     def test_nothing_else_holds_the_caret_while_selecting(self):
         """xterm parks a 6x11 textarea at opacity 0 behind the screen and
@@ -3779,9 +3848,9 @@ class KeypadVocabularyTests(unittest.TestCase):
         # `newbuild` overlay the terminal rather than taking a row.
         controls = re.findall(r'<button id="(\w+)"', self.html)
         self.assertEqual(controls,
-                         ['selpaste', 'seldone', 'hist', 'newbuild', 'edit',
-                          'grab', 'back', 'fontminus', 'fontauto', 'fontplus',
-                          'kbd', 'sel', 'hide', 'grip'])
+                         ['selcopy', 'selpaste', 'seldone', 'hist', 'newbuild',
+                          'edit', 'grab', 'back', 'fontminus', 'fontauto',
+                          'fontplus', 'kbd', 'sel', 'hide', 'grip'])
         row = self.html[self.html.index('<div id="tabs">'):]
         row = row[:row.index('</div>')]
         self.assertEqual(re.findall(r'<button id="(\w+)"', row),
