@@ -2892,10 +2892,10 @@ class KeypadVocabularyTests(unittest.TestCase):
         the thing a line could never do: selecting '/to/file' out of the
         middle of a path and copying it puts '/to/file' on the clipboard.
         """
-        start = self.js[self.js.index("host.addEventListener('touchstart'"):]
-        start = start[:start.index("host.addEventListener('touchmove'")]
-        self.assertIn('setSelecting(true, {', start)
-        self.assertNotIn('copyLine(span.text)', start,
+        end = self.js[self.js.index("['touchend', 'touchcancel']"):]
+        end = end[:end.index('function spread')]
+        self.assertIn('setSelecting(true, {', end)
+        self.assertNotIn('copyLine', self.js,
                          'still copying a line instead of handing over')
         reveal = _extract(self.js, 'revealLine')
         self.assertIn('scrollTop', reveal)
@@ -2953,6 +2953,53 @@ class KeypadVocabularyTests(unittest.TestCase):
                 self.assertNotIn(name, self.js)
                 self.assertNotIn(name, self.html)
 
+    def test_a_scroll_that_pauses_is_still_a_scroll(self):
+        """The hold used to open the copy view at the 500ms mark, which is
+        irrevocable -- so resting a thumb before scrolling landed you in it.
+
+        Measured, five gestures a thumb actually makes: pause 600ms then
+        scroll, a slow start, a scroll with a rest in the middle, a plain
+        fast flick, and a deliberate 900ms hold. Before: all five opened the
+        copy view. After: only the deliberate hold does.
+
+        Two separate faults. The cancel compared the finger against
+        `(pressed && pressed.from) || {x: lastX, y: lastY}` -- and while the
+        timer was still pending `pressed` is null, so it compared the current
+        point with itself and cancelled nothing. And opening in the timer
+        left nothing to cancel even once that worked.
+        """
+        start = self.js[self.js.index("host.addEventListener('touchstart'"):]
+        start = start[:start.index("host.addEventListener('touchmove'")]
+        self.assertIn('pressFrom = from', start)
+        self.assertNotIn('setSelecting(true, {', start,
+                         'the view still opens in the timer')
+        move = self.js[self.js.index("host.addEventListener('touchmove'"):]
+        move = move[:move.index("['touchend', 'touchcancel']")]
+        # Against the remembered origin, never against the current point.
+        self.assertIn('var start = pressFrom;', move)
+        self.assertNotIn('|| {x: lastX, y: lastY}', move)
+        end = self.js[self.js.index("['touchend', 'touchcancel']"):]
+        end = end[:end.index('function spread')]
+        self.assertIn('setSelecting(true, {', end)
+
+    def test_the_terminal_is_told_to_keep_off_but_the_text_field_is_not(self):
+        """#term switches selection off so iOS keeps its own long press away
+        from the terminal -- and that is inherited by xterm's helper
+        textarea, which is a genuine text field sitting inside it. iOS
+        applies user-select: none to text *editing* and not only to
+        selection, so holding backspace deleted one character instead of
+        repeating: the platform had stopped treating the box as editable.
+
+        Measured after: the terminal is `none` and the field is `text`.
+        """
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        term = re.search(r'#term \{(.*?)\}', css, re.S).group(1)
+        self.assertIn('user-select: none', term)
+        field = re.search(r'\.xterm-helper-textarea \{(.*?)\}', css, re.S)
+        self.assertIsNotNone(field, 'the text field is not exempted')
+        self.assertIn('user-select: text !important', field.group(1))
+        self.assertIn('-webkit-user-select: text !important', field.group(1))
+
     def test_the_selectable_layer_stands_where_the_terminal_stood(self):
         """Arriving in it has to read as "the text went selectable", not as a
         screen that opened over what you were reading. Same background, same
@@ -2985,16 +3032,18 @@ class KeypadVocabularyTests(unittest.TestCase):
         arrive, and `name === 'touchend'` excluded precisely the case that
         does.
 
-        Nothing waits for the release now: the handover happens in the timer,
-        and the release handler only tidies up -- for touchcancel too.
+That reasoning was about the clipboard, which needs a user gesture. The
+        hold opens a view now and a view needs no permission, so it can wait
+        for the lift -- and waiting is what makes it cancellable, which is
+        what stopped a pause before scrolling landing in the copy view. What
+        still holds is that both endings count: iOS hands a stationary press
+        back as touchcancel as readily as touchend.
         """
         end = self.js[self.js.index("['touchend', 'touchcancel']"):]
         end = end[:end.index('function spread')]
         self.assertNotIn("name === 'touchend'", end,
                          'the cancel case is excluded again')
-        start = self.js[self.js.index("host.addEventListener('touchstart'"):]
-        start = start[:start.index("host.addEventListener('touchmove'")]
-        self.assertIn('setSelecting(true, {', start)
+        self.assertIn('setSelecting(true, {', end)
 
     def test_there_is_one_way_to_reach_the_clipboard_and_it_is_used(self):
         """A second clipboard path that nothing calls is a trap: it rots,
@@ -3051,7 +3100,11 @@ class KeypadVocabularyTests(unittest.TestCase):
         move = move[:move.index("['touchend', 'touchcancel']")]
         self.assertIn('cancelPress()', move)
         self.assertIn('LONG_PRESS_SLOP', move)
-        self.assertIn('pressed.from', move)
+        # Against the remembered origin. It used to be
+        # `(pressed && pressed.from) || {x: lastX, y: lastY}`, and with the
+        # timer still pending `pressed` is null -- so it compared the current
+        # point with itself and cancelled nothing at all.
+        self.assertIn('pressFrom', move)
 
     def test_a_wrapped_line_copies_whole_or_not_at_all(self):
         """A path long enough to be worth copying is long enough to wrap, and

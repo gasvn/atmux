@@ -2221,6 +2221,12 @@
   // several is what the copy view is still there for.
   var LONG_PRESS_MS = 500, LONG_PRESS_SLOP = 8;
   var pressTimer = 0, pressed = null;
+  // Where the finger went down. Kept out here because touchmove needs it
+  // while the timer is still pending -- it used to fall back to the current
+  // point when `pressed` was not yet set, which made the comparison
+  // `|now - now| > slop` and cancelled nothing. Measured: every gesture
+  // tried, including a plain fast scroll, ended in the copy view.
+  var pressFrom = null;
 
   // Said once, ever. A gesture nobody knows about is a gesture that does not
   // exist, and there is nothing on a terminal to hint at one -- but a tip
@@ -2283,6 +2289,7 @@
   function cancelPress() {
     if (pressTimer) { clearTimeout(pressTimer); pressTimer = 0; }
     pressed = null;
+    pressFrom = null;
   }
 
   var pinchStart = 0, pinchFont = 0;
@@ -2311,6 +2318,7 @@
       lastY = event.touches[0].clientY;
       cancelPress();
       var from = {x: lastX, y: lastY};
+      pressFrom = from;
       pressTimer = setTimeout(function () {
         pressTimer = 0;
         var row = rowUnder();
@@ -2319,28 +2327,17 @@
         // A blank row is not something anyone means to copy, and marking one
         // would be the gesture appearing to work and doing nothing.
         if (!span.text.trim()) return;
-        pressed = {from: from};
+        // Armed, not fired. The view opens on the lift, and any movement
+        // before then puts it back -- so a finger that rests a moment and
+        // then scrolls is a scroll, which is what it was always meant to be.
+        //
+        // Opening here instead was right while the hold copied to the
+        // clipboard: that needs a user gesture and cannot wait for a
+        // touchend iOS may replace with touchcancel. It opens a view now,
+        // and a view needs no permission -- so the irrevocable half of the
+        // gesture went with the clipboard call.
+        pressed = {from: from, row: row, span: span};
         haptic();
-        // Hand over to the text, rather than copying the line and calling it
-        // done. Copying a whole line is coarse -- it cannot give you half a
-        // path, or two words out of a command -- and the reason it was doing
-        // that is that the terminal cannot be selected, not that a line is
-        // what anyone wanted.
-        //
-        // The text can be. So a press lands in the same text, at the same
-        // size, in the same place, with the pressed line already selected,
-        // and from there it is the system's own selection: drag the handles,
-        // and the menu iOS offers over a selection is the real one.
-        //
-        // Which is also what iOS does natively -- press, and a selection
-        // appears that you then adjust and copy. It was never one gesture
-        // there either.
-        var here = host.querySelector('.xterm-rows');
-        var mark = here && here.children[Math.max(0, span.first)];
-        setSelecting(true, {
-          index: (term.buffer.active.viewportY || 0) + span.first,
-          screenY: mark ? mark.getBoundingClientRect().top : lastY
-        });
       }, LONG_PRESS_MS);
     } else {
       cancelPress();
@@ -2360,14 +2357,14 @@
     // Moved, so it is a drag and not a hold. Checked against where the
     // finger started rather than against the last frame: a slow drag never
     // moves far in one frame and would hold its way into a copy.
-    if (pressed || pressTimer) {
-      var start = (pressed && pressed.from) || {x: lastX, y: lastY};
+    if (pressFrom) {
+      var start = pressFrom;
       if (pressTimer && (Math.abs(lastX - start.x) > LONG_PRESS_SLOP ||
                          Math.abs(lastY - start.y) > LONG_PRESS_SLOP)) {
         cancelPress();
       } else if (pressed &&
-                 (Math.abs(lastX - pressed.from.x) > LONG_PRESS_SLOP ||
-                  Math.abs(lastY - pressed.from.y) > LONG_PRESS_SLOP)) {
+                 (Math.abs(lastX - start.x) > LONG_PRESS_SLOP ||
+                  Math.abs(lastY - start.y) > LONG_PRESS_SLOP)) {
         // Already marked, and now the finger is travelling: they changed
         // their mind into a scroll, and the mark has to go with it.
         cancelPress();
@@ -2403,7 +2400,17 @@
       // stop this being read as a tap or a flick as well -- and this runs for
       // touchcancel too, which is the whole point.
       if (pressed) {
+        // The gesture completed without moving. Both endings count: iOS
+        // hands a stationary press back as touchcancel as often as touchend
+        // once it starts thinking about its own long press.
+        var span = pressed.span;
+        var here = host.querySelector('.xterm-rows');
+        var mark = here && here.children[Math.max(0, span.first)];
         cancelPress();
+        setSelecting(true, {
+          index: (term.buffer.active.viewportY || 0) + span.first,
+          screenY: mark ? mark.getBoundingClientRect().top : lastY
+        });
         pinchStart = 0; swiped = false;
         holdWrites(false);
         scrolled = 0; pageDebt = 0; wheelDebt = 0;

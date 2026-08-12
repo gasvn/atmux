@@ -159,6 +159,17 @@
      parked at the cursor. Stretched transparently over the terminal, a tap
      lands on a real text input and the platform raises its keyboard by
      itself -- which is the only route iOS honours. */
+  /* Exempt from #term's user-select: none, which is inherited and which iOS
+     applies to text *editing* and not only to selection: with it on the
+     field, holding backspace deleted one character instead of repeating,
+     because the platform stops treating the box as editable text. #term
+     switches selection off to keep iOS's own long press off the terminal;
+     the one element in there that is genuinely a text field has to be told
+     it is still a text field. */
+  .xterm-helper-textarea {
+    user-select: text !important;
+    -webkit-user-select: text !important;
+  }
   .xterm-helper-textarea.atmux-typing {
     position: absolute !important;
     left: 0 !important; top: 0 !important;
