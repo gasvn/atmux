@@ -101,6 +101,26 @@
        reason .key is none: on this page a drag is ours or it is nothing.
        Also drops the double-tap-to-zoom delay, which is what pan-y was for. */
     touch-action: none;
+    /* And iOS is told to keep its own long press off this box. A finger held
+       still for half a second over text is when iOS starts its callout and
+       magnifier, and starting them is how the web touch gets taken away --
+       delivered as touchcancel, which this file already documents happening.
+       The hold is ours to interpret, so nothing else may claim it.
+       body.selecting lifts both, because there the point IS the native
+       gesture; #seltext restates them for the same reason. */
+    -webkit-touch-callout: none;
+    user-select: none; -webkit-user-select: none;
+  }
+  /* Everything #term switches off, switched back on for the copy view, in
+     one place. #term is an ANCESTOR of that view and the effective touch
+     behaviour is the intersection down the chain -- so declaring auto on the
+     view alone was never the same as the view being auto, and
+     getComputedStyle reports the specified value rather than the intersected
+     one, which is why a probe called it fine while it was being overruled. */
+  body.selecting #term {
+    touch-action: auto;
+    -webkit-touch-callout: default;
+    user-select: text; -webkit-user-select: text;
   }
   /* xterm's own stylesheet paints this element #000 and reserves a scrollbar
      on it. Both show up as a black stripe beside the dashboard, because the
@@ -319,13 +339,8 @@
     -webkit-tap-highlight-color: transparent;
   }
   #selbar button:active { background: #30303a; }
-  /* #term is an ANCESTOR of this layer and carries touch-action: none, and
-     the effective touch behaviour is the intersection down the ancestor
-     chain -- so declaring auto on the layer alone is not the same as the
-     layer being auto. The rule that used to say this went out with the code
-     it was written for. getComputedStyle reports the specified value, not
-     the intersected one, which is exactly why a probe said this was fine. */
-  body.selecting #term { touch-action: auto; }
+  /* The ancestor is let go of beside #term itself, where the rules being
+     lifted are written. */
   #seltext {
     flex: 1 1 auto; margin: 0; overflow: auto;
     -webkit-overflow-scrolling: touch;

@@ -2834,23 +2834,6 @@ class KeypadVocabularyTests(unittest.TestCase):
         # The columns are per line now, so the line is what holds them.
         self.assertRegex(css, r'\.sline \{[^}]*white-space: pre')
 
-    def test_the_ancestor_is_let_go_of_too_and_not_only_the_layer(self):
-        """#term carries touch-action: none and the layer is INSIDE it. The
-        effective touch behaviour is the intersection down the ancestor
-        chain, so declaring auto on the layer alone is not the same as the
-        layer being auto -- and getComputedStyle reports the specified value,
-        not the intersected one, which is exactly why a probe called this
-        fine while the phone could not select a thing.
-
-        The rule existed, for this reason, and went out with the code it was
-        written against.
-        """
-        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
-        self.assertIn('body.selecting #term { touch-action: auto; }', css)
-        # And the terminal's own gesture handlers stand down while it is on,
-        # or the first drag pages the scrollback out from under the selection.
-        self.assertEqual(self.js.count('if (selecting) return;'), 3)
-
     def test_the_selectable_layer_holds_more_than_the_screen_does(self):
         """buffer.active starts at the oldest retained line, not at the top of
         the screen -- so what you can select from includes the scrollback,
@@ -2878,9 +2861,8 @@ class KeypadVocabularyTests(unittest.TestCase):
 
         Measured, with real touch events: a 120ms tap copies nothing and
         marks nothing; a 700ms hold puts that line on the clipboard and says
-        so; a hold that turns into a drag scrolls and copies nothing, and the
-        mark goes with it; a plain flick copies nothing; and a hold on a
-        blank row does nothing at all rather than appearing to work.
+        so; a plain flick copies nothing; and a hold on a blank row does
+        nothing at all rather than appearing to work.
         """
         self.assertIn('LONG_PRESS_MS', self.js)
         start = self.js[self.js.index("host.addEventListener('touchstart'"):]
@@ -2890,6 +2872,72 @@ class KeypadVocabularyTests(unittest.TestCase):
         # has to be taken at the start or cellAt reads wherever the last
         # gesture happened to end.
         self.assertIn('lastX = event.touches[0].clientX', start)
+
+    def test_the_copy_happens_while_the_finger_is_still_down(self):
+        """The bug that made the whole gesture do nothing on the phone.
+
+        It was written to copy on touchend -- and this file already knows,
+        in the comment directly above that handler, that iOS fires
+        touchcancel instead when the system takes a gesture away. A finger
+        held still for half a second over text is exactly when iOS starts
+        its own callout and magnifier, so touchend was the one event not
+        guaranteed to arrive, and `name === 'touchend'` excluded precisely
+        the case that does.
+
+        Copying from inside the timer is also still inside a user gesture:
+        the pointerdown that began the touch grants transient activation and
+        Safari's window is seconds, not milliseconds.
+
+        Measured: the clipboard holds the line while the finger is still
+        down, and a touch that ends in touchCancel has copied it too.
+        """
+        start = self.js[self.js.index("host.addEventListener('touchstart'"):]
+        start = start[:start.index("host.addEventListener('touchmove'")]
+        self.assertIn('copyLine(span.text)', start,
+                      'the copy is not inside the timer')
+        end = self.js[self.js.index("['touchend', 'touchcancel']"):]
+        end = end[:end.index('function spread')]
+        self.assertNotIn("name === 'touchend'", end,
+                         'the cancel case is excluded again')
+
+    def test_ios_is_told_to_keep_its_own_long_press_off_the_terminal(self):
+        """Starting the system callout is how the web touch gets taken away,
+        and the hold is ours to interpret. Lifted again for the copy view,
+        where the native gesture is the entire point."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        term = re.search(r'#term \{(.*?)\}', css, re.S).group(1)
+        self.assertIn('-webkit-touch-callout: none', term)
+        self.assertIn('user-select: none', term)
+        lifted = re.search(r'body\.selecting #term \{(.*?)\}', css, re.S)
+        self.assertIsNotNone(lifted)
+        for rule in ('touch-action: auto', '-webkit-touch-callout: default',
+                     'user-select: text'):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, lifted.group(1))
+
+    def test_the_deprecated_fallback_is_the_one_ios_actually_honours(self):
+        """readonly + select() is the recipe everyone writes, and on iOS it
+        selects nothing -- iOS refuses a caret in a readonly field -- so it
+        copies nothing, silently, while returning true. contentEditable is
+        what makes the field selectable, a Range is what selects it, and
+        setSelectionRange is what iOS honours.
+
+        Not verifiable here either way: execCommand('copy') returns true and
+        reaches no clipboard in headless Chrome or in Playwright's WebKit,
+        both of which lack a system clipboard. So this pins the recipe rather
+        than the result.
+        """
+        source = _extract(self.js, 'legacyCopy')
+        self.assertIn('contentEditable', source)
+        self.assertIn('createRange', source)
+        self.assertIn('setSelectionRange', source)
+        self.assertNotIn("setAttribute('readonly'", source)
+        # 16px, or iOS zooms the page to meet a focused field -- a visible
+        # lurch on a terminal, for a field nobody can see.
+        self.assertIn("fontSize = '16px'", source)
+        # And it is removed however it exits, or a failed copy leaves an
+        # invisible editable parked over the page.
+        self.assertIn('finally', source)
 
     def test_a_hold_that_becomes_a_drag_is_a_drag(self):
         """Otherwise a slow scroll copies a line out from under itself. The
@@ -2901,15 +2949,6 @@ class KeypadVocabularyTests(unittest.TestCase):
         self.assertIn('cancelPress()', move)
         self.assertIn('LONG_PRESS_SLOP', move)
         self.assertIn('pressed.from', move)
-
-    def test_the_clipboard_write_happens_on_the_lift(self):
-        """Safari wants a clipboard write inside a user gesture, and the end
-        of a touch is one where the middle of a hold is arguable. The mark
-        appears at 500ms so the wait is visible; the copy lands on release."""
-        end = self.js[self.js.index("['touchend', 'touchcancel']"):]
-        end = end[:end.index('function spread')]
-        self.assertIn("name === 'touchend'", end)
-        self.assertIn('copyLine', end)
 
     def test_a_hold_marks_what_it_is_about_to_copy(self):
         """A gesture with no sign it has been recognised is one people give

@@ -1674,20 +1674,38 @@
   // secure context or a permission -- which is what an http:// tailnet
   // address or an older iOS falls back to.
   function legacyCopy(text) {
+    var box = null;
     try {
-      var box = document.createElement('textarea');
+      box = document.createElement('textarea');
       box.value = text;
-      box.setAttribute('readonly', '');
+      // Not readonly, and selected through a Range rather than .select().
+      // iOS refuses to put a caret in a readonly field, so the usual recipe
+      // -- readonly + select() -- selects nothing there and copies nothing,
+      // silently. contentEditable is what makes it selectable; the Range is
+      // what actually selects it; setSelectionRange is what iOS honours.
+      box.contentEditable = 'true';
+      box.readOnly = false;
       box.style.position = 'fixed';
+      box.style.top = '0';
+      box.style.left = '0';
       box.style.opacity = '0';
+      // Under 16px iOS zooms the page to meet a focused field, which on a
+      // terminal is a visible lurch for a field nobody can see.
+      box.style.fontSize = '16px';
       document.body.appendChild(box);
-      box.select();
+      var range = document.createRange();
+      range.selectNodeContents(box);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
       box.setSelectionRange(0, text.length);
       var ok = document.execCommand('copy');
-      document.body.removeChild(box);
+      sel.removeAllRanges();
       return ok;
     } catch (e) {
       return false;
+    } finally {
+      if (box && box.parentNode) box.parentNode.removeChild(box);
     }
   }
 
@@ -2282,6 +2300,18 @@
         pressed = {row: row, text: span.text, from: from};
         flashRows(span.first, span.last);
         haptic();
+        // Here, not on the lift. This file already knows that iOS fires
+        // touchcancel when the system takes a gesture away -- it says so
+        // above the touchend handler -- and a finger held still for half a
+        // second over text is exactly when iOS decides to do something of
+        // its own. Waiting for touchend meant waiting for the one event
+        // that is not guaranteed to come.
+        //
+        // Still inside a user gesture: the pointerdown that started this
+        // grants transient activation, and Safari's window is seconds, not
+        // milliseconds. So the clipboard is reachable from here -- and from
+        // here it is reachable before anything can intervene.
+        copyLine(span.text);
       }, LONG_PRESS_MS);
     } else {
       cancelPress();
@@ -2341,11 +2371,12 @@
       // sit inside a user gesture, and the end of a touch is one where the
       // middle of a hold is arguable. The mark appears at 500ms so the wait
       // is visible; the copy lands when the finger goes.
-      if (pressed && name === 'touchend') {
-        copyLine(pressed.text);
+      // The copy already happened, at the 500ms mark. All that is left is to
+      // stop this being read as a tap or a flick as well -- and this runs for
+      // touchcancel too, which is the whole point.
+      if (pressed) {
         unflash();
         cancelPress();
-        // Nothing else may treat this as a tap or a flick.
         pinchStart = 0; swiped = false;
         holdWrites(false);
         scrolled = 0; pageDebt = 0; wheelDebt = 0;
