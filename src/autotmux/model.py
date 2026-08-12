@@ -97,6 +97,31 @@ def session_rank(row) -> int:
     return _attention_rank(row)
 
 
+def filter_rows(rows, query: str):
+    """The rows a query narrows to.
+
+    Substring rather than fuzzy, and deliberately: this narrows a list you
+    are looking at, so what disappears has to be explainable by what you
+    typed. A fuzzy match that keeps `tu_harness` for the query `sh` is
+    correct by its own rules and looks like a bug from the outside -- the
+    palette is where fuzzy belongs, because there you are searching a set you
+    cannot see.
+
+    Matched against the name and the machine together: "which of these is on
+    15304" is the same question as "where is newclaw", and both are asked by
+    typing part of what you remember.
+    """
+    query = str(query or '').strip().lower()
+    if not query:
+        return list(rows)
+    kept = []
+    for row in rows:
+        hay = f'{_session_label(row[1])} {node_label(row[0])}'.lower()
+        if query in hay:
+            kept.append(row)
+    return kept
+
+
 def plan_rows(rows):
     """Lay rows out as bands, in the order they already sort in.
 

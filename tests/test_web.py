@@ -4148,8 +4148,11 @@ class PublishedControlsEndToEndTests(unittest.TestCase):
                    + re.escape('\x1b\\'))
         frames = re.findall(pattern, text)
         self.assertTrue(frames, 'nothing was published')
-        data = keypad.decode(frames[0])
-        self.assertIsNotNone(data, f'unparseable: {frames[0]!r}')
+        # The last frame, not the first: the first is published before the
+        # table has rows, so `Attach` -- which lives on the table -- is not
+        # active yet. What matters is what a button ends up carrying.
+        data = keypad.decode(frames[-1])
+        self.assertIsNotNone(data, f'unparseable: {frames[-1]!r}')
         self.assertEqual(data['mode'], 'app')
         labels = {k['l']: k['k'] for k in data['keys']}
         # The footer's own keys, which is the app's statement of what matters.

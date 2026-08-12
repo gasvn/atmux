@@ -2244,12 +2244,13 @@ class KeyDiscoverabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(labelled['g'], 'Clusters')
         shown = {b.key: b.description
                  for b in autotmux.AutotmuxApp.BINDINGS if b.show}
-        # Six eligible, and never six at once: `esc` is retired by
-        # check_action on the list, where there is no back from the list. So
-        # five are drawn, which is where the current writing lands -- and the
-        # other fifteen are in `?` and all of them still work.
-        self.assertLessEqual(len(shown), 6)
+        # Seven eligible and never seven at once: `esc` is retired by
+        # check_action on the list, where there is no back from the list.
+        # Six are drawn, and the other seventeen are in `?`, on the phone's
+        # keypad, and in `:` -- and all of them still work.
+        self.assertLessEqual(len(shown), 7)
         self.assertIn('escape', shown)
+        self.assertIn('slash', shown)
         for description in labelled.values():
             self.assertEqual(description, description.strip())
             self.assertTrue(description[:1].isupper() or description[:1] == '↑')

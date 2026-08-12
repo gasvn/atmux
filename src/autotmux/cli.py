@@ -12,6 +12,7 @@ import enum
 import errno
 import fcntl
 from functools import partial
+import functools
 import hashlib
 import json
 import math
@@ -36,6 +37,7 @@ import uuid
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import DiscoveryHit, Hit, Provider
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.reactive import reactive
@@ -64,7 +66,7 @@ from autotmux.model import (                                    # noqa: F401
     _IDLE_DOT, _OFFLINE_SESSION, _START_SHELL_SESSION,
     _attention_rank, _coerce_idle_seconds, _format_idle, _idle_marker,
     _idle_tier, _looks_stale, _session_label, _split_idle_marker,
-    build_session_rows, plan_rows, session_rank,
+    build_session_rows, filter_rows, plan_rows, session_rank,
 )
 
 STATE_FILE = paths.STATE_FILE
@@ -2731,6 +2733,87 @@ def _band_cells(title: str, count: int) -> tuple:
     """
     return _heading(title, str(count))
 
+class ActionCommands(Provider):
+    """Every binding this app has, by name.
+
+    Twenty-one bindings and five in the footer means sixteen that work and
+    are advertised nowhere but `?`. `?` is a list you read; this is a list
+    you search -- and searching is what you want when you know the name of
+    the thing and not the letter somebody assigned it.
+
+    It also takes the pressure off the letters. Every new action was a
+    scramble for a free key, which is how `j` came to mean the jobs panel
+    and `k` the keep-alive.
+
+    Fuzzy here, unlike the `/` filter: this searches a set you cannot see, so
+    a near miss is a help. That filter narrows a list in front of you, where
+    a match you cannot explain looks like a bug.
+    """
+
+    def _commands(self):
+        app = self.app
+        for binding in getattr(app, 'BINDINGS', ()):
+            action = getattr(binding, 'action', '')
+            description = getattr(binding, 'description', '')
+            if not action or not description:
+                continue
+            key = getattr(binding, 'key', '')
+            yield description, key, action
+
+    async def discover(self):
+        """What the palette lists before anything is typed."""
+        for description, key, action in self._commands():
+            yield DiscoveryHit(
+                description,
+                functools.partial(self.app.run_action, action),
+                text=description,
+                help=f'key: {key}' if key else None,
+            )
+
+    async def search(self, query: str):
+        matcher = self.matcher(query)
+        for description, key, action in self._commands():
+            # The key is searchable too: somebody who half-remembers `k`
+            # should find it by typing `k` as readily as by typing renew.
+            score = max(matcher.match(description), matcher.match(key or ''))
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(description),
+                    functools.partial(self.app.run_action, action),
+                    text=description,
+                    help=f'key: {key}' if key else None,
+                )
+
+
+class FilterInput(Input):
+    """The filter box, with its own way out.
+
+    Escape has to leave here and put the rows back, and an Input swallows it
+    -- so the binding lives on the widget, where the focused widget's
+    bindings win. It was briefly a priority binding on the app instead,
+    which won everywhere including over the help screen's own escape: `?`
+    opened and could not be closed. A key bound globally to solve a local
+    problem takes the key away from everywhere else.
+    """
+
+    BINDINGS = [Binding('escape', 'leave_filter', 'Back to list', show=False)]
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Closed, and therefore not a place the keyboard can be. Textual
+        # focuses the first focusable widget, and this one is first in the
+        # column -- so on startup it took the keyboard, which meant typing
+        # went into the filter and the phone was published this widget's
+        # editing keys (`Delete character left`, `Cut selected text`) in
+        # place of the session actions. `display: none` was not enough:
+        # focusability is its own question.
+        self.can_focus = False
+
+    def action_leave_filter(self) -> None:
+        self.app._close_filter(keep=False)
+
+
 class StatusLine(Static):
     """The top line, replacing Textual's stock Header.
 
@@ -3729,6 +3812,15 @@ class AutotmuxApp(App):
         width: 100%;
         height: 1fr;
     }
+    #filter {
+        display: none;
+        height: 1;
+        border: none;
+        padding: 0 1;
+        background: $panel;
+    }
+    #filter.-on { display: block; }
+    #filter:focus { background: $boost; }
     /* Layout modes (`z`). The divider belongs to the preview, not the table:
        a rule down the right edge of a full-width table is a frame, not a
        separator, and reads as clipped content. Owned by the pane that only
@@ -3836,6 +3928,8 @@ class AutotmuxApp(App):
         Binding("n", "new_session", "New session", show=False),
         Binding("x", "kill_session", "Kill session", show=False),
         Binding("v", "view_pane", "View output", show=False),
+        Binding("slash", "filter_sessions", "Filter"),
+        Binding("colon", "command_palette", "Commands", show=False),
         Binding("question_mark", "show_help", "Help"),
         Binding("q", "app.quit", "Quit"),
         Binding("r", "refresh_table", "Refresh now", show=False),
@@ -3883,6 +3977,8 @@ class AutotmuxApp(App):
             ("2", "The job queue", "← → too"),
             ("3", "The preview", "arrows scroll"),
             ("escape", "Back to the session list", "from any pane"),
+            ("slash", "Narrow the list by typing", "esc restores"),
+            ("colon", "Every action, by name", "fuzzy"),
         ]),
         ("View", [
             ("z", "Cycle layout: split → wide → table → jobs", "remembered"),
@@ -3913,6 +4009,11 @@ class AutotmuxApp(App):
         ("LOAD", "1-min load / cores; near cores means busy"),
     ]
 
+    # Ours alongside Textual's own, which carries the theme and screen
+    # commands. `:` opens it -- the palette key everything in this family
+    # uses -- and ctrl+p keeps working because Textual binds it.
+    COMMANDS = App.COMMANDS | {ActionCommands}
+
     title = reactive(f"AutoTmux v{__version__}")
     sub_title = reactive("")
 
@@ -3924,6 +4025,10 @@ class AutotmuxApp(App):
         self._select = select
         self._connection_manager_open = False
         self._help_open = False
+        # What the list is narrowed to, '' for everything, and how much that
+        # hid -- the count is what stops a filter being invisible state.
+        self._filter = ''
+        self._match_count = (0, 0)
         self._restart_attempts = []   # time.monotonic() of recent daemon restarts
         self._crash_looping = False
         self._recovery_inflight = False
@@ -3970,6 +4075,10 @@ class AutotmuxApp(App):
         # the list's rows are the same machines in Slurm's vocabulary.
         with Horizontal(id="upper"):
             with Vertical(id="left_column"):
+                # Hidden until `/`. It is one line, and one line of a list
+                # you are trying to see less of is a line worth not spending
+                # when you are not filtering.
+                yield FilterInput(placeholder="filter sessions", id="filter")
                 yield ClickToAttachDataTable(id="left_pane")
                 # squeue output contains user-controlled job names and array
                 # syntax; render it literally rather than treating ``[...]``
@@ -4154,6 +4263,8 @@ class AutotmuxApp(App):
 
     async def _connection_manager_closed(self, result: dict | None) -> None:
         self._connection_manager_open = False
+        # What the list is narrowed to, '' for everything.
+        self._filter = ''
         if result is None:
             self._connection_setup_pending = False
             # First-run Cancel means "not now".  Resume the ordinary local
@@ -4439,6 +4550,10 @@ class AutotmuxApp(App):
         self._maybe_warn_expiring_jobs(state)
         rows = build_session_rows(state)
         rows = self._decorate_keepalive(rows, state)
+        showing = len(rows)
+        if self._filter:
+            rows = filter_rows(rows, self._filter)
+        self._match_count = (len(rows), showing)
         updated = state.get('updated', '?')
 
         sig = tuple(rows)
@@ -4814,6 +4929,13 @@ class AutotmuxApp(App):
         # say better. Only what is wrong earns a place up here.
         if '⚠' not in warning and 'daemon' not in warning.lower():
             warning = ''
+        # A filter is the one piece of state that hides things, so it is the
+        # one that must never be hidden itself: with the bar closed, missing
+        # sessions read as sessions having gone missing.
+        shown, total = self._match_count
+        if self._filter:
+            note = f'/{self._filter}  {shown} of {total}'
+            warning = f'{note}   {warning}' if warning else note
         line.show(counts, warning)
 
     def _status_subtitle(self, state, rows, updated) -> str:
@@ -5296,6 +5418,54 @@ class AutotmuxApp(App):
             return
         pane.focus()
 
+    # ── narrowing the list ───────────────────────────────────────────────
+    def action_filter_sessions(self) -> None:
+        """Open the filter, or put the cursor back in it if it is open."""
+        try:
+            box = self.query_one('#filter', FilterInput)
+        except Exception:
+            return
+        box.can_focus = True
+        box.add_class('-on')
+        box.focus()
+
+    def _close_filter(self, keep: bool) -> None:
+        """Put the keyboard back on the list.
+
+        `keep` is the difference between Enter and Escape: one is "that is
+        the list I wanted", the other is "put them all back". A filter that
+        survived Escape would be invisible state -- the bar is gone and the
+        sessions are missing, which reads as sessions having gone missing.
+        """
+        try:
+            box = self.query_one('#filter', FilterInput)
+        except Exception:
+            return
+        if not keep:
+            box.value = ''
+            self._filter = ''
+            self._invalidate_rows()
+            self._refresh_table(self._last_state)
+        box.remove_class('-on')
+        box.can_focus = False
+        self.action_focus_table()
+
+    def _invalidate_rows(self) -> None:
+        """Force the next refresh to rebuild rather than update in place."""
+        self._last_rows_sig = None
+        self._last_structural_sig = None
+
+    async def on_input_changed(self, event) -> None:
+        if getattr(event.input, 'id', '') != 'filter':
+            return
+        self._filter = event.value
+        self._invalidate_rows()
+        self._refresh_table(self._last_state)
+
+    async def on_input_submitted(self, event) -> None:
+        if getattr(event.input, 'id', '') == 'filter':
+            self._close_filter(keep=True)
+
     def action_focus_table(self) -> None:
         """The way back, from anywhere.
 
@@ -5303,6 +5473,8 @@ class AutotmuxApp(App):
         the list without your having to remember which direction you came
         from -- otherwise focus is a maze, which is what made it worth
         removing the first time.
+
+        The filter has its own escape, on the widget: see FilterInput.
         """
         table = getattr(self, 'table', None)
         if table is not None and table.display:
