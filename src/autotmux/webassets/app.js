@@ -182,54 +182,76 @@
   // ── typing on a software keyboard ───────────────────────────────────
   // Holding delete removed one character and stopped. iOS repeats the
   // software keyboard's delete key only while the field still has something
-  // to delete, and xterm's helper textarea is kept empty -- so the first
-  // press deleted nothing the OS could see, and the repeat never started.
-  // Measured: value.length was 0.
+  // to delete, and xterm's helper textarea is kept empty -- measured,
+  // value.length was 0 -- so the first press deleted nothing the platform
+  // could see and the repeat never started.
   //
-  // So the field is padded while the keyboard is up, and what the platform
-  // does to that padding is read back as intent: characters gone means
-  // backspaces, characters added means text. This is how mobile terminals
-  // have always done it, and it is the only thing iOS's own repeat can act
-  // on.
+  // Padding xterm's own helper was the first fix and it was wrong: that
+  // meant sharing one element with a listener registered before ours, and at
+  // the target element listeners run in registration order whatever their
+  // capture flag, so stopImmediatePropagation was always too late. Measured
+  // with real keystrokes -- the last probe used a synthetic Event('input')
+  // which xterm ignores, so it tested my handler alone and said all was
+  // well -- a typed space arrived as two.
   //
-  // Only while our typing mode is on. Off it, xterm has the textarea back
-  // and behaves exactly as before -- a hardware keyboard never needed this.
-  var PAD = ' '.repeat(64);
-  var padding = false;
+  // So the keyboard types into a field of ours that xterm knows nothing
+  // about, and the whole translation is ours. Off typing mode it is not even
+  // displayed, and xterm has its own textarea back exactly as before.
+  var typebox = document.getElementById('typebox');
+  var PAD = ' '.repeat(64);
+  var lastTyped = PAD;
 
   function repad() {
-    if (!textarea) return;
-    textarea.value = PAD;
-    try { textarea.setSelectionRange(PAD.length, PAD.length); } catch (e) {}
+    if (!typebox) return;
+    typebox.value = PAD;
+    lastTyped = PAD;
+    try { typebox.setSelectionRange(PAD.length, PAD.length); } catch (e) {}
   }
 
+  // Compared against what was there, not filtered for padding. Filtering
+  // spaces out of the difference is what made a typed space vanish -- the
+  // padding is spaces, so a space is indistinguishable from padding by
+  // content and only distinguishable by position.
   function onTypedInput(event) {
-    if (!padding || event.isComposing) return;
-    event.stopImmediatePropagation();     // xterm must not read the padding
-    var value = textarea.value;
-    if (value.length < PAD.length) {
-      typed('\x7f'.repeat(PAD.length - value.length));
-    } else if (value.length > PAD.length) {
-      // Whatever the platform put in, wherever it put it. Compared against
-      // the pad rather than sliced from the end: autocomplete and dictation
-      // both replace a run rather than append to it.
-      var added = value.split('').filter(function (ch) {
-        return ch !== ' ';
-      }).join('');
-      if (added) typed(added);
+    if (!typebox || event.isComposing) return;
+    var now = typebox.value;
+    var was = lastTyped;
+    var head = 0;
+    while (head < now.length && head < was.length && now[head] === was[head]) {
+      head += 1;
     }
-    repad();
+    var tail = 0;
+    while (tail < now.length - head && tail < was.length - head
+           && now[now.length - 1 - tail] === was[was.length - 1 - tail]) {
+      tail += 1;
+    }
+    var removed = was.length - head - tail;
+    var inserted = now.slice(head, now.length - tail);
+    if (removed > 0) typed('\x7f'.repeat(removed));
+    if (inserted) typed(inserted);
+    lastTyped = now;
+    // Refilled only when it is running low, never after every keystroke.
+    // A held delete is one long burst of platform-driven deletions, and
+    // rewriting the field's value in the middle of one is how you stop it:
+    // the repeat is the platform's, and it is chewing on this buffer. Half
+    // the pad is thirty-two deletions of headroom, which outlasts any
+    // realistic hold, and the refill lands between bursts.
+    if (now.length < PAD.length / 2 || now.length > PAD.length * 2) repad();
   }
 
   function onTypedKey(event) {
-    if (!padding) return;
     var send = {Enter: '\r', Tab: '\t', Escape: '\x1b',
                 ArrowUp: '\x1b[A', ArrowDown: '\x1b[B',
                 ArrowRight: '\x1b[C', ArrowLeft: '\x1b[D'}[event.key];
     if (!send) return;                    // let the field have it
     event.preventDefault();
-    event.stopImmediatePropagation();
     typed(send);
+  }
+
+  if (typebox) {
+    typebox.addEventListener('input', onTypedInput);
+    typebox.addEventListener('keydown', onTypedKey);
+    typebox.addEventListener('compositionend', function () { repad(); });
   }
 
   function setKeyboard(open) {
@@ -237,26 +259,19 @@
     kbdOpen = open;
     var button = document.getElementById('kbd');
     if (button) button.classList.toggle('on', open);
-    textarea.classList.toggle('atmux-typing', open);
-    padding = !!open;
+    if (typebox) typebox.classList.toggle('on', open);
     if (open) {
-      textarea.removeAttribute('inputmode');
       repad();
-      // Worth a try: on a platform that does honour it this saves the tap.
-      try { textarea.focus(); } catch (e) {}
+      // xterm's own field must not also be focused: two focused editables
+      // is two places the keyboard could go.
+      try { textarea.blur(); } catch (e) {}
+      try { typebox.focus(); } catch (e) {}
       say('tap the screen to type');
     } else {
-      textarea.setAttribute('inputmode', 'none');
-      textarea.value = '';
-      textarea.blur();
+      if (typebox) { typebox.value = ''; typebox.blur(); }
       term.focus();
       say('keyboard off');
     }
-  }
-
-  if (textarea) {
-    textarea.addEventListener('input', onTypedInput, true);
-    textarea.addEventListener('keydown', onTypedKey, true);
   }
 
   // A button that takes focus first leaves nothing for the terminal, so every

@@ -332,6 +332,20 @@
      rather than as a screen that opened over what you were reading. The one
      thing it cannot carry across is colour: it is one weight of one colour,
      because it is text and not a grid of cells. */
+  /* Full-bleed and invisible: the reader is looking at the terminal, and
+     this only has to be the thing the keyboard is attached to. Below the
+     copy view, which must never be typed through. */
+  #typebox {
+    display: none;
+    position: absolute; inset: 0; z-index: 5;
+    width: 100%; height: 100%;
+    opacity: 0; border: 0; padding: 0; resize: none;
+    background: transparent; color: transparent;
+    /* Under 16px iOS zooms the page to meet a focused field. */
+    font-size: 16px;
+    user-select: text; -webkit-user-select: text;
+  }
+  #typebox.on { display: block; }
   #selview {
     /* Above the typing textarea, which is full-screen at z-index 5 while the
        software keyboard is up. Below it, the copy view was covered by an
@@ -825,6 +839,15 @@
 <body>
 <div id="app">
   <div id="term">
+    <!-- Where the software keyboard types.
+         Ours, not xterm's. Padding xterm's own helper meant sharing one
+         element with a listener registered before ours -- and at the target
+         element listeners run in registration order whatever their capture
+         flag, so stopImmediatePropagation was always too late. A typed
+         space came out as two. -->
+    <textarea id="typebox" autocapitalize="off" autocorrect="off"
+              autocomplete="off" spellcheck="false"
+              aria-label="type into the terminal"></textarea>
     <!-- The selecting layer. Empty and hidden until `copy` is tapped, and
          filled from the terminal buffer at that moment: a snapshot is what
          you want to select from, since text that reflows under a long press

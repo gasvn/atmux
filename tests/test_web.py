@@ -1263,10 +1263,14 @@ class TouchKeypadTests(unittest.TestCase):
         Safari raises the keyboard when the tap itself lands on a focusable
         element -- which is why every ordinary web form works and none of
         that did."""
-        self.assertIn('atmux-typing', self.js)
-        self.assertIn('.xterm-helper-textarea.atmux-typing', self.html)
-        self.assertRegex(self.html, r'atmux-typing \{[^}]*opacity: 0')
-        self.assertRegex(self.html, r'atmux-typing \{[^}]*height: 100%')
+        self.assertIn('id="typebox"', self.html)
+        self.assertIn("typebox.classList.toggle('on', open)", self.js)
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        block = re.search(r'#typebox \{(.*?)\}', css, re.S).group(1)
+        self.assertIn('opacity: 0', block)
+        self.assertIn('height: 100%', block)
+        # And under 16px iOS zooms the page to meet a focused field.
+        self.assertIn('font-size: 16px', block)
 
 
     def test_repeating_keys_are_recognised_rather_than_flagged(self):
@@ -1281,10 +1285,15 @@ class TouchKeypadTests(unittest.TestCase):
         self.assertNotIn("'rep'", self.js)
 
     def test_the_software_keyboard_is_off_until_asked_for(self):
-        """It costs half the screen and atmux needs it only to name a new
-        session. inputmode=none keeps the textarea focused -- so a hardware
-        keyboard still works -- without raising the on-screen one."""
-        self.assertIn("'inputmode'", self.js)
+        """It costs half the screen, and atmux needs it only now and then.
+        The field it types into is not displayed until asked for, so nothing
+        can raise the on-screen keyboard by accident -- and xterm keeps its
+        own textarea focused meanwhile, so a hardware keyboard still works.
+        """
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        block = re.search(r'#typebox \{(.*?)\}', css, re.S).group(1)
+        self.assertIn('display: none', block)
+        self.assertIn('#typebox.on { display: block; }', css)
         self.assertIn("'none'", self.js)
         self.assertIn('id="kbd"', self.html)
 
@@ -1298,8 +1307,12 @@ class TouchKeypadTests(unittest.TestCase):
                          self.js, re.S)
         self.assertIsNotNone(body, 'setKeyboard not found')
         code = re.sub(r'//.*', '', body.group(1))       # comments are not code
-        self.assertIn('textarea.focus()', code,
-                      'the keyboard path must focus the textarea directly')
+        # Ours now, not xterm's. Sharing that element meant sharing it with a
+        # listener registered before ours, and at the target element
+        # listeners run in registration order whatever their capture flag --
+        # so a typed space arrived as two.
+        self.assertIn('typebox.focus()', code,
+                      'the keyboard path must focus a real field directly')
         self.assertNotIn('preventScroll', code)
 
     def test_the_element_is_bounced_so_ios_re_reads_the_input_mode(self):
@@ -2958,32 +2971,52 @@ class KeypadVocabularyTests(unittest.TestCase):
         field still has something to delete, and xterm's helper textarea is
         kept empty -- measured, value.length was 0. So the first press
         deleted nothing the platform could see and the repeat never started,
-        which is the opposite of what every other iOS text field does.
+        which is the opposite of every other iOS text field.
 
-        The field is padded while the keyboard is up, and what the platform
-        does to that padding is read back as intent. Measured: removing seven
-        characters sends seven backspaces, adding `ls -la` sends `ls -la`,
-        and the pad is refilled after each so the next hold has something to
-        chew on again.
+        The keyboard types into a padded field of ours, and what the
+        platform does to that padding is read back as intent. Measured with
+        real keystrokes: 40 backspaces send 40, 100 send 100, and a whole
+        command with quotes and spaces arrives unchanged.
         """
         source = _extract(self.js, 'onTypedInput')
-        self.assertIn('stopImmediatePropagation', source,
-                      'xterm would read the padding as typed text')
-        self.assertIn('PAD.length - value.length', source)
-        self.assertIn('repad()', source)
-        # Composition is the platform mid-sentence; diffing it would send
-        # half-formed characters.
-        self.assertIn('isComposing', source)
-        # Capture phase, or xterm's own listener runs first.
-        self.assertIn("addEventListener('input', onTypedInput, true)", self.js)
+        self.assertIn('lastTyped', source)
+        self.assertIn("'\\x7f'.repeat(removed)", source)
+        # A prefix/suffix comparison, not a filter. Filtering the padding out
+        # of the difference is what made a typed space vanish: the padding is
+        # spaces, so a space differs from padding only by position.
+        self.assertIn('head', source)
+        self.assertIn('tail', source)
+        self.assertNotIn("!== ' '", source)
+
+    def test_the_field_is_ours_so_nothing_else_reads_it(self):
+        """Padding xterm's own helper meant sharing one element with a
+        listener registered before ours -- and at the target element,
+        listeners run in registration order whatever their capture flag, so
+        stopImmediatePropagation was always too late. Measured with real
+        keystrokes: a typed space arrived as two.
+        """
+        self.assertIn('id="typebox"', self.html)
+        self.assertNotIn('atmux-typing', self.js)
+        # Registered on our own element, and plainly -- there is nothing left
+        # to outrun.
+        self.assertIn("typebox.addEventListener('input', onTypedInput)", self.js)
+        self.assertNotIn('onTypedInput, true', self.js)
+
+    def test_the_pad_is_refilled_between_bursts_not_during_one(self):
+        """A held delete is one long burst of platform-driven deletions, and
+        rewriting the field in the middle of one is how you stop it -- the
+        repeat is the platform's and it is chewing on this buffer."""
+        source = _extract(self.js, 'onTypedInput')
+        self.assertIn('PAD.length / 2', source)
+        self.assertNotRegex(source, r'typed\(inserted\);\s*\n\s*repad\(\);')
 
     def test_the_padding_exists_only_while_the_keyboard_is_up(self):
         """A hardware keyboard never needed any of this, and off typing mode
-        xterm has its textarea back exactly as before."""
+        xterm has its own textarea back exactly as before."""
         source = _extract(self.js, 'setKeyboard')
-        self.assertIn('padding = !!open', source)
         self.assertIn('repad()', source)
-        self.assertIn("textarea.value = ''", source)
+        self.assertIn("typebox.value = ''", source)
+        self.assertIn('textarea.blur()', source)
 
     def test_the_keys_wait_to_be_asked_for(self):
         """Three rows of keys is 41% of a phone, and the reason you opened a
