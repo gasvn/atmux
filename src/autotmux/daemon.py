@@ -2783,7 +2783,7 @@ def _hard_run(argv, *, timeout: float, **kwargs):
         subprocess.run, argv, timeout=timeout, **kwargs)
 
 
-def _parse_session_payload(out: str) -> tuple[list, str, str, str]:
+def _parse_session_payload(out: str) -> tuple[list, str, str, str, str]:
     """Parse the marker-framed session/load/tmux response from one node.
 
     NUL-framed markers cannot occur in tmux session names or shell startup
@@ -2801,6 +2801,11 @@ def _parse_session_payload(out: str) -> tuple[list, str, str, str]:
     if not found:
         raise ValueError('missing tmux-info payload marker')
     info_lines = [line.strip() for line in node_text.splitlines() if line.strip()]
+    gpu = ''
+    for line in info_lines:
+        if line.startswith('gpu '):
+            gpu = line[4:].strip()
+    info_lines = [line for line in info_lines if not line.startswith('gpu ')]
     nproc = info_lines[0] if info_lines else ''
     load = info_lines[1].split(',')[0].strip() if len(info_lines) >= 2 else ''
     # The remote clock, sampled in the same command as the activity stamps.
@@ -2848,7 +2853,7 @@ def _parse_session_payload(out: str) -> tuple[list, str, str, str]:
     escape_time = tmux_lines[0] if tmux_lines else ''
     if not escape_time.isdigit():
         escape_time = ''
-    return sessions, nproc, load, escape_time
+    return sessions, nproc, load, escape_time, gpu
 
 
 def _session_probe_script() -> str:
@@ -2894,6 +2899,20 @@ def _session_probe_script() -> str:
         " || echo '?');"
         " LC_ALL=C uptime | sed -n 's/.*load average: //p';"
         " (date +%s 2>/dev/null || echo '?');"
+        # One line, whatever the card count: mean utilisation and summed
+        # memory, or nothing at all where there are no GPUs. Tagged `gpu`
+        # rather than found by position -- the reader drops blank lines, so a
+        # node whose load average came back empty would otherwise shift this
+        # into the load slot and report a card count as a load average.
+        #
+        # Guarded twice: a login node has no nvidia-smi, and a node whose
+        # driver is unhappy writes to stderr and exits non-zero. A probe that
+        # failed here would take the CPU numbers down with it.
+        " (nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total"
+        " --format=csv,noheader,nounits 2>/dev/null"
+        " | awk -F', *' 'NF>=3 {u+=$1; m+=$2; t+=$3; n++}"
+        " END {if (n) printf \"gpu %d %d %d %d\", u/n, m, t, n}'"
+        " || true); echo;"
         " printf '\\000AUTOTMUX_TMUXINFO\\000\\n';"
         " (tmux show-options -s -v escape-time 2>/dev/null || echo '?');"
         " exit 0"
@@ -2949,7 +2968,7 @@ def _session_loop():
                         cmd, universal_newlines=True, timeout=10,
                         stderr=subprocess.PIPE,
                     )
-                    sessions, nproc, load, escape_time = (
+                    sessions, nproc, load, escape_time, gpu = (
                         _parse_session_payload(out))
                     lease.success()
                     snapshot = None
@@ -2963,6 +2982,10 @@ def _session_loop():
                                 info['load'] = load
                             if escape_time:
                                 info['escape_time'] = escape_time
+                            # Set even when empty: a node that lost its GPUs
+                            # -- or a job that moved to a CPU partition --
+                            # must stop reporting the last ones it saw.
+                            info['gpu'] = gpu
                             _set_info_error_locked(info, 'session', None)
                             snapshot = dict(info)
                     if snapshot is not None:

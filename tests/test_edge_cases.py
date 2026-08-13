@@ -657,7 +657,8 @@ class SessionPayloadTests(unittest.TestCase):
             + d._TMUXINFO_SECTION
             + '\n500\n'
         )
-        sessions, nproc, load, escape_time = d._parse_session_payload(payload)
+        sessions, nproc, load, escape_time, _gpu = d._parse_session_payload(
+            payload)
         self.assertEqual(
             sessions, [['---NODEINFO---', '2', 100], ['main', '1', 10]])
         self.assertEqual(nproc, '8')

@@ -219,7 +219,7 @@ def _split_idle_marker(status) -> tuple[str, str]:
 def build_session_rows(state: dict) -> list:
     """Turn daemon state into a flat list of display rows.
 
-    Each row: (node, session, wins, time_left, status, cpu, load)
+    Each row: (node, session, wins, time_left, status, cpu, load, gpu)
     `cpu` is how many processors the machine has and `load` is its 1-min load
     average -- both node-wide, so dividing one by the other means something.
     Together they tell the user whether attaching will be snappy or sluggish.
@@ -238,6 +238,8 @@ def build_session_rows(state: dict) -> list:
             info = {}
         time_left = str(info.get('time', '') or '')
         cpu = str(info.get('nproc', '') or '')
+        # "mean-util used total count", or '' where the node has no cards.
+        gpu = str(info.get('gpu', '') or '')
         load = str(info.get('load', '') or '')
         try:
             escape_time = int(str(info.get('escape_time', '') or ''))
@@ -261,7 +263,7 @@ def build_session_rows(state: dict) -> list:
                 network_warning += f': {reason}'
         if not nd.get('alive'):
             status = f'OFFLINE: {last_error[:30]}' if last_error else 'OFFLINE'
-            rows.append((node, _OFFLINE_SESSION, '-', time_left, status, cpu, load))
+            rows.append((node, _OFFLINE_SESSION, '-', time_left, status, cpu, load, gpu))
             continue
         sessions = nd.get('sessions', [])
         if not isinstance(sessions, (list, tuple)):
@@ -290,14 +292,14 @@ def build_session_rows(state: dict) -> list:
                     status = f'{status} · {latency_warning}'
                 if network_warning:
                     status = f'{status} · {network_warning}'
-                rows.append((node, name, wins, time_left, status, cpu, load))
+                rows.append((node, name, wins, time_left, status, cpu, load, gpu))
                 added = True
         if not added:
             status = (f'DEGRADED: {last_error[:30]}'
                       if last_error else 'No sessions')
             if network_warning:
                 status = f'{status} · {network_warning}'
-            rows.append((node, _START_SHELL_SESSION, '-', time_left, status, cpu, load))
+            rows.append((node, _START_SHELL_SESSION, '-', time_left, status, cpu, load, gpu))
     rows.sort(key=lambda r: (_attention_rank(r), r[0], _session_label(r[1])))
     return rows
 
@@ -350,7 +352,7 @@ def sessions(state: dict, keepalive_entries=()) -> list[dict]:
     the same name, so a name match would claim jobs nobody armed.
     """
     out = []
-    for node, name, wins, time_left, status, cpu, load in \
+    for node, name, wins, time_left, status, cpu, load, gpu in \
             build_session_rows(state):
         marker, rest = _split_idle_marker(status)
         idle_seconds = None
@@ -383,9 +385,12 @@ def sessions(state: dict, keepalive_entries=()) -> list[dict]:
             'tier': _idle_tier(idle_seconds) if idle_seconds is not None else '',
             'cpu': cpu,
             'load': load,
+            # "mean-util used total count", or '' on a node with no cards.
+            # The browser list draws the same rail the table does.
+            'gpu': gpu,
             'keepalive': _keepalive_field(state, node, keepalive_entries),
             'attention': _attention_rank((node, name, wins, time_left,
-                                          status, cpu, load)),
+                                          status, cpu, load, gpu)),
         })
     return out
 

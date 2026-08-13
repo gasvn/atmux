@@ -2572,7 +2572,11 @@ def _idle_cell(marker) -> rich.text.Text:
 # One column, padded here, costs the alignment that a grid gives for free and
 # buys back the thing the design needs: a line whose last field takes whatever
 # width is left, which is where the output goes.
-_TAIL_MIN = 24
+# The rail is fixed and known, so it is reserved rather than left to be
+# clipped: 6 for the walltime, then a labelled bar and a percentage each for
+# CPU and GPU. Names give way before numbers do -- a truncated session name
+# is still recognisable and a truncated bar is a lie.
+_RAIL = 6 + 2 + 9 + 2 + 9
 
 
 def _row_widths(rows, total: int) -> tuple:
@@ -2584,12 +2588,15 @@ def _row_widths(rows, total: int) -> tuple:
     lead = max([6] + [len(_idle_marker_text(r)) for r in rows])
     name = max([7] + [len(_session_cell(r[1], r[2])) for r in rows])
     where = max([4] + [len(_node_label(r[0])) for r in rows])
-    # The output takes what is left, and the names give way before it does:
-    # a truncated session name is still recognisable, and a truncated
-    # traceback is not.
-    spare = total - (lead + name + where + 6)
-    if spare < _TAIL_MIN:
-        where = max(4, where - (_TAIL_MIN - spare))
+    spare = total - (lead + name + where + 6) - _RAIL
+    if spare < 0:
+        # The machine gives way first: its name is the more guessable of the
+        # two, and the session name is what the reader navigates by.
+        give = min(where - 6, -spare)
+        where = max(6, where - max(0, give))
+        spare = total - (lead + name + where + 6) - _RAIL
+        if spare < 0:
+            name = max(8, name + spare)
     return lead, name, where
 
 
@@ -2648,11 +2655,13 @@ def _compose_session(r, widths, tail: str, total: int) -> rich.text.Text:
     # figures the reader had to do arithmetic on -- `12.60/96` is a division,
     # and a walltime three days out is a number nobody acts on.
     rail = _row_rail(r)
-    room = max(0, total - (lead + name + where + 6) - rail.cell_len)
+    room = max(0, total - (lead + name + where + 6))
     if tail:
-        line.append(tail[:room] if len(tail) <= room else tail[:room - 1] + '…')
+        keep = max(0, room - rail.cell_len - 2)
+        line.append(tail[:keep] if len(tail) <= keep else tail[:keep - 1] + '…')
+        room -= min(len(tail), keep)
     if rail.cell_len:
-        line.append(' ' * max(1, room - _visible_len(tail, room)))
+        line.append(' ' * max(1, room - rail.cell_len))
         line.append_text(rail)
     return line
 
@@ -2661,53 +2670,85 @@ def _visible_len(text: str, room: int) -> int:
     return min(len(text or ''), room)
 
 
-# Under this much walltime the number stops being background and starts
-# being the thing you act on. Above it, a session that ends in two days is
-# not news and the column it would cost is better spent on the output.
+# Colour thresholds. The numbers are always shown -- what changes with them
+# is only how loudly. Hiding them until something was wrong was my idea and
+# it was wrong: on a Slurm workflow "how long have I got" and "is the machine
+# actually working" are what you watch, not what you are told about.
 _WALL_URGENT = 2 * 3600
 _WALL_CRITICAL = 30 * 60
-# And a machine is only worth remarking on when it is actually loaded.
-_LOAD_BUSY = 0.75
+_BUSY = 0.75
+
+
+def _gpu_share(spec):
+    """(utilisation, memory share, card count) from the probe's gpu line."""
+    parts = str(spec or '').split()
+    if len(parts) < 4:
+        return None
+    try:
+        util, used, total, count = (float(p) for p in parts[:4])
+    except ValueError:
+        return None
+    if not (math.isfinite(util) and math.isfinite(total)) or total <= 0:
+        return None
+    return util / 100.0, max(0.0, used / total), int(count)
+
+
+def _meter(share, width, label) -> rich.text.Text:
+    """One bar and its number, coloured by how far along it is."""
+    out = rich.text.Text()
+    if share is None:
+        return out
+    style = (tone('danger') if share >= 0.95 else
+             tone('warn') if share >= _BUSY else tone('ok'))
+    out.append(label, style=tone('quiet'))
+    out.append(bar(share, width), style=style)
+    out.append(f'{min(999, round(share * 100)):3d}%', style=style)
+    return out
 
 
 def _row_rail(r) -> rich.text.Text:
-    """The right-hand rail: what is abnormal about this row, if anything.
+    """The right-hand rail: time left, CPU, GPU.
 
-    Silence is the healthy state. A rail that always shows a load bar and a
-    walltime is six columns of "everything is fine" on every row, which is
-    the reading the bands already give for free.
+    Always drawn for a real session. These are the two -- three now -- that
+    a person watching a cluster job checks continuously, and a number that
+    only appears once it is too late is not a number you were watching.
     """
     rail = rich.text.Text()
     if r[1] in (_OFFLINE_SESSION, _START_SHELL_SESSION):
-        # Neither number means anything here. An unreachable node's walltime
-        # is whatever it last said before it went, and a login node runs at
-        # five times its core count all day -- drawing that in red on every
-        # one of them is a warning about the normal state of the machine.
+        # An unreachable node's walltime is whatever it last said before it
+        # went, and a login node runs at five times its core count all day.
         return rail
     seconds = keepalive.parse_time_left(str(r[3] or '').strip())
-    if (seconds is not None and math.isfinite(seconds)
-            and seconds <= _WALL_URGENT):
-        style = tone('danger') if seconds <= _WALL_CRITICAL else tone('warn')
-        rail.append(_time_left_label(r[3]).rjust(6), style=style)
+    left = _time_left_label(r[3])
+    if left and left not in {'-', '?'}:
+        style = tone('quiet')
+        if seconds is not None and math.isfinite(seconds):
+            if seconds <= _WALL_CRITICAL:
+                style = tone('danger')
+            elif seconds <= _WALL_URGENT:
+                style = tone('warn')
+        rail.append(left.rjust(6), style=style)
     share = load_fraction(r[6], r[5])
-    if share is not None and share >= _LOAD_BUSY:
-        if rail.cell_len:
-            rail.append(' ')
-        rail.append(bar(share, 6),
-                    style=tone('danger') if share >= 1.0 else tone('warn'))
+    if share is not None:
+        rail.append('  ')
+        rail.append_text(_meter(share, 4, 'c'))
+    gpu = _gpu_share(r[7] if len(r) > 7 else '')
+    if gpu is not None:
+        rail.append('  ')
+        # Utilisation, not memory: a card holding a model and doing nothing
+        # is the failure this is meant to show, and memory alone cannot tell
+        # that apart from a card that is working.
+        rail.append_text(_meter(gpu[0], 4, 'g'))
     return rail
 
 
 def _heading(title: str, note: str = '', key: str = '') -> rich.text.Text:
     """The one heading this app draws, wherever it draws one.
 
-    There were three shapes of the same idea and no two agreed: the bands
-    wrote `── just stopped 3`, the preview wrote
-    `── node:session ─ live  [2: scroll] ──` with dashes at both ends, and
-    the queue wrote `── ALL JOBS (squeue -l)  [j: switch · 3: scroll] ──
-    4s old` -- caps, brackets, parentheses and a trailing rule, all in one
-    line. Three panes that are peers should not each invent their own
-    furniture.
+    There were three shapes of the same idea and no two agreed: the bands,
+    the preview and the queue each invented their own caps, brackets and
+    trailing rules. Three panes that are peers should not each invent their
+    own furniture.
 
     One rule at the front, the title, then what is true of it, then the key
     that acts on it. Nothing at the end: a trailing rule has to be measured

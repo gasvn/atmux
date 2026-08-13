@@ -1486,12 +1486,15 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
             'gpu1:quiet': {'lines': 'collected 214 items\n1264 passed\n'},
         })
         self.assertNotIn('1264 passed', str(lines['quiet']))
-        self.assertEqual(str(lines['quiet']).split(), ['●', '15m', 'quiet', 'gpu1'])
+        self.assertNotIn('collected', str(lines['quiet']))
 
     async def test_a_session_with_no_snapshot_yet_says_nothing(self):
         """Rather than an apology. The snapshot loop fills in on its own."""
         lines = await self._lines(self.IDLE_STATE)
-        self.assertEqual(str(lines['busy']).split(), ['busy', 'gpu1'])
+        # The rail is always there now; what a row without a snapshot must
+        # not carry is a pane line, not a walltime.
+        self.assertIn('busy', str(lines['busy']))
+        self.assertIn('gpu1', str(lines['busy']))
 
     async def test_a_troubled_row_reports_instead_of_its_output(self):
         """Quieting the healthy baseline must not quiet the rows that
@@ -1605,20 +1608,30 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
                             autotmux._TOKENS['danger'][1])
         self.assertEqual(autotmux.tone('nonsense'), '')
 
-    async def test_the_rail_stays_quiet_until_there_is_something_to_say(self):
-        """Silence is the healthy state. A load bar and a walltime on every
-        row is six columns of "everything is fine" repeated down the screen,
-        which is the reading the bands already give for free."""
-        def row(node, session, left, load, cpu):
-            return (node, session, '1', left, '', cpu, load)
-        # Nothing abnormal: no rail at all.
-        self.assertEqual(
-            autotmux._row_rail(row('gpu1', 'a', '2-00:00:00', '4.0', '96')).plain,
-            '')
-        # A walltime running out, and a machine that is full.
-        rail = autotmux._row_rail(row('gpu1', 'a', '0:22:14', '94.0', '96')).plain
-        self.assertIn('22m', rail)
-        self.assertIn('█', rail)
+    async def test_the_rail_is_always_there(self):
+        """Hiding the walltime and the load until something was wrong was my
+        idea and it was wrong: on a Slurm workflow "how long have I got" and
+        "is the machine actually working" are what a person watches, not what
+        they wait to be told. A number that only appears once it is too late
+        is not a number anybody was watching.
+        """
+        def row(node, session, left, load, cpu, gpu=''):
+            return (node, session, '1', left, '', cpu, load, gpu)
+        healthy = autotmux._row_rail(
+            row('gpu1', 'a', '2-00:00:00', '4.0', '96')).plain
+        self.assertIn('2d', healthy)
+        self.assertIn('%', healthy)
+        # And the GPU beside it where there is one.
+        withgpu = autotmux._row_rail(
+            row('gpu1', 'a', '0:22:14', '94.0', '96', '61 40000 81559 2')).plain
+        self.assertIn('22m', withgpu)
+        self.assertEqual(withgpu.count('%'), 2, 'cpu and gpu both')
+
+    async def test_a_node_with_no_cards_shows_no_gpu(self):
+        """Rather than a zero, which reads as a card doing nothing."""
+        rail = autotmux._row_rail(
+            ('gpu1', 'a', '1', '2:00:00', '', '96', '4.0', '')).plain
+        self.assertEqual(rail.count('%'), 1)
 
     async def test_neither_number_means_anything_on_a_placeholder(self):
         """An unreachable node's walltime is whatever it last said before it

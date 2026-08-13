@@ -115,7 +115,7 @@ class BuildSessionRowsTests(unittest.TestCase):
         rows = autotmux.build_session_rows(state)
         self.assertEqual(rows, [(
             'also-bad', autotmux._OFFLINE_SESSION,
-            '-', '', 'OFFLINE', '', '',
+            '-', '', 'OFFLINE', '', '', '',
         )])
 
     def test_offline_node_shows_last_error(self):
@@ -720,6 +720,24 @@ class SessionActivityParsingTests(unittest.TestCase):
             f'{self.NOW - 1}:1:first\n')
         self.assertEqual([r[0] for r in rows], ['first', 'second'])
 
+    def test_the_gpu_line_is_found_by_its_tag_not_its_position(self):
+        """The reader drops blank lines, so a node whose load average came
+        back empty would shift a positional GPU line into the load slot and
+        report a card count as a load average."""
+        info = f'96\n0.50, 0.4, 0.3\n{self.NOW}\ngpu 42 8192 81559 4\n'
+        out = d._parse_session_payload(
+            _probe_payload(f'{self.NOW - 5}:1:a\n', info))
+        self.assertEqual(out[1], '96')          # nproc
+        self.assertEqual(out[2], '0.50')        # load
+        self.assertEqual(out[4], '42 8192 81559 4')
+
+    def test_a_node_with_no_cards_reports_no_gpu(self):
+        info = f'96\n0.50, 0.4, 0.3\n{self.NOW}\n'
+        out = d._parse_session_payload(
+            _probe_payload(f'{self.NOW - 5}:1:a\n', info))
+        self.assertEqual(out[4], '')
+        self.assertEqual(out[2], '0.50')
+
     def test_session_name_may_contain_colons(self):
         """Activity and window count lead precisely so the name can hold ':'."""
         rows = self._sessions(f'{self.NOW - 5}:1:proj:sub:run\n')
@@ -1103,9 +1121,16 @@ class IdleRowTests(unittest.TestCase):
         self.assertEqual(row[1], 'train')
         self.assertNotIn(autotmux._IDLE_DOT, row[1])
 
-    def test_rows_stay_seven_wide_for_the_table(self):
-        self.assertEqual(
-            len(autotmux.build_session_rows(self._state(['t', '1', 900]))[0]), 7)
+    def test_rows_carry_every_field_the_table_draws(self):
+        """Eight now: the GPU line joined the row when the rail started
+        showing it. The count is asserted because the table indexes this
+        tuple positionally, so a field added in the middle would silently
+        move somebody's load average into their walltime."""
+        row = autotmux.build_session_rows(self._state(['t', '1', 900]))[0]
+        self.assertEqual(len(row), 8)
+        node, session, wins, left, status, cpu, load, gpu = row
+        self.assertEqual((session, wins), ('t', '1'))
+        self.assertTrue(node)
 
     def test_entries_without_idle_data_render_as_before(self):
         row = autotmux.build_session_rows(self._state(['train', '2']))[0]
