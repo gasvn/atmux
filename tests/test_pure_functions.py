@@ -672,7 +672,16 @@ def _probe_payload(sessions: str, info: str) -> str:
 class SessionActivityParsingTests(unittest.TestCase):
     """The probe reports each session's last-activity stamp and the remote
     clock, sampled together so idle time never depends on clock agreement
-    between the laptop and the node."""
+    between the laptop and the node.
+
+    One line per *window* now, because #{session_activity} does not track
+    output. Measured against a session printing a line a second: it read 3s
+    idle, then 9s, then 11s, while the output never stopped -- it is the
+    time of the last input, so a running job looked more and more finished
+    the longer it ran. #{window_activity} was 0s throughout, and stays 0s
+    for a window that is not the current one, which session_activity missed
+    too. The newest window wins: work in a background window is still work.
+    """
 
     NOW = 1_000_000
 
@@ -684,6 +693,32 @@ class SessionActivityParsingTests(unittest.TestCase):
         rows = self._sessions(
             f'{self.NOW - 60}:2:fresh\n{self.NOW - 900}:1:quiet\n')
         self.assertEqual(rows, [['fresh', '2', 60], ['quiet', '1', 900]])
+
+    def test_a_session_is_as_busy_as_its_busiest_window(self):
+        """Several lines per session, and the newest of them is the answer.
+        Reporting the current window's silence would call a session idle
+        while a background window was printing."""
+        rows = self._sessions(
+            f'{self.NOW - 900}:3:work\n'      # the window you are looking at
+            f'{self.NOW - 4}:3:work\n'        # a background window, printing
+            f'{self.NOW - 600}:3:work\n')
+        self.assertEqual(rows, [['work', '3', 4]])
+
+    def test_windows_of_different_sessions_do_not_pool(self):
+        rows = self._sessions(
+            f'{self.NOW - 10}:1:alpha\n'
+            f'{self.NOW - 800}:2:beta\n'
+            f'{self.NOW - 5}:2:beta\n')
+        self.assertEqual(rows, [['alpha', '1', 10], ['beta', '2', 5]])
+
+    def test_the_first_sighting_fixes_the_order(self):
+        """The list is read in the order tmux gave it, so a session does not
+        jump about the table because one of its windows printed."""
+        rows = self._sessions(
+            f'{self.NOW - 5}:1:first\n'
+            f'{self.NOW - 9}:1:second\n'
+            f'{self.NOW - 1}:1:first\n')
+        self.assertEqual([r[0] for r in rows], ['first', 'second'])
 
     def test_session_name_may_contain_colons(self):
         """Activity and window count lead precisely so the name can hold ':'."""

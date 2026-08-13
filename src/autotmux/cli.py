@@ -4403,13 +4403,7 @@ class AutotmuxApp(App):
         return max(48, width - 2 if width else 78)
 
     def _row_tail(self, r) -> str:
-        """What this session was last doing.
-
-        Free: the daemon already snapshots every pane on a timer so the
-        preview has something to show instantly, and the notice path already
-        knows how to pick the one line out of a screen that says something.
-        Nothing here is fetched.
-        """
+        """What is wrong with this row, if anything."""
         session = r[1]
         # A warning outranks the output. DEGRADED, an escape-time or a
         # network state is about whether this row can be reached at all, and
@@ -4421,13 +4415,12 @@ class AutotmuxApp(App):
             return note
         if session in (_OFFLINE_SESSION, _START_SHELL_SESSION):
             return ''
-        snap = self.snapshots.get(f'{r[0]}:{session}')
-        if not isinstance(snap, dict):
-            return ''
-        try:
-            return notify.last_output_line(snap.get('lines') or '')
-        except Exception:
-            return ''
+        # And nothing else. The pane's last line used to go here, and with
+        # the preview beside the list it was the same answer twice -- read
+        # once per row it is a column of unrelated sentences, which is
+        # clutter rather than information. The preview says it for the row
+        # you are on, which is the row you are asking about.
+        return ''
 
     def _update_row_cells(self, i: int, r) -> bool:
         """Rewrite row i in place, without rebuilding the table.

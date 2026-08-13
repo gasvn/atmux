@@ -1059,16 +1059,20 @@ class GatewayPool:
         sessions = []
         error = ""
         try:
-            # Same field order as the remote probe -- activity and window count
-            # lead so a session name may contain ':' -- so local sessions earn
-            # the same idle hint as remote ones.
+            # Same query as the remote probe, for the same reason it changed
+            # there: #{session_activity} is the time of the last *input*, so
+            # a session printing steadily reads as more and more idle. It is
+            # windows now, newest wins, and the field order still puts the
+            # name last because it may contain ':'.
             result = subprocess.run(
-                ["tmux", "list-sessions", "-F",
-                 "#{session_activity}:#{session_windows}:#{session_name}"],
+                ["tmux", "list-windows", "-a", "-F",
+                 "#{window_activity}:#{session_windows}:#{session_name}"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, timeout=1.5)
             if result.returncode == 0:
                 now = int(time.time())
+                newest: dict = {}
+                order: list = []
                 for line in (result.stdout or "").splitlines():
                     parts = line.split(":", 2)
                     if len(parts) != 3:
@@ -1076,11 +1080,22 @@ class GatewayPool:
                     activity, windows, name = (part.strip() for part in parts)
                     if not name:
                         continue
-                    entry = [name, windows or "?"]
                     try:
-                        entry.append(max(0, now - int(activity)))
+                        stamp = int(activity)
                     except ValueError:
-                        pass
+                        stamp = None
+                    if name not in newest:
+                        order.append(name)
+                        newest[name] = [windows or "?", stamp]
+                    elif stamp is not None:
+                        held = newest[name]
+                        if held[1] is None or stamp > held[1]:
+                            held[1] = stamp
+                for name in order:
+                    windows, stamp = newest[name]
+                    entry = [name, windows]
+                    if stamp is not None:
+                        entry.append(max(0, now - stamp))
                     sessions.append(entry)
         except FileNotFoundError:
             error = "local tmux is not installed"

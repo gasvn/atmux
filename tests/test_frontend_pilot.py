@@ -1475,16 +1475,18 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
         text = str(lines['quiet'])
         self.assertLess(text.index('quiet'), text.index('gpu1'))
 
-    async def test_the_line_ends_with_what_the_session_was_doing(self):
-        """The half of the design that was missing, and the reason the bands
-        alone read as furniture: a band says four things stopped, and only
-        this says which one broke."""
+    async def test_the_line_does_not_repeat_the_preview(self):
+        """The pane's last line used to end every row. With the preview
+        beside the list it is the same answer twice, and read down a column
+        it is a stack of unrelated sentences -- clutter rather than
+        information. The preview says it for the row you are on, which is
+        the row you are asking about.
+        """
         lines = await self._lines(self.IDLE_STATE, snapshots={
             'gpu1:quiet': {'lines': 'collected 214 items\n1264 passed\n'},
-            'gpu1:old': {'lines': "Traceback (most recent call last):\nKeyError: 'lr'\n"},
         })
-        self.assertTrue(str(lines['quiet']).rstrip().endswith('1264 passed'))
-        self.assertTrue(str(lines['old']).rstrip().endswith("KeyError: 'lr'"))
+        self.assertNotIn('1264 passed', str(lines['quiet']))
+        self.assertEqual(str(lines['quiet']).split(), ['●', '15m', 'quiet', 'gpu1'])
 
     async def test_a_session_with_no_snapshot_yet_says_nothing(self):
         """Rather than an apology. The snapshot loop fills in on its own."""

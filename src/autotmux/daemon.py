@@ -2810,7 +2810,12 @@ def _parse_session_payload(out: str) -> tuple[list, str, str, str]:
         remote_now = int(info_lines[2]) if len(info_lines) >= 3 else None
     except ValueError:
         remote_now = None
-    sessions = []
+    # One line per window, so a session with several appears several times.
+    # The newest activity across a session's windows is the session's: work
+    # in a background window is still work, and reporting the current
+    # window's silence would call a busy session idle.
+    newest: dict = {}
+    order: list = []
     for line in sessions_text.splitlines():
         line = line.strip()
         if not line:
@@ -2821,15 +2826,23 @@ def _parse_session_payload(out: str) -> tuple[list, str, str, str]:
             activity, wins, name = parts
         else:
             activity, wins, name = '', '?', line
-        idle = None
-        if remote_now is not None:
-            try:
-                idle = max(0, remote_now - int(activity))
-            except ValueError:
-                idle = None
-        entry = [name, wins or '?']
-        if idle is not None:
-            entry.append(idle)
+        try:
+            stamp = int(activity)
+        except ValueError:
+            stamp = None
+        if name not in newest:
+            order.append(name)
+            newest[name] = [wins or '?', stamp]
+        else:
+            held = newest[name]
+            if stamp is not None and (held[1] is None or stamp > held[1]):
+                held[1] = stamp
+    sessions = []
+    for name in order:
+        wins, stamp = newest[name]
+        entry = [name, wins]
+        if remote_now is not None and stamp is not None:
+            entry.append(max(0, remote_now - stamp))
         sessions.append(entry)
     tmux_lines = [line.strip() for line in tmux_text.splitlines() if line.strip()]
     escape_time = tmux_lines[0] if tmux_lines else ''
@@ -2851,11 +2864,22 @@ def _session_probe_script() -> str:
         " tmux set-option -s escape-time 10 >/dev/null 2>&1 || true;"
         " fi ;; esac;"
         "printf '\\000AUTOTMUX_SESSIONS\\000';"
-        # Activity and window count lead so a session name may contain ':'.
-        # #{session_activity} is the epoch of the session's last activity, read
-        # on the same host as the clock below so the two always agree.
-        "tmux list-sessions"
-        " -F '#{session_activity}:#{session_windows}:#{session_name}'"
+        # Read on the same host as the clock below, so the two always agree.
+        # Windows, not sessions, and the newest of them wins.
+        #
+        # #{session_activity} does not track output. Measured against a
+        # session printing a line a second: it read 3s idle, then 9s, then
+        # 11s, while the output never stopped -- it is the time of the last
+        # *input*, so a running job looked more and more finished the longer
+        # it ran, which is exactly backwards. #{window_activity} was 0s
+        # throughout the same run, and stays 0s for a window that is not the
+        # current one, which #{session_activity} also missed.
+        #
+        # One line per window, so a session with several reports several
+        # times; the reader keeps the newest. Activity leads and the name is
+        # last, because a session name may contain ':'.
+        "tmux list-windows -a"
+        " -F '#{window_activity}:#{session_windows}:#{session_name}'"
         " 2>/dev/null;"
         " printf '\\000AUTOTMUX_NODEINFO\\000\\n';"
         # Keep the CPU count on its own line even on failure so a load value
