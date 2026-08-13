@@ -141,6 +141,41 @@ def decode_interactive_token(token: str) -> dict:
     return value
 
 
+def _local_gpu() -> str:
+    """This machine's cards, in the shape the remote probe reports.
+
+    The local node's info was written by hand rather than read from the same
+    probe the remote ones use, so it had no GPU line at all -- and a
+    workstation with cards in it looked like a node without any.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,"
+             "memory.total", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=2.0)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    util = used = total = 0.0
+    count = 0
+    for line in (result.stdout or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            util += float(parts[0])
+            used += float(parts[1])
+            total += float(parts[2])
+        except ValueError:
+            continue
+        count += 1
+    if not count:
+        return ""
+    return f"{int(util / count)} {int(used)} {int(total)} {count}"
+
+
 def _safe_error(value, limit: int = 240) -> str:
     cleaned = _CONTROL_RE.sub(" ", str(value or ""))
     return " ".join(cleaned.split())[:limit]
@@ -1117,7 +1152,7 @@ class GatewayPool:
             "info": {
                 "job_id": "-", "job_name": "local",
                 "time": "", "nproc": str(os.cpu_count() or ""),
-                "load": load,
+                "load": load, "gpu": _local_gpu(),
             },
             "sessions": sessions,
             "last_error": error,
