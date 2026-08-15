@@ -2801,18 +2801,31 @@ def _parse_session_payload(out: str) -> tuple[list, str, str, str, str]:
     if not found:
         raise ValueError('missing tmux-info payload marker')
     info_lines = [line.strip() for line in node_text.splitlines() if line.strip()]
-    gpu = ''
+    # By tag, so a field that comes back empty cannot shift the ones after
+    # it. Untagged lines are still read by position, because a daemon that
+    # has not been restarted is still sending the old shape and its nodes
+    # should not go blank until it is.
+    tagged: dict = {}
+    loose: list = []
     for line in info_lines:
-        if line.startswith('gpu '):
-            gpu = line[4:].strip()
-    info_lines = [line for line in info_lines if not line.startswith('gpu ')]
-    nproc = info_lines[0] if info_lines else ''
-    load = info_lines[1].split(',')[0].strip() if len(info_lines) >= 2 else ''
+        name, _sep, rest = line.partition(' ')
+        if name in {'cpu', 'load', 'now', 'gpu'}:
+            tagged[name] = rest.strip()
+        else:
+            loose.append(line)
+    gpu = tagged.get('gpu', '')
+    nproc = tagged.get('cpu') or (loose[0] if loose else '')
+    load = tagged.get('load')
+    if load is None:
+        load = loose[1].split(',')[0].strip() if len(loose) >= 2 else ''
     # The remote clock, sampled in the same command as the activity stamps.
     # Comparing against our own clock instead would report nonsense whenever
     # the two hosts disagree.
+    clock = tagged.get('now')
+    if clock is None:
+        clock = loose[2] if len(loose) >= 3 else ''
     try:
-        remote_now = int(info_lines[2]) if len(info_lines) >= 3 else None
+        remote_now = int(clock) if clock else None
     except ValueError:
         remote_now = None
     # One line per window, so a session with several appears several times.
@@ -2887,18 +2900,32 @@ def _session_probe_script() -> str:
         " -F '#{window_activity}:#{session_windows}:#{session_name}'"
         " 2>/dev/null;"
         " printf '\\000AUTOTMUX_NODEINFO\\000\\n';"
-        # Keep the CPU count on its own line even on failure so a load value
-        # cannot slide into the CPU slot.
+        # Every line names itself.
+        #
+        # They used to be read by position, and a field that came back empty
+        # shifted every field after it: on macOS `uptime` says "load
+        # averages: 1.2 3.4 5.6" -- plural, space-separated -- so the sed
+        # below matched nothing, the blank line was dropped, and the clock
+        # slid into the load slot. The load read as a Unix timestamp and the
+        # clock went missing, which left every local session with no idle
+        # time at all. The GPU line was already tagged for exactly this
+        # reason; the rest were not.
         #
         # --all, not plain nproc: nproc reports the CPUs this process may run
         # on, and an SSH session adopted into a job's cgroup sees as few as 1.
         # The load average on the next line is node-wide, so pairing it with an
         # affinity-limited count made an idle 96-core node read as "4.2/1",
         # four times oversubscribed. Both numbers now describe the machine.
-        " (nproc --all 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null"
-        " || echo '?');"
-        " LC_ALL=C uptime | sed -n 's/.*load average: //p';"
-        " (date +%s 2>/dev/null || echo '?');"
+        " printf 'cpu %s\\n' \"$(nproc --all 2>/dev/null"
+        " || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu"
+        " 2>/dev/null || echo '?')\";"
+        # `load average:` on Linux, `load averages:` on macOS -- and macOS
+        # separates them with spaces rather than commas. Both handled, and
+        # the first field taken however it was delimited.
+        " printf 'load %s\\n' \"$(LC_ALL=C uptime"
+        " | sed -n 's/.*load average[s]*: *//p'"
+        " | tr ',' ' ' | awk '{print $1}')\";"
+        " printf 'now %s\\n' \"$(date +%s 2>/dev/null || echo '?')\";"
         # One line, whatever the card count: mean utilisation and summed
         # memory, or nothing at all where there are no GPUs. Tagged `gpu`
         # rather than found by position -- the reader drops blank lines, so a

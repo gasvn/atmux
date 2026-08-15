@@ -720,11 +720,46 @@ class SessionActivityParsingTests(unittest.TestCase):
             f'{self.NOW - 1}:1:first\n')
         self.assertEqual([r[0] for r in rows], ['first', 'second'])
 
+    def test_a_missing_field_does_not_shift_the_others(self):
+        """The failure this cost us: on macOS `uptime` says "load averages:
+        1.2 3.4 5.6" -- plural, space-separated -- so the sed matched
+        nothing, the blank line was dropped, and the clock slid into the load
+        slot. The load read as a Unix timestamp and the clock went missing,
+        which left every local session with no idle time at all.
+
+        Measured on the Mac afterwards: load 17.43 and idle 1079s, both of
+        which had been wrong since the probe was written.
+        """
+        info = f'cpu 96\nload \nnow {self.NOW}\n'
+        out = d._parse_session_payload(
+            _probe_payload(f'{self.NOW - 60}:1:a\n', info))
+        self.assertEqual(out[1], '96')
+        self.assertEqual(out[2], '')            # genuinely unknown
+        self.assertEqual(out[0], [['a', '1', 60]])   # and the clock survived
+
+    def test_the_old_untagged_shape_still_parses(self):
+        """A daemon that has not been restarted is still sending the old
+        positional payload, and its nodes must not go blank until it is."""
+        info = f'96\n0.50, 0.4, 0.3\n{self.NOW}\n'
+        out = d._parse_session_payload(
+            _probe_payload(f'{self.NOW - 60}:1:a\n', info))
+        self.assertEqual((out[1], out[2]), ('96', '0.50'))
+        self.assertEqual(out[0], [['a', '1', 60]])
+
+    def test_the_probe_reads_both_spellings_of_load_average(self):
+        """Linux says `load average:` and separates with commas; macOS says
+        `load averages:` and separates with spaces."""
+        script = d._session_probe_script()
+        self.assertIn('load average[s]*: *', script)
+        self.assertIn("tr ',' ' '", script)
+        # And a CPU count on a Mac, which has no nproc.
+        self.assertIn('sysctl -n hw.ncpu', script)
+
     def test_the_gpu_line_is_found_by_its_tag_not_its_position(self):
         """The reader drops blank lines, so a node whose load average came
         back empty would shift a positional GPU line into the load slot and
         report a card count as a load average."""
-        info = f'96\n0.50, 0.4, 0.3\n{self.NOW}\ngpu 42 8192 81559 4\n'
+        info = f'cpu 96\nload 0.50\nnow {self.NOW}\ngpu 42 8192 81559 4\n'
         out = d._parse_session_payload(
             _probe_payload(f'{self.NOW - 5}:1:a\n', info))
         self.assertEqual(out[1], '96')          # nproc
@@ -732,7 +767,7 @@ class SessionActivityParsingTests(unittest.TestCase):
         self.assertEqual(out[4], '42 8192 81559 4')
 
     def test_a_node_with_no_cards_reports_no_gpu(self):
-        info = f'96\n0.50, 0.4, 0.3\n{self.NOW}\n'
+        info = f'cpu 96\nload 0.50\nnow {self.NOW}\n'
         out = d._parse_session_payload(
             _probe_payload(f'{self.NOW - 5}:1:a\n', info))
         self.assertEqual(out[4], '')
