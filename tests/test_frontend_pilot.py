@@ -4,6 +4,7 @@ These don't need a running daemon — they point STATE_FILE at a temp
 file with synthetic content and exercise the UI logic directly.
 """
 import asyncio
+import inspect
 import json
 import os
 import shlex
@@ -1589,18 +1590,26 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertTrue(app.check_action('focus_table', ()))
 
-    async def test_a_proportion_is_drawn_rather_than_divided(self):
-        """`12.60/96` is a division the reader performs. This is the thing
-        the current crop of terminal apps is actually known for."""
-        self.assertEqual(autotmux.bar(0.0, 6), '      ')
-        self.assertEqual(autotmux.bar(0.5, 6), '███   ')
-        self.assertEqual(autotmux.bar(1.0, 6), '██████')
-        # Eighths, so it is precise to a fraction of a cell.
-        self.assertIn('▌', autotmux.bar(0.5 + 1 / 12, 6))
-        # Nothing off the end, whatever it is handed.
-        for odd in (1.5, -3, float('nan'), None, True, 'x'):
-            with self.subTest(value=odd):
-                self.assertEqual(len(autotmux.bar(odd, 6)), 6)
+    async def test_each_number_says_what_it_is(self):
+        """The rail was `1d16h  c▌ 13%  g███▉ 97%` and unreadable, which is
+        fair: the header row went when the table became one column, so
+        nothing on screen said what `c` or `g` meant -- and the bar and the
+        percentage beside it were one fact in nine columns, said twice.
+
+        There are also two durations on the line meaning opposite things:
+        the dot at the front is how long this has been quiet, and the other
+        is how long is left. Bare, they were the same shape twice.
+        """
+        row = ('gpu1', 'a', '1', '2:00:00', '', '96', '48.0',
+               '61 40000 81559 2')
+        rail = autotmux._row_rail(row).plain
+        self.assertIn('cpu', rail)
+        self.assertIn('gpu', rail)
+        self.assertIn('⧗', rail)        # and this one is time remaining
+        self.assertIn('50%', rail)
+        self.assertIn('61%', rail)
+        # One fact once: no bar beside the number it repeats.
+        self.assertNotIn('█', rail)
 
     async def test_the_design_survives_sixteen_colours(self):
         """Over SSH into a cluster, sixteen is often all there is -- and if
@@ -1614,6 +1623,46 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(autotmux._TOKENS['warn'][1],
                             autotmux._TOKENS['danger'][1])
         self.assertEqual(autotmux.tone('nonsense'), '')
+
+    async def test_the_reserved_width_matches_what_is_drawn(self):
+        """Counted by hand it was two columns short -- `cpu 13%` is eight
+        cells, not seven -- so the GPU was silently dropped from rows that
+        had room for it. Measured from the renderer instead."""
+        row = ('gpu1', 'a', '1', '2:00:00', '', '96', '48.0',
+               '61 40000 81559 2')
+        self.assertLessEqual(autotmux._row_rail(row).cell_len, autotmux._RAIL)
+        # And not wastefully wide either: the reservation is what a full
+        # rail actually needs.
+        self.assertEqual(autotmux._row_rail(row).cell_len, autotmux._RAIL)
+
+    async def test_a_narrow_rail_drops_fields_rather_than_cutting_them(self):
+        """A number cut in half reads as a smaller number -- `cpu   1` was
+        really 13% -- which is worse than not showing it. The walltime is
+        the one that cannot be undone, so it is the one that stays."""
+        row = ('gpu1', 'a', '1', '2:00:00', '', '96', '48.0',
+               '61 40000 81559 2')
+        full = autotmux._row_rail(row, 999).plain
+        self.assertIn('gpu', full)
+        # Room for the walltime and one meter, not two.
+        tight = autotmux._row_rail(row, 16).plain
+        self.assertIn('⧗', tight)
+        self.assertIn('cpu', tight)
+        self.assertNotIn('gpu', tight)
+        # Whatever is kept is whole.
+        self.assertTrue(tight.rstrip().endswith('%'))
+        # And with room for neither, the walltime alone survives.
+        barest = autotmux._row_rail(row, 8).plain
+        self.assertIn('⧗', barest)
+        self.assertNotIn('cpu', barest)
+
+    async def test_the_row_width_asks_the_widget_for_its_chrome(self):
+        """A line composed to 54 came out clipped at 52 on a 58-column
+        screen: the DataTable takes cell_padding on each side of its one
+        column, and a scrollbar gutter when it has one. Guessing at that is
+        what made the numbers lie."""
+        source = inspect.getsource(autotmux.AutotmuxApp._row_width)
+        self.assertIn('cell_padding', source)
+        self.assertIn('scrollbar_size_vertical', source)
 
     async def test_the_rail_is_always_there(self):
         """Hiding the walltime and the load until something was wrong was my

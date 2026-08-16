@@ -2465,30 +2465,6 @@ def tone(token: str) -> str:
     return pair[0] if _TRUECOLOR else pair[1]
 
 
-# Eighths, so a bar is precise to a fraction of a cell rather than to a whole
-# one. Six cells of these resolve forty-eight steps, which is finer than a
-# one-minute load average deserves and costs six columns.
-_EIGHTHS = ' ▏▎▍▌▋▊▉█'
-
-
-def bar(fraction: float, width: int = 6) -> str:
-    """A proportion, drawn.
-
-    `12.60/96` is a division the reader performs; a bar is the answer. This
-    is the thing the current crop of terminal apps is actually known for --
-    btop is the one everybody names, and what it does is draw the numbers.
-    """
-    if not isinstance(fraction, (int, float)) or isinstance(fraction, bool):
-        return ' ' * width
-    if not math.isfinite(fraction):
-        return ' ' * width
-    fraction = max(0.0, min(1.0, float(fraction)))
-    eighths = int(round(fraction * width * 8))
-    full, rest = divmod(eighths, 8)
-    out = '█' * full + (_EIGHTHS[rest] if rest else '')
-    return out.ljust(width)[:width]
-
-
 def load_fraction(load, cpus):
     """How much of the machine is in use, or None if it cannot be said."""
     try:
@@ -2572,11 +2548,15 @@ def _idle_cell(marker) -> rich.text.Text:
 # One column, padded here, costs the alignment that a grid gives for free and
 # buys back the thing the design needs: a line whose last field takes whatever
 # width is left, which is where the output goes.
-# The rail is fixed and known, so it is reserved rather than left to be
-# clipped: 6 for the walltime, then a labelled bar and a percentage each for
-# CPU and GPU. Names give way before numbers do -- a truncated session name
-# is still recognisable and a truncated bar is a lie.
-_RAIL = 6 + 2 + 9 + 2 + 9
+# Reserved rather than left to be clipped: `⧗1d16h`, then `cpu 13%` and
+# `gpu 97%`. Names give way before numbers do -- a truncated session name is
+# still recognisable and a truncated number is a lie.
+#
+# Measured from the thing itself rather than counted by hand. Counting is
+# what put this two columns short -- `cpu 13%` is eight cells, not seven --
+# so the GPU was silently dropped from rows that had room for it.
+_WALL_CELLS = 6
+_RAIL = 0            # set below, once _meter exists to be measured
 
 
 def _row_widths(rows, total: int) -> tuple:
@@ -2654,8 +2634,8 @@ def _compose_session(r, widths, tail: str, total: int) -> rich.text.Text:
     # shapes and only when they have something to say. Both were columns of
     # figures the reader had to do arithmetic on -- `12.60/96` is a division,
     # and a walltime three days out is a number nobody acts on.
-    rail = _row_rail(r)
     room = max(0, total - (lead + name + where + 6))
+    rail = _row_rail(r, room)
     if tail:
         keep = max(0, room - rail.cell_len - 2)
         line.append(tail[:keep] if len(tail) <= keep else tail[:keep - 1] + '…')
@@ -2693,20 +2673,29 @@ def _gpu_share(spec):
     return util / 100.0, max(0.0, used / total), int(count)
 
 
-def _meter(share, width, label) -> rich.text.Text:
-    """One bar and its number, coloured by how far along it is."""
+def _meter(share, label) -> rich.text.Text:
+    """A named percentage, coloured by how far along it is.
+
+    It was a bar *and* the number -- one fact in nine columns, twice -- and
+    labelled `c` and `g`, with no header left on screen to say what either
+    letter meant. The colour is what the bar was really for; a word and a
+    number are what make it readable.
+    """
     out = rich.text.Text()
     if share is None:
         return out
     style = (tone('danger') if share >= 0.95 else
              tone('warn') if share >= _BUSY else tone('ok'))
-    out.append(label, style=tone('quiet'))
-    out.append(bar(share, width), style=style)
+    out.append(label + ' ', style=tone('quiet'))
     out.append(f'{min(999, round(share * 100)):3d}%', style=style)
     return out
 
 
-def _row_rail(r) -> rich.text.Text:
+# Now that _meter exists, ask it how wide it is rather than counting.
+_RAIL = _WALL_CELLS + 2 * (2 + _meter(0.5, 'cpu').cell_len)
+
+
+def _row_rail(r, room: int = 999) -> rich.text.Text:
     """The right-hand rail: time left, CPU, GPU.
 
     Always drawn for a real session. These are the two -- three now -- that
@@ -2727,18 +2716,28 @@ def _row_rail(r) -> rich.text.Text:
                 style = tone('danger')
             elif seconds <= _WALL_URGENT:
                 style = tone('warn')
-        rail.append(left.rjust(6), style=style)
+        # Marked, because it is the second duration on the line and the two
+        # mean opposite things: the dot at the front is how long this has
+        # been quiet, and this is how long is left. Bare, they were the same
+        # shape twice and nothing said which was which.
+        rail.append('⧗', style=tone('quiet'))
+        rail.append(left.rjust(5), style=style)
+    else:
+        rail.append(' ' * 6)
+    # Whole fields, dropped from the right, when there is not room for all
+    # of them. A number cut in half reads as a smaller number -- `cpu   1`
+    # was really 13% -- which is worse than not showing it: the walltime is
+    # the one that cannot be undone, so it is the one that stays.
     share = load_fraction(r[6], r[5])
-    if share is not None:
-        rail.append('  ')
-        rail.append_text(_meter(share, 4, 'c'))
     gpu = _gpu_share(r[7] if len(r) > 7 else '')
-    if gpu is not None:
+    for value, label in ((share, 'cpu'), (gpu[0] if gpu else None, 'gpu')):
+        if value is None:
+            continue
+        cell = _meter(value, label)
+        if rail.cell_len + 2 + cell.cell_len > room:
+            break
         rail.append('  ')
-        # Utilisation, not memory: a card holding a model and doing nothing
-        # is the failure this is meant to show, and memory alone cannot tell
-        # that apart from a card that is working.
-        rail.append_text(_meter(gpu[0], 4, 'g'))
+        rail.append_text(cell)
     return rail
 
 
@@ -4439,13 +4438,23 @@ class AutotmuxApp(App):
         return self._notes.get(str(session), '')
 
     def _row_width(self) -> int:
-        """How wide a row may be. The table is one column now, so nothing
-        else decides this for us."""
+        """How wide a row may be.
+
+        The table is one column, so nothing else decides this -- but the
+        DataTable still takes cell_padding on each side of that column and a
+        scrollbar gutter when it has one. Guessing at the chrome is how a
+        line composed to 54 came out clipped at 52 on a 58-column screen, so
+        the widget is asked instead.
+        """
         try:
             width = int(self.table.size.width)
+            pad = int(self.table.cell_padding) * 2
+            gutter = int(getattr(self.table, 'scrollbar_size_vertical', 0) or 0)
         except Exception:
-            width = 0
-        return max(48, width - 2 if width else 78)
+            return 78
+        if not width:
+            return 78
+        return max(40, width - pad - gutter - 1)
 
     def _row_tail(self, r) -> str:
         """What is wrong with this row, if anything."""
