@@ -131,9 +131,15 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
             app = autotmux.AutotmuxApp()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                # Three nodes worth of rows: one shell (localhost), two
-                # named sessions (gpu1), one offline placeholder (gpu2).
-                self.assertEqual(len(app.all_sessions), 4)
+                # Three nodes: two named sessions on gpu1, an offline
+                # placeholder for gpu2, and a "start something here" row for
+                # each of the two reachable nodes -- a machine you hold is
+                # somewhere you can start something whether or not something
+                # is already running on it.
+                self.assertEqual(len(app.all_sessions), 6)
+                kinds = [r[1] for r in app.all_sessions]
+                self.assertEqual(
+                    kinds.count(autotmux._START_SHELL_SESSION), 2)
                 node_names = {r[0] for r in app.all_sessions}
                 self.assertEqual(node_names, {'localhost', 'gpu1', 'gpu2'})
 
@@ -655,14 +661,15 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 # can be read without counting rows.
                 for title in titles:
                     with self.subTest(title=title):
-                        self.assertRegex(title, r' \d+$')
+                        # The count, then whatever keys that band advertises.
+                        self.assertRegex(title, r' \d+(\s|$)')
                 # The bands keep the order the ranks already chose; they must
                 # not invent one. Asserted as an ordering rather than as a
                 # fixed list, because which bands exist depends on what is
                 # running -- an empty band is never drawn.
                 order = [t for t, _ in autotmux.model.BANDS]
                 order = [autotmux.model.BAND_TITLES[r] for r in order]
-                order.append('start a shell here')
+                order.append(autotmux.model.OFFER_TITLE)
                 seen = [next(i for i, o in enumerate(order)
                              if t.startswith(o)) for t in titles]
                 self.assertEqual(seen, sorted(seen),

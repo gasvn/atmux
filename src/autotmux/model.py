@@ -90,6 +90,10 @@ BAND_TITLES = dict(BANDS)
 # mixing an offer into a list of states is what made 40% of the rows things
 # you cannot attach to.
 OFFER_RANK = 4
+# What that band is called. Two things happen there -- Enter opens a plain
+# shell, `n` creates a named tmux session -- so it is named for the machines
+# rather than for either verb.
+OFFER_TITLE = 'start something here'
 
 
 def session_rank(row) -> int:
@@ -141,7 +145,7 @@ def plan_rows(rows):
     """
     ranked = [(session_rank(r), r) for r in rows]
     plan = []
-    for rank, title in BANDS + ((OFFER_RANK, 'start a shell here'),):
+    for rank, title in BANDS + ((OFFER_RANK, OFFER_TITLE),):
         band = [r for got, r in ranked if got == rank]
         if not band:
             continue                    # an empty band is a heading over nothing
@@ -294,12 +298,23 @@ def build_session_rows(state: dict) -> list:
                     status = f'{status} · {network_warning}'
                 rows.append((node, name, wins, time_left, status, cpu, load, gpu))
                 added = True
-        if not added:
-            status = (f'DEGRADED: {last_error[:30]}'
-                      if last_error else 'No sessions')
-            if network_warning:
-                status = f'{status} · {network_warning}'
-            rows.append((node, _START_SHELL_SESSION, '-', time_left, status, cpu, load, gpu))
+        # Always, not only when the node is empty.
+        #
+        # This row is "somewhere you can start something", and a machine you
+        # hold an allocation on is that whether or not something is already
+        # running on it. Emitting it only for empty nodes meant the band
+        # headed "start a shell here" listed the one machine with no job on
+        # it and left out both GPU nodes -- exactly backwards, and it hid the
+        # only row `n` could aim at to open a session on a busy node.
+        if last_error:
+            status = f'DEGRADED: {last_error[:30]}'
+        elif added:
+            status = ''                 # the band says what this row is
+        else:
+            status = 'No sessions'
+        if network_warning:
+            status = f'{status} · {network_warning}' if status else network_warning
+        rows.append((node, _START_SHELL_SESSION, '-', time_left, status, cpu, load, gpu))
     rows.sort(key=lambda r: (_attention_rank(r), r[0], _session_label(r[1])))
     return rows
 

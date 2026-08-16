@@ -2772,7 +2772,11 @@ def _band_cells(title: str, count: int) -> tuple:
     is the sentence somebody came to the screen for, and reading it should
     not require counting rows.
     """
-    return _heading(title, str(count))
+    # The offers band advertises its own keys, for the same reason the queue
+    # advertises `j` in its title: a key belongs beside the thing it acts on,
+    # and these two are the only way to start anything.
+    key = 'n: new session · ⏎ shell' if title == model.OFFER_TITLE else ''
+    return _heading(title, str(count), key)
 
 class ActionCommands(Provider):
     """Every binding this app has, by name.

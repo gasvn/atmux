@@ -115,7 +115,7 @@ class BandPlanTests(unittest.TestCase):
                 self.offer('login--a'), self.offer('login--b')]
         plan = model.plan_rows(rows)
         self.assertEqual([p[1] for p in plan if p[0] == 'band'],
-                         ['just stopped', 'start a shell here'])
+                         ['just stopped', model.OFFER_TITLE])
         # Still there, still selectable, and last.
         self.assertEqual([p[1][0] for p in plan if p[0] == 'row'],
                          ['gpu1', 'login--a', 'login--b'])
@@ -133,7 +133,47 @@ class BandPlanTests(unittest.TestCase):
         reachable = [p[1][0] for p in plan if p[0] == 'row']
         self.assertEqual(sorted(reachable), ['gpu1', 'gpu2', 'login--a'])
         self.assertEqual([p[1] for p in plan if p[0] == 'band'][-1],
-                         'start a shell here')
+                         model.OFFER_TITLE)
+
+    def test_a_machine_you_hold_is_offered_even_when_it_is_busy(self):
+        """The bug, stated as the rule it broke.
+
+        Measured against the live cluster: two GPU nodes with running jobs
+        and a session apiece, and localhost with none. The band headed "start
+        a shell here" listed localhost alone -- the one machine with no job
+        on it -- and left out both nodes being paid for. It also hid the only
+        row `n` could aim at to open a session on a busy node.
+
+        A machine you hold an allocation on is somewhere you can start
+        something, whether or not something is already running on it.
+        """
+        rows = model.build_session_rows({'nodes': {
+            'gpu1': {'alive': True, 'info': {'time': '2:00:00'},
+                     'sessions': [['train', '1', 10]], 'last_error': ''},
+            'gpu2': {'alive': True, 'info': {'time': '2:00:00'},
+                     'sessions': [], 'last_error': ''},
+        }})
+        offers = {r[0] for r in rows if r[1] == model._START_SHELL_SESSION}
+        self.assertEqual(offers, {'gpu1', 'gpu2'})
+
+    def test_an_unreachable_machine_is_not_offered(self):
+        """It is not somewhere you can start anything, and saying otherwise
+        is an invitation that fails when taken."""
+        rows = model.build_session_rows({'nodes': {
+            'gpu1': {'alive': False, 'info': {}, 'sessions': [],
+                     'last_error': 'connect timeout'},
+        }})
+        self.assertEqual([r[1] for r in rows], [model._OFFLINE_SESSION])
+
+    def test_the_offer_row_of_a_busy_machine_says_nothing_extra(self):
+        """"No sessions" would be a lie on a node that has some, and the
+        band above it already says what the row is for."""
+        rows = model.build_session_rows({'nodes': {
+            'gpu1': {'alive': True, 'info': {'time': '2:00:00'},
+                     'sessions': [['train', '1', 10]], 'last_error': ''},
+        }})
+        offer = next(r for r in rows if r[1] == model._START_SHELL_SESSION)
+        self.assertEqual(offer[4], '')
 
     def test_nothing_at_all_plans_to_nothing_at_all(self):
         self.assertEqual(model.plan_rows([]), [])
@@ -148,7 +188,9 @@ class BandPlanTests(unittest.TestCase):
 
 class SessionRecordTests(unittest.TestCase):
     def test_a_session_carries_the_fields_a_list_needs(self):
-        rows = model.sessions(state(n1=node([('train', 2, 0)])))
+        # Every reachable node also carries a "start something here" record.
+        rows = [r for r in model.sessions(state(n1=node([('train', 2, 0)])))
+                if r['kind'] == 'session']
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row['session'], 'train')

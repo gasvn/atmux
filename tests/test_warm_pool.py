@@ -796,7 +796,8 @@ class BuildRowsWithLoadTests(unittest.TestCase):
                 }
             }
         }
-        rows = autotmux.build_session_rows(state)
+        rows = [r for r in autotmux.build_session_rows(state)
+                if r[1] != autotmux._START_SHELL_SESSION]
         self.assertEqual(len(rows), 1)
         # row layout: (node, session, wins, time, status, cpu, load)
         self.assertEqual(rows[0][5], '4')

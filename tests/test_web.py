@@ -4535,13 +4535,17 @@ class DashboardStateTests(unittest.TestCase):
         source = self.statesource.StateSource(pool=pool, refresh=5.0,
                                               clock=lambda: clock[0])
         self.assertTrue(source.refresh())
-        self.assertEqual(len(source.snapshot()['sessions']), 1)
+        # The session, plus the node's own "start something here" record.
+        rows = source.snapshot()['sessions']
+        self.assertEqual(sum(1 for r in rows if r['kind'] == 'session'), 1)
 
         pool.ok = False
         clock[0] += 60.0
         self.assertFalse(source.refresh())
         snap = source.snapshot()
-        self.assertEqual(len(snap['sessions']), 1, 'the last answer was lost')
+        self.assertEqual(
+            sum(1 for r in snap['sessions'] if r['kind'] == 'session'), 1,
+            'the last answer was lost')
         self.assertTrue(snap['stale'])
         self.assertGreaterEqual(snap['age'], 60.0)
         self.assertIn('unreachable', snap['error'])

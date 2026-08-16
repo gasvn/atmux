@@ -105,6 +105,18 @@ class ReadSnapshotsTests(unittest.TestCase):
             self.assertEqual(autotmux.read_snapshots(), {})
 
 
+def _session_rows(state):
+    """Only the rows that are somebody's session.
+
+    Every reachable node also carries a "start something here" row now --
+    a machine you hold is somewhere you can start something whether or not
+    something is already running on it -- and these tests are about the
+    sessions.
+    """
+    return [r for r in autotmux.build_session_rows(state)
+            if r[1] != autotmux._START_SHELL_SESSION]
+
+
 class BuildSessionRowsTests(unittest.TestCase):
     def test_empty_state(self):
         self.assertEqual(autotmux.build_session_rows({}), [])
@@ -146,7 +158,7 @@ class BuildSessionRowsTests(unittest.TestCase):
                 }
             }
         }
-        rows = autotmux.build_session_rows(state)
+        rows = _session_rows(state)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0][1], 'main')
         self.assertEqual(rows[0][2], '3')
@@ -197,11 +209,13 @@ class BuildSessionRowsTests(unittest.TestCase):
             'sessions': [['<offline>', '1'], ['<Start Shell>', '2']],
         }}}
         rows = autotmux.build_session_rows(state)
-        self.assertEqual(
-            {row[1] for row in rows}, {'<offline>', '<Start Shell>'})
-        self.assertNotIn(autotmux._OFFLINE_SESSION, {row[1] for row in rows})
-        self.assertNotIn(
-            autotmux._START_SHELL_SESSION, {row[1] for row in rows})
+        # Plus the node's own "start something here" row, which every
+        # reachable node now gets. What matters is that a session *named*
+        # like a placeholder is not mistaken for one.
+        real = {row[1] for row in rows
+                if row[1] != autotmux._START_SHELL_SESSION}
+        self.assertEqual(real, {'<offline>', '<Start Shell>'})
+        self.assertNotIn(autotmux._OFFLINE_SESSION, real)
 
     def test_alive_node_surfaces_degraded_error_in_status(self):
         state = {'nodes': {'h1': {
@@ -221,8 +235,7 @@ class BuildSessionRowsTests(unittest.TestCase):
                 'a': {'alive': True, 'info': {}, 'sessions': [['m', '1']]},
             }
         }
-        rows = autotmux.build_session_rows(state)
-        self.assertEqual([(r[0], r[1]) for r in rows],
+        self.assertEqual([(r[0], r[1]) for r in _session_rows(state)],
                          [('a', 'm'), ('b', 'a'), ('b', 'z')])
 
 
@@ -1023,9 +1036,14 @@ class AttentionOrderingTests(unittest.TestCase):
             'nodeB': {'alive': True, 'info': {}, 'sessions': [['b', '1'], ['a', '1']]},
             'nodeA': {'alive': True, 'info': {}, 'sessions': [['z', '1']]},
         }}
-        rows = autotmux.build_session_rows(state)
-        self.assertEqual([(r[0], r[1]) for r in rows],
+        self.assertEqual([(r[0], r[1]) for r in _session_rows(state)],
                          [('nodeA', 'z'), ('nodeB', 'a'), ('nodeB', 'b')])
+        # And the offers sink below every one of them, which is the tier
+        # doing its job rather than the sort being disturbed.
+        rows = autotmux.build_session_rows(state)
+        offers = [i for i, r in enumerate(rows)
+                  if r[1] == autotmux._START_SHELL_SESSION]
+        self.assertEqual(offers, [3, 4])
 
 
 class LocalAttachTakeoverTests(unittest.TestCase):
@@ -1174,9 +1192,12 @@ class IdleRowTests(unittest.TestCase):
     def test_degraded_node_keeps_its_reason_alongside_the_dot(self):
         state = self._state(['train', '2', 900])
         state['nodes']['gpu1']['last_error'] = 'connect timeout'
-        self.assertEqual(
-            autotmux.build_session_rows(state)[0][4],
-            '● 15m DEGRADED: connect timeout')
+        # By name, not by index: every reachable node also has a "start
+        # something here" row now, and which one sorts first is not what
+        # this is about.
+        row = next(r for r in autotmux.build_session_rows(state)
+                   if r[1] == 'train')
+        self.assertEqual(row[4], '● 15m DEGRADED: connect timeout')
 
 
 if __name__ == '__main__':
