@@ -94,7 +94,10 @@ LAYOUT_WIDTHS = (LAYOUT_SPLIT_WIDTH, LAYOUT_TABLE_WIDTH)
 # uses ':' and '.' to address windows and panes, so a session carrying either
 # can never be referred to reliably afterwards. Narrower than tmux allows.
 NEW_SESSION_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_@+-]{0,63}$')
-SESSION_VERBS = ('kill', 'new')
+# `window` opens another window inside an existing session -- the same
+# shape as `kill` (it names a session that must already exist) and none of
+# the risk, which is why it validates through the same path.
+SESSION_VERBS = ('kill', 'new', 'window')
 
 # Scrollback the expanded preview may ask for. Bounded because it crosses SSH
 # and a chatty pane's history is unbounded; a few thousand lines is far more

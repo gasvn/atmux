@@ -103,8 +103,23 @@
     // A row with no session yet cannot be attached to -- there is nothing
     // there. Starting one on that machine is what you actually want, and it
     // is the same one tap.
-    button.addEventListener('click', function () {
+    button.addEventListener('click', function (event) {
+      // A hold has already acted; the click the browser sends afterwards is
+      // not a second instruction.
+      if (Date.now() - actedAt < 700) { event.preventDefault(); return; }
       go(row.kind === 'session' ? 'attach' : 'shell', row);
+    });
+    // Hold to act on this row without leaving the list.
+    button.addEventListener('touchstart', function (event) {
+      armHold(event, row);
+    }, {passive: true});
+    button.addEventListener('touchmove', moveHold, {passive: true});
+    button.addEventListener('touchend', endHold);
+    button.addEventListener('touchcancel', cancelHold);
+    // And a mouse, so the same actions exist on a laptop.
+    button.addEventListener('contextmenu', function (event) {
+      event.preventDefault();
+      openSheet(row);
     });
     item.appendChild(button);
 
@@ -128,6 +143,161 @@
     }
     return item;
   }
+
+  // ── acting on a row without leaving the list ──────────────────────────
+  // Everything used to route through the console: `⋯` opened the terminal
+  // standing on the row, and you did the thing there. That is the right
+  // answer for the twenty actions the TUI has and the wrong one for the two
+  // or three you reach for on a phone, where it costs a page load, a shell,
+  // and the way back.
+  //
+  // The gesture is the one the console settled on, for the same reasons:
+  // our own timer rather than the platform's recogniser, movement measured
+  // from where the finger went down, and the sheet opening on the lift so
+  // that a scroll starting late still cancels it.
+  var HOLD_MS = 500, HOLD_SLOP = 8;
+  var holdTimer = 0, holdFrom = null, holdArmed = null;
+  // Set when a hold has just acted. preventDefault on touchend suppresses the
+  // synthetic click on every browser that honours it, and this is the belt:
+  // `holdArmed` is cleared by the time the click would arrive, so the guard
+  // cannot read it.
+  var actedAt = 0;
+  var sheet = document.getElementById('sheet');
+  var sheetTitle = document.getElementById('sheettitle');
+  var sheetActs = document.getElementById('sheetacts');
+
+  function cancelHold() {
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; }
+    holdFrom = null; holdArmed = null;
+  }
+
+  function armHold(event, row) {
+    if (event.touches && event.touches.length !== 1) return cancelHold();
+    var touch = event.touches ? event.touches[0] : event;
+    cancelHold();
+    holdFrom = {x: touch.clientX, y: touch.clientY};
+    holdTimer = setTimeout(function () {
+      holdTimer = 0;
+      holdArmed = row;
+      if (navigator.vibrate) { try { navigator.vibrate(8); } catch (e) {} }
+    }, HOLD_MS);
+  }
+
+  function moveHold(event) {
+    if (!holdFrom) return;
+    var touch = event.touches ? event.touches[0] : event;
+    if (Math.abs(touch.clientX - holdFrom.x) > HOLD_SLOP ||
+        Math.abs(touch.clientY - holdFrom.y) > HOLD_SLOP) {
+      cancelHold();
+    }
+  }
+
+  function endHold(event) {
+    var row = holdArmed;
+    cancelHold();
+    if (!row) return false;
+    // The tap that would otherwise follow belongs to the hold.
+    if (event && event.cancelable) event.preventDefault();
+    actedAt = Date.now();
+    openSheet(row);
+    return true;
+  }
+
+  function openSheet(row) {
+    var where = row.node_label || row.node;
+    sheetTitle.textContent = row.kind === 'session'
+      ? row.label + '  ·  ' + where : where;
+    sheetActs.textContent = '';
+    var acts = row.kind === 'session'
+      ? [['attach', 'Open in terminal', ''],
+         ['window', 'New window in this session', ''],
+         ['new', 'New session on ' + where, ''],
+         ['kill', 'Kill ' + row.label, 'danger']]
+      : [['shell', 'Open a shell here', ''],
+         ['new', 'New session on ' + where, '']];
+    acts.forEach(function (spec) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'act' + (spec[2] ? ' ' + spec[2] : '');
+      button.textContent = spec[1];
+      button.addEventListener('click', function () { runAct(spec[0], row); });
+      sheetActs.appendChild(button);
+    });
+    sheet.hidden = false;
+  }
+
+  function closeSheet() { sheet.hidden = true; }
+
+  function runAct(act, row) {
+    if (act === 'attach' || act === 'shell') {
+      closeSheet();
+      go(act, row);
+      return;
+    }
+    if (act === 'kill') {
+      // Asked once, in the sheet rather than through a confirm() the page
+      // cannot style and iOS renders as a system dialog over everything.
+      // Nothing else here is irreversible, so nothing else asks.
+      sheetTitle.textContent = 'Kill ' + row.label + ' on '
+                             + (row.node_label || row.node) + '?'
+                             + '  Anything running in it stops.';
+      sheetActs.textContent = '';
+      var yes = document.createElement('button');
+      yes.type = 'button';
+      yes.className = 'act danger';
+      yes.textContent = 'Yes, kill it';
+      yes.addEventListener('click', function () { send('kill', row); });
+      sheetActs.appendChild(yes);
+      return;
+    }
+    if (act === 'new') {
+      var name = window.prompt('Name for the new session on '
+                               + (row.node_label || row.node));
+      if (!name) return;
+      send('new', row, name.trim());
+      return;
+    }
+    send(act, row);
+  }
+
+  function send(verb, row, session) {
+    var target = session || row.session;
+    var buttons = sheetActs.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+    sheetTitle.textContent = 'working…';
+    fetch(api('session'), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({node: row.node, verb: verb, session: target}),
+    }).then(function (r) { return r.json().catch(function () { return {}; }); })
+      .then(function (answer) {
+        closeSheet();
+        if (!answer || !answer.ok) {
+          err.hidden = false;
+          err.textContent = (answer && answer.reason)
+            || 'the ' + verb + ' did not go through';
+          return;
+        }
+        err.hidden = true;
+        // Straight away rather than on the next tick of the poll: the
+        // reason you pressed it was to change this list.
+        poll();
+      })
+      .catch(function (error) {
+        closeSheet();
+        err.hidden = false;
+        err.textContent = 'could not reach the server — ' + error;
+      });
+  }
+
+  sheet.addEventListener('click', function (event) {
+    // The backdrop and Cancel both dismiss. A sheet with only one way out is
+    // a sheet people back out of with the browser, which leaves the page.
+    if (event.target === sheet ||
+        (event.target.dataset && event.target.dataset.act === 'cancel')) {
+      closeSheet();
+    }
+  });
 
   function go(verb, row) {
     var url = new URL('console/', location.href);

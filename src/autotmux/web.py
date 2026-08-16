@@ -43,10 +43,7 @@ import termios
 import threading
 import urllib.parse
 
-from . import config
-from . import keypad
-from . import paths
-from . import statesource
+from . import config, ipc, keypad, paths, statesource
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'webassets')
 
@@ -383,6 +380,87 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True                      # no list, no check: as it was
         who = (self.headers.get(self.IDENTITY_HEADER) or '').strip().lower()
         return bool(who) and who in allowed
+
+    # ── acting, not only reading ──────────────────────────────────────────
+    # Everything else here answers questions. This is the one thing that
+    # changes something, so it is the one that needs saying out loud.
+    #
+    # It does not run tmux. It hands the request to the daemon's private
+    # socket, which already validates the node against the live allocation,
+    # checks the session exists, and constrains a new name to
+    # NEW_SESSION_RE -- the same path and the same checks the TUI has always
+    # used for these verbs. Nothing new is trusted; a second implementation
+    # would be a second opinion about what is allowed.
+    _ACTION_LIMIT = 4096
+
+    def do_POST(self) -> None:
+        path = self.path.split('?', 1)[0]
+        if not self._allowed():
+            self.send_error(403, 'Forbidden')
+            return
+        if path != '/api/session':
+            self.send_error(404)
+            return
+        if not self._same_origin():
+            # A page on another origin can make a browser send a POST even
+            # though it can never read the reply. Requiring JSON forces a
+            # preflight it cannot satisfy, and Sec-Fetch-Site says it plainly
+            # where the browser sends it.
+            self.send_error(403, 'Forbidden', 'cross-origin request')
+            return
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            length = -1
+        if not 0 < length <= self._ACTION_LIMIT:
+            self.send_error(413, 'Payload Too Large')
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode('utf-8'))
+            if not isinstance(body, dict):
+                raise ValueError('expected an object')
+        except Exception:
+            self._json({'ok': False, 'reason': 'malformed request'}, 400)
+            return
+        node = body.get('node')
+        verb = body.get('verb')
+        session = body.get('session')
+        if verb not in config.SESSION_VERBS:
+            self._json({'ok': False, 'reason': 'unknown action'}, 400)
+            return
+        try:
+            answer = ipc.request(paths.PREVIEW_SOCKET, {
+                'action': 'session', 'node': node,
+                'verb': verb, 'session': session,
+            }, timeout=20.0)
+        except FileNotFoundError:
+            self._json({'ok': False,
+                        'reason': 'no daemon is running on this machine'}, 503)
+            return
+        except Exception as error:
+            self._json({'ok': False,
+                        'reason': ' '.join(str(error).split())[:200]}, 502)
+            return
+        self._json(answer, 200 if answer.get('ok') else 409)
+
+    def _same_origin(self) -> bool:
+        """Whether this POST came from the page this server serves."""
+        site = (self.headers.get('Sec-Fetch-Site') or '').strip().lower()
+        if site and site not in ('same-origin', 'none'):
+            return False
+        kind = (self.headers.get('Content-Type') or '').split(';', 1)[0]
+        return kind.strip().lower() == 'application/json'
+
+    def _json(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', _ASSET_TYPES['.json'])
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(body)
 
     def do_HEAD(self) -> None:
         # Same routing, no body. _bytes() checks self.command, and the

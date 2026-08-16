@@ -1884,7 +1884,12 @@ def _handle_session_request(node: str, request: dict) -> dict:
         if not _preview_session_known(node, session):
             return {'ok': False, 'kind': 'not-found',
                     'reason': 'tmux session no longer exists'}
-        args = ['kill-session', '-t', session]
+        # `-t session` and not `-t session:0`: tmux reads a target after a
+        # colon as a window, and a session name is checked against the live
+        # list above rather than parsed, so the target is exactly what was
+        # verified to exist.
+        args = (['new-window', '-t', session] if verb == 'window'
+                else ['kill-session', '-t', session])
     ok, reason = _run_node_tmux(node, args, f'session-{verb}')
     if not ok:
         state = _network_coordinator.snapshot(node)

@@ -19,7 +19,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from autotmux import keypad, web
+from autotmux import config, keypad, web
 
 
 def _node():
@@ -871,6 +871,120 @@ class BuildStampTests(_ServedFixture):
         page = body.decode('utf-8')
         sheet = page[page.index('<div id="sheet">'):page.index('id="grab"')]
         self.assertIn('id="buildline"', sheet)
+
+
+class SessionActionTests(_ServedFixture):
+    """The first write path on a surface that had only ever read.
+
+    Every other route here answers a question; this one changes something,
+    which is why the guards are the point. It does not run tmux itself: the
+    request goes to the daemon's private socket, which already validates the
+    node against the live allocation, checks the session exists, and
+    constrains a new name -- the same path the TUI has always used. A second
+    implementation would be a second opinion about what is allowed.
+    """
+
+    def post(self, body, ctype='application/json', headers=None):
+        raw = body if isinstance(body, str) else json.dumps(body)
+        head = {'Content-Type': ctype, 'Content-Length': str(len(raw))}
+        head.update(headers or {})
+        lines = ['POST /api/session HTTP/1.1', 'Host: t', 'Connection: close']
+        lines += [f'{k}: {v}' for k, v in head.items()]
+        sock = socket.create_connection((self.host, self.port), timeout=10)
+        got = b''
+        try:
+            sock.sendall(('\r\n'.join(lines) + '\r\n\r\n' + raw).encode())
+        except OSError:
+            # Refusing a body before reading it is the point of the size
+            # check, and a server that answers and closes resets the write
+            # still in flight. The answer is already on the wire.
+            pass
+        try:
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                got += chunk
+        except OSError:
+            pass
+        sock.close()
+        head, _, payload = got.partition(b'\r\n\r\n')
+        return head.decode('latin-1'), payload
+
+    def test_a_form_post_is_refused(self):
+        """A page on another origin can make a browser send a POST even
+        though it can never read the reply. Requiring JSON forces a preflight
+        that a cross-origin page cannot satisfy -- a form-encoded body is the
+        one shape that would have got through without one."""
+        head, _ = self.post({'node': 'localhost', 'verb': 'kill',
+                             'session': 'x'},
+                            ctype='application/x-www-form-urlencoded')
+        self.assertIn('403', head)
+
+    def test_a_cross_site_post_is_refused(self):
+        head, _ = self.post({'node': 'localhost', 'verb': 'kill',
+                             'session': 'x'},
+                            headers={'Sec-Fetch-Site': 'cross-site'})
+        self.assertIn('403', head)
+
+    def test_the_page_own_request_is_allowed_through(self):
+        head, _ = self.post({'node': 'localhost', 'verb': 'window',
+                             'session': 'x'},
+                            headers={'Sec-Fetch-Site': 'same-origin'})
+        self.assertNotIn('403', head)
+
+    def test_only_the_verbs_the_daemon_knows(self):
+        head, body = self.post({'node': 'localhost', 'verb': 'exec',
+                                'session': 'x'})
+        self.assertIn('400', head)
+        self.assertEqual(json.loads(body)['reason'], 'unknown action')
+        for verb in config.SESSION_VERBS:
+            with self.subTest(verb=verb):
+                head, _ = self.post({'node': 'localhost', 'verb': verb,
+                                     'session': 'x'})
+                self.assertNotIn('400', head)
+
+    def test_a_body_that_is_not_an_object_is_refused(self):
+        for raw in ('[]', '"kill"', 'null', 'not json at all'):
+            with self.subTest(body=raw):
+                head, _ = self.post(raw)
+                self.assertIn('400', head)
+
+    def test_an_oversized_body_is_refused_before_it_is_read(self):
+        head, _ = self.post({'node': 'localhost', 'verb': 'kill',
+                             'session': 'x' * 9000})
+        self.assertIn('413', head)
+
+    def test_a_missing_daemon_says_so_rather_than_failing(self):
+        """This server can be running on a machine with no daemon, and the
+        page has to be able to say which of the two is wrong."""
+        head, body = self.post({'node': 'localhost', 'verb': 'window',
+                                'session': 'x'})
+        # Either the daemon is there and answers, or it is not and the reason
+        # names it -- never a bare 500.
+        self.assertNotIn('500', head)
+        answer = json.loads(body)
+        self.assertIn('ok', answer)
+        if not answer['ok']:
+            self.assertTrue(answer.get('reason'))
+
+    def test_no_other_path_accepts_a_post(self):
+        for path in ('/api/state', '/', '/console/', '/api/build'):
+            with self.subTest(path=path):
+                lines = [f'POST {path} HTTP/1.1', 'Host: t',
+                         'Connection: close', 'Content-Type: application/json',
+                         'Content-Length: 2']
+                sock = socket.create_connection((self.host, self.port),
+                                                timeout=10)
+                sock.sendall(('\r\n'.join(lines) + '\r\n\r\n{}').encode())
+                got = b''
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    got += chunk
+                sock.close()
+                self.assertIn('404', got.decode('latin-1', 'replace'))
 
 
 class WebsocketBridgeTests(_ServedFixture):
