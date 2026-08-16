@@ -112,6 +112,19 @@
   .more:active { background: var(--panel); }
   .row {
     display: grid; gap: 2px 10px; align-items: center;
+    /* A row is something you hold, so it is not something you select. The
+       long press was landing on ordinary text inside a button: iOS selected
+       it, painted the whole row blue and offered its own callout on top of
+       the sheet we were opening. The console learnt this; the dashboard had
+       never needed it until now. */
+    user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    /* The hold has to look like it is happening. Half a second with no
+       feedback reads as a tap that missed, which is why people press
+       harder rather than longer. */
+    transition: transform 160ms cubic-bezier(.32, .72, 0, 1),
+                background-color 160ms ease-out;
+    transform-origin: center;
     grid-template-columns: 14px 1fr auto;
     /* 44px is Apple's minimum and the reason the console needed a keypad at
        all. Here a row is the target, so it simply is one. */
@@ -120,6 +133,14 @@
     width: 100%; text-align: left; color: inherit; font: inherit;
   }
   .row:active { background: var(--panel); }
+  /* Held, and about to open: the row settles back and lights up. Small on
+     purpose -- this is a list of rows, and one that jumps is one that looks
+     like it moved to somewhere else. */
+  .row.holding { transform: scale(.97); background: var(--panel); }
+  .row.lifted {
+    transform: scale(1); background: #23232b;
+    box-shadow: 0 0 0 1px var(--accent) inset;
+  }
   /* Every cell placed explicitly. Left to auto-placement the two row-
      spanning children compete for the same track and the session name --
      the thing you are looking for -- ends up on the far right. */
@@ -186,15 +207,40 @@
      and because it is the shape every phone already uses for this. */
   #sheet {
     position: fixed; inset: 0; z-index: 30;
-    background: rgba(0, 0, 0, .55);
+    background: rgba(0, 0, 0, .5);
     display: flex; align-items: flex-end; justify-content: center;
+    /* The backdrop fades and the card slides, separately: a single fade of
+       the whole thing reads as a screenshot appearing rather than as
+       something arriving from the bottom edge. */
+    opacity: 0;
+    -webkit-backdrop-filter: blur(0px); backdrop-filter: blur(0px);
+    transition: opacity 200ms ease-out,
+                backdrop-filter 260ms ease-out,
+                -webkit-backdrop-filter 260ms ease-out;
   }
   #sheet[hidden] { display: none; }
+  #sheet.in {
+    opacity: 1;
+    -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  }
   #sheetcard {
     width: 100%; max-width: 34rem;
     background: var(--panel); border-top: 1px solid var(--line);
     border-radius: 14px 14px 0 0;
     padding: .6rem .6rem calc(.6rem + env(safe-area-inset-bottom));
+    /* Overshoots very slightly and settles, which is what a spring does and
+       what every sheet on this platform does. The curve is mine rather than
+       a published constant -- Apple documents the behaviour, not the
+       numbers -- and it is tuned to arrive quickly and stop dead. */
+    transform: translateY(100%);
+    transition: transform 320ms cubic-bezier(.32, .72, 0, 1);
+  }
+  #sheet.in #sheetcard { transform: translateY(0); }
+  /* Anyone who asked the system for less motion gets the states without the
+     travel. The sheet still arrives; it simply does not slide. */
+  @media (prefers-reduced-motion: reduce) {
+    #sheet, #sheetcard, .row { transition: none; }
+    .row.holding { transform: none; }
   }
   #sheettitle {
     padding: .5rem .8rem .6rem; color: var(--dim); font-size: 13px;

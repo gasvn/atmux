@@ -873,6 +873,109 @@ class BuildStampTests(_ServedFixture):
         self.assertIn('id="buildline"', sheet)
 
 
+class DashboardHoldTests(_ServedFixture):
+    """What a hold has to look like, not only what it does.
+
+    The four parts of this on the platform it is imitating: the item
+    animates, the menu arrives, the background goes back, and a haptic marks
+    the moment. Apple documents the behaviour rather than the numbers, so
+    the curves here are mine; what is not a judgement call is that a state
+    change and its buzz land on the same frame, which their own guidance is
+    explicit about -- felt before it is seen, it reads as a glitch.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(web.ASSETS, 'dash.html'),
+                  encoding='utf-8') as handle:
+            cls.html = handle.read()
+        with open(os.path.join(web.ASSETS, 'dash.js'),
+                  encoding='utf-8') as handle:
+            cls.js = handle.read()
+
+    def test_a_row_you_hold_is_not_a_row_you_select(self):
+        """The long press was landing on ordinary text inside a button, so
+        iOS selected it, painted the whole row blue, and offered its own
+        callout on top of the sheet being opened. The console learnt this
+        for the terminal; the dashboard had never needed it until a hold
+        meant something here."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        # By what the rule declares, not by its selector: `.row {` matches
+        # `li .row { flex: ... }` first, and a test that reads the wrong
+        # rule reports on something nobody changed.
+        block = next(b for b in re.findall(r'\.row \{(.*?)\}', css, re.S)
+                     if 'user-select' in b)
+        self.assertIn('user-select: none', block)
+        self.assertIn('-webkit-user-select: none', block)
+        self.assertIn('-webkit-touch-callout: none', block)
+
+    def test_the_half_second_is_visibly_a_hold(self):
+        """Half a second with no feedback reads as a tap that missed, which
+        is why people press harder rather than longer."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        self.assertRegex(css, r'\.row\.holding \{[^}]*transform: scale')
+        # Applied on the way down, not when the timer fires.
+        start = self.js[self.js.index('function armHold'):]
+        start = start[:start.index('function moveHold')]
+        self.assertLess(start.index("classList.add('holding')"),
+                        start.index('setTimeout'))
+
+    def test_the_state_change_and_the_buzz_land_together(self):
+        """Apple's own guidance: latency between the visual and the haptic
+        destroys the illusion."""
+        start = self.js[self.js.index('function armHold'):]
+        start = start[:start.index('function moveHold')]
+        fired = start[start.index('setTimeout'):]
+        self.assertIn("classList.add('lifted')", fired)
+        self.assertIn('navigator.vibrate', fired)
+
+    def test_the_sheet_arrives_and_leaves_rather_than_appearing(self):
+        """A single fade of the whole thing reads as a screenshot appearing.
+        The backdrop fades and blurs while the card slides from the bottom
+        edge, and on the way out it does both in reverse -- measured
+        mid-flight at 245px in and 271px out."""
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        card = re.search(r'#sheetcard \{(.*?)\}', css, re.S).group(1)
+        self.assertIn('translateY(100%)', card)
+        self.assertIn('transition: transform', card)
+        self.assertIn('#sheet.in #sheetcard { transform: translateY(0); }', css)
+        self.assertIn('backdrop-filter', css)
+        # Two frames before the class that moves it, or the browser has
+        # nothing to transition from and the card jumps.
+        opened = self.js[self.js.index('function openSheet'):]
+        opened = opened[:opened.index('function closeSheet')]
+        self.assertEqual(opened.count('requestAnimationFrame'), 2)
+        # And hidden only after it has left.
+        closed = self.js[self.js.index('function closeSheet'):]
+        closed = closed[:closed.index('function runAct')]
+        self.assertIn("classList.remove('in')", closed)
+        self.assertIn('transitionend', closed)
+        self.assertIn('setTimeout', closed)      # the reduced-motion backstop
+
+    def test_less_motion_still_gets_the_states(self):
+        css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
+        # There are two of these -- the page transition already had one --
+        # so this picks the one that speaks about the sheet.
+        blocks = re.findall(
+            r'@media \(prefers-reduced-motion: reduce\) \{(.*?)\n  \}',
+            css, re.S)
+        block = next((b for b in blocks if '#sheet' in b), None)
+        self.assertIsNotNone(block, 'the sheet still moves for everyone')
+        self.assertIn('transition: none', block)
+        self.assertIn('.row.holding { transform: none; }', block)
+
+    def test_one_affordance_rather_than_two_that_differ(self):
+        """`⋯` used to jump into the console standing on the row -- a page
+        load and a shell for something the sheet now does in place. It opens
+        the same sheet, and what it used to do is the last item in it."""
+        self.assertIn('openSheet(row)', self.js)
+        more = self.js[self.js.index("more.addEventListener"):]
+        more = more[:more.index('item.appendChild(more)')]
+        self.assertIn('openSheet(row)', more)
+        self.assertNotIn("go('select', row)", more)
+        self.assertIn("'More actions", self.js)
+
+
 class SessionActionTests(_ServedFixture):
     """The first write path on a surface that had only ever read.
 
@@ -4828,7 +4931,12 @@ class AttachLinkTests(unittest.TestCase):
         session has nothing to attach to and wants a shell instead, and
         everything else lives on the row the dashboard is standing on."""
         self.assertIn("'attach' : 'shell'", self.dash)
-        self.assertIn("go('select', row)", self.dash)
+        # `select` -- the console standing on this row, where the other
+        # twenty actions live -- is reached through the sheet now rather than
+        # by its own button, so what is asserted is that it still exists and
+        # still navigates.
+        self.assertIn("'select'", self.dash)
+        self.assertIn("act === 'select'", self.dash)
         self.assertIn("stopPropagation", self.dash)
 
     def test_a_row_with_no_session_offers_no_actions_menu(self):

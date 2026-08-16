@@ -135,9 +135,14 @@
       more.type = 'button';
       more.textContent = '⋯';
       more.setAttribute('aria-label', 'actions for ' + row.label);
+      // The same sheet the hold opens. It used to jump straight into the
+      // console standing on this row, which is a page load and a shell for
+      // something the sheet now does in place -- and two affordances that
+      // did different things were two things to learn. What it used to do
+      // is still there, as the last item.
       more.addEventListener('click', function (event) {
         event.stopPropagation();
-        go('select', row);
+        openSheet(row);
       });
       item.appendChild(more);
     }
@@ -157,6 +162,7 @@
   // that a scroll starting late still cancels it.
   var HOLD_MS = 500, HOLD_SLOP = 8;
   var holdTimer = 0, holdFrom = null, holdArmed = null;
+  var holdEl = null, liftedEl = null;
   // Set when a hold has just acted. preventDefault on touchend suppresses the
   // synthetic click on every browser that honours it, and this is the belt:
   // `holdArmed` is cleared by the time the click would arrive, so the guard
@@ -168,6 +174,7 @@
 
   function cancelHold() {
     if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; }
+    if (holdEl) { holdEl.classList.remove('holding'); holdEl = null; }
     holdFrom = null; holdArmed = null;
   }
 
@@ -176,9 +183,21 @@
     var touch = event.touches ? event.touches[0] : event;
     cancelHold();
     holdFrom = {x: touch.clientX, y: touch.clientY};
+    // Immediately, so the half second is visibly a hold rather than a tap
+    // that missed. Cheap to undo: a scroll clears it on the first move.
+    holdEl = event.currentTarget;
+    if (holdEl) holdEl.classList.add('holding');
     holdTimer = setTimeout(function () {
       holdTimer = 0;
       holdArmed = row;
+      // The buzz and the change of state on the same frame. Apple's own
+      // guidance is that latency between the two destroys the illusion, and
+      // it is right: felt before it is seen, it reads as a glitch.
+      if (holdEl) {
+        holdEl.classList.remove('holding');
+        holdEl.classList.add('lifted');
+        liftedEl = holdEl;
+      }
       if (navigator.vibrate) { try { navigator.vibrate(8); } catch (e) {} }
     }, HOLD_MS);
   }
@@ -212,9 +231,15 @@
       ? [['attach', 'Open in terminal', ''],
          ['window', 'New window in this session', ''],
          ['new', 'New session on ' + where, ''],
-         ['kill', 'Kill ' + row.label, 'danger']]
+         ['kill', 'Kill ' + row.label, 'danger'],
+         // Everything else the dashboard can do -- note, auto-renew, view
+         // output, ssh -- lives in the TUI and acts on the highlighted row,
+         // so this opens it standing here rather than listing twenty verbs
+         // twice.
+         ['select', 'More actions…', '']]
       : [['shell', 'Open a shell here', ''],
-         ['new', 'New session on ' + where, '']];
+         ['new', 'New session on ' + where, ''],
+         ['select', 'More actions…', '']];
     acts.forEach(function (spec) {
       var button = document.createElement('button');
       button.type = 'button';
@@ -224,12 +249,34 @@
       sheetActs.appendChild(button);
     });
     sheet.hidden = false;
+    // Two frames, not one: the browser has to lay the card out at
+    // translateY(100%) before the class that moves it can be a transition
+    // rather than a jump.
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () { sheet.classList.add('in'); });
+    });
   }
 
-  function closeSheet() { sheet.hidden = true; }
+  function closeSheet() {
+    if (liftedEl) { liftedEl.classList.remove('lifted'); liftedEl = null; }
+    if (sheet.hidden) return;
+    sheet.classList.remove('in');
+    // Hidden after it has left, or it vanishes instead of leaving. The
+    // timeout matches the longest transition on the card and is a backstop
+    // for the reduced-motion case, where there is no transitionend at all.
+    var card = document.getElementById('sheetcard');
+    var done = false;
+    var finish = function () {
+      if (done) return;
+      done = true;
+      sheet.hidden = true;
+    };
+    card.addEventListener('transitionend', finish, {once: true});
+    setTimeout(finish, 400);
+  }
 
   function runAct(act, row) {
-    if (act === 'attach' || act === 'shell') {
+    if (act === 'attach' || act === 'shell' || act === 'select') {
       closeSheet();
       go(act, row);
       return;
