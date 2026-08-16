@@ -2635,7 +2635,12 @@ def _compose_session(r, widths, tail: str, total: int) -> rich.text.Text:
     # figures the reader had to do arithmetic on -- `12.60/96` is a division,
     # and a walltime three days out is a number nobody acts on.
     room = max(0, total - (lead + name + where + 6))
-    rail = _row_rail(r, room)
+    # room - 1, because the gap before the rail is part of what has to fit.
+    # Asking for `room` and then appending `max(1, room - rail)` spends a
+    # cell that was never budgeted whenever the rail exactly fills the room,
+    # and one cell over is one cell the table clips -- which is what made
+    # the idle marker and the rail look welded together at some widths.
+    rail = _row_rail(r, room - 1)
     if tail:
         keep = max(0, room - rail.cell_len - 2)
         line.append(tail[:keep] if len(tail) <= keep else tail[:keep - 1] + '…')
@@ -2707,6 +2712,9 @@ def _row_rail(r, room: int = 999) -> rich.text.Text:
     only appears once it is too late is not a number you were watching.
     """
     rail = rich.text.Text()
+    if room < _WALL_CELLS:
+        # Not even the walltime fits. Nothing is better than a fragment.
+        return rail
     if r[1] in (_OFFLINE_SESSION, _START_SHELL_SESSION):
         # An unreachable node's walltime is whatever it last said before it
         # went, and a login node runs at five times its core count all day.

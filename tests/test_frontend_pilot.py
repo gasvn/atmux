@@ -1661,6 +1661,32 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('⧗', barest)
         self.assertNotIn('cpu', barest)
 
+    async def test_a_row_never_composes_wider_than_its_budget(self):
+        """One cell over is one cell the table clips, and at the widths
+        where it happened the idle marker and the rail looked welded
+        together.
+
+        The gap before the rail was appended as `max(1, room - rail)` but
+        never budgeted, so whenever the rail exactly filled the room the line
+        came out a cell too long. Swept 30..140 columns across a session, an
+        offer, an offline row and a bare one: 52, 48 and 40 were each one
+        over before, and none are now.
+        """
+        rows = [
+            ('gpu1', 'newclaw', '1', '1-16:00:00', '● 54m Active',
+             '96', '12.6', '97 78000 81559 1'),
+            ('login--a', autotmux._START_SHELL_SESSION, '-', '-', '',
+             '32', '182', ''),
+            ('gpu9', autotmux._OFFLINE_SESSION, '-', '30:00',
+             'OFFLINE: connect timeout', '', '', ''),
+        ]
+        for total in range(30, 141):
+            widths = autotmux._row_widths(rows, total)
+            for row in rows:
+                line = autotmux._compose_session(row, widths, '', total)
+                with self.subTest(total=total, session=row[1][:10]):
+                    self.assertLessEqual(line.cell_len, total)
+
     async def test_the_row_width_asks_the_widget_for_its_chrome(self):
         """A line composed to 54 came out clipped at 52 on a 58-column
         screen: the DataTable takes cell_padding on each side of its one
