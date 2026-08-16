@@ -1733,6 +1733,82 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
                     ('login--a', session, '1', '0:10:00', '', '32', '182.0'))
                 self.assertEqual(rail.plain, '')
 
+    async def test_one_long_name_does_not_widen_the_column(self):
+        """`tend-mgr-tendsystemoptimizer20260810-25eda74d` is a real session
+        name, and at 45 characters it set the column for every row beside it
+        -- so four-letter names sat in a 45-cell trough."""
+        long_name = 'tend-mgr-tendsystemoptimizer20260810-25eda74d'
+        rows = [('gpu1', long_name, '1', '-', '', '', '', ''),
+                ('gpu1', '4gpu', '1', '-', '', '', '', '')]
+        _lead, name, _where = autotmux._row_widths(rows, 120)
+        self.assertLessEqual(name, autotmux._NAME_CAP)
+
+    async def test_a_clipped_name_says_which_end_is_hidden(self):
+        """An ellipsis on whichever side is hiding something, so the row
+        says there is more rather than merely ending early. The head is kept
+        when nothing has scrolled: session names put the purpose first and
+        the tail is often a date or a hash -- which is the opposite of a
+        machine name, whose end is what distinguishes it."""
+        text = 'tend-mgr-tendsystemoptimizer20260810-25eda74d'
+        self.assertEqual(autotmux._window(text, 20, 0),
+                         'tend-mgr-tendsystem…')
+        middle = autotmux._window(text, 20, 14)
+        self.assertTrue(middle.startswith('…') and middle.endswith('…'))
+        end = autotmux._window(text, 20, 99)      # clamped to the tail
+        self.assertTrue(end.startswith('…'))
+        self.assertTrue(end.endswith('25eda74d'))
+        # A name that fits is padded, never marked.
+        self.assertEqual(autotmux._window('4gpu', 8, 0), '4gpu    ')
+
+    async def test_the_scroll_walks_to_the_end_and_then_stops(self):
+        """Bounded on purpose. This file already refuses to run a clock in
+        the header, because an idle repaint over SSH is a trickle of traffic
+        for nothing -- and a marquee that loops for ever is that trickle
+        with a reason attached. It walks once, and only on the row the
+        cursor is on, and only when something is genuinely hidden.
+        """
+        long_name = 'tend-mgr-tendsystemoptimizer20260810-25eda74d'
+        state = {'updated': 'now', 'nodes': {'gpu1': {
+            'alive': True, 'socket': '/tmp/x', 'last_error': '',
+            'info': {'time': '2:00:00'},
+            'sessions': [[long_name, '1', 10], ['4gpu', '1', 10]]}}}
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            with open(autotmux.STATE_FILE, 'w') as handle:
+                json.dump(state, handle)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(90, 20)) as pilot:
+                await pilot.pause()
+                app._refresh_table(state)
+                await pilot.pause()
+                # A short name is fully visible, so nothing ticks for it.
+                app.table.move_cursor(row=table_row(app, '4gpu'))
+                await pilot.pause()
+                self.assertIsNone(app._marquee_timer)
+                # A long one walks.
+                app.table.move_cursor(row=table_row(app, long_name))
+                await pilot.pause()
+                self.assertIsNotNone(app._marquee_timer)
+                for _ in range(120):
+                    await asyncio.sleep(0.05)
+                    await pilot.pause()
+                    if app._marquee_timer is None:
+                        break
+                self.assertIsNone(app._marquee_timer, 'it never stopped')
+                shown = str(app.table.get_cell_at(
+                    Coordinate(table_row(app, long_name), 0)))
+                self.assertIn('25eda74d', shown, 'the tail was never reached')
+
+    async def test_the_scroll_is_keyed_to_the_session_not_the_row(self):
+        """A refresh rebuilds the table every few seconds and re-emits a
+        highlight for whatever the cursor lands back on. Keyed by row, or
+        treating that as a move, sent a name you were part-way through
+        reading back to its head every five seconds."""
+        source = inspect.getsource(autotmux.AutotmuxApp._marquee_reset)
+        self.assertIn('key == self._marquee_key', source)
+        self.assertIn('_marquee_key', inspect.getsource(
+            autotmux.AutotmuxApp._marquee_tick))
+
     async def test_a_narrow_screen_keeps_the_part_of_a_name_that_differs(self):
         """Cut from the right, holygpu8a15104 / 15304 / 15602 all become
         `holygpu8a1` -- the part every node in the cluster shares, and none

@@ -2555,6 +2555,12 @@ def _idle_cell(marker) -> rich.text.Text:
 # Measured from the thing itself rather than counted by hand. Counting is
 # what put this two columns short -- `cpu 13%` is eight cells, not seven --
 # so the GPU was silently dropped from rows that had room for it.
+# How wide the session column may grow. One 45-character name --
+# `tend-mgr-tendsystemoptimizer20260810-25eda74d` is a real one -- set the
+# column for every row beside it, so four-letter names sat in a 45-cell
+# trough. The cap is generous for the names people actually type and the
+# rest is read by scrolling the selected row.
+_NAME_CAP = 20
 _WALL_CELLS = 6
 _RAIL = 0            # set below, once _meter exists to be measured
 
@@ -2566,7 +2572,8 @@ def _row_widths(rows, total: int) -> tuple:
     fixed guess is either padding or truncation on somebody's cluster.
     """
     lead = max([6] + [len(_idle_marker_text(r)) for r in rows])
-    name = max([7] + [len(_session_cell(r[1], r[2])) for r in rows])
+    name = min(_NAME_CAP,
+               max([7] + [len(_session_cell(r[1], r[2])) for r in rows]))
     where = max([4] + [len(_node_label(r[0])) for r in rows])
     spare = total - (lead + name + where + 6) - _RAIL
     if spare < 0:
@@ -2598,7 +2605,28 @@ def _idle_marker_text(r) -> str:
     return str(marker)
 
 
-def _compose_session(r, widths, tail: str, total: int) -> rich.text.Text:
+def _window(text: str, width: int, offset: int) -> str:
+    """`width` cells of `text`, starting `offset` in.
+
+    An ellipsis on whichever side is hiding something, so the row says that
+    there is more rather than merely ending early. Session names put the
+    meaningful part first -- a project, a purpose -- and the tail is often a
+    date or a hash, which is why this keeps the head where the machine-name
+    version keeps the tail.
+    """
+    if len(text) <= width:
+        return text.ljust(width)
+    offset = max(0, min(offset, len(text) - width))
+    piece = text[offset:offset + width]
+    if offset:
+        piece = '…' + piece[1:]
+    if offset + width < len(text):
+        piece = piece[:-1] + '…'
+    return piece
+
+
+def _compose_session(r, widths, tail: str, total: int,
+                     offset: int = 0) -> rich.text.Text:
     """One session, as a line.
 
     The name comes first now. It is what the reader navigates by -- the
@@ -2623,7 +2651,8 @@ def _compose_session(r, widths, tail: str, total: int) -> rich.text.Text:
         line.append(_node_label(r[0]).ljust(name + where + 2)[:name + where + 2],
                     style='dim')
     else:
-        line.append(_session_cell(r[1], r[2]).ljust(name)[:name], style='bold')
+        line.append(_window(_session_cell(r[1], r[2]), name, offset),
+                    style='bold')
         line.append('  ')
         line.append(_fit_node(_node_label(r[0]), where), style='dim')
     line.append('  ')
@@ -4081,6 +4110,17 @@ class AutotmuxApp(App):
         self._select = select
         self._connection_manager_open = False
         self._help_open = False
+        # Scrolling a name too long for its column. Bounded on purpose: it
+        # walks to the end and stops, because this file already refuses to
+        # run a clock in the header -- an idle repaint over SSH is a trickle
+        # of traffic for nothing, and a marquee that loops for ever is that
+        # trickle with a reason attached.
+        # Keyed by (node, session), not by row number: a refresh rebuilds
+        # the table every few seconds and the rows move, so an index would
+        # send the scroll back to the head of whatever now sits there.
+        self._marquee_key = None
+        self._marquee_off = 0
+        self._marquee_timer = None
         # What the list is narrowed to, '' for everything, and how much that
         # hid -- the count is what stops a filter being invisible state.
         self._filter = ''
@@ -4449,6 +4489,67 @@ class AutotmuxApp(App):
             return status
         return self._notes.get(str(session), '')
 
+    def _marquee_stop(self) -> None:
+        if self._marquee_timer is not None:
+            self._marquee_timer.stop()
+            self._marquee_timer = None
+
+    def _marquee_hidden(self, target) -> int:
+        """How many cells of this row's name do not fit, 0 if it all does."""
+        rows = [x for x in self.row_targets if x is not None]
+        _lead, name, _where = _row_widths(rows, self._row_width())
+        return max(0, len(_session_cell(target[1], target[2])) - name)
+
+    def _marquee_reset(self) -> None:
+        """Point the scroll at whatever the cursor is on now.
+
+        Only started when the name on that row genuinely does not fit: a
+        timer that ticks to redraw a name already fully on screen is the
+        idle repaint this app declines to do anywhere else.
+        """
+        target = self._cursor_target()
+        key = (target[0], target[1]) if target is not None else None
+        if key is not None and key == self._marquee_key:
+            # The same row. A rebuild re-emits a highlight for whatever the
+            # cursor lands back on, and treating that as a move sent a name
+            # you were part-way through reading back to its head every five
+            # seconds.
+            return
+        was = self._marquee_key
+        self._marquee_stop()
+        self._marquee_key, self._marquee_off = None, 0
+        if was is not None:
+            self._redraw_key(was)        # put the old one back at its head
+        if target is None or not self._marquee_hidden(target):
+            return
+        self._marquee_key = key
+        self._marquee_timer = self.set_interval(0.35, self._marquee_tick)
+
+    def _cursor_target(self):
+        row = self.table.cursor_row if getattr(self, 'table', None) else -1
+        return (self.row_targets[row]
+                if 0 <= row < len(self.row_targets) else None)
+
+    def _marquee_tick(self) -> None:
+        key = self._marquee_key
+        row = next((i for i, t in enumerate(self.row_targets)
+                    if t is not None and (t[0], t[1]) == key), -1)
+        if row < 0:
+            self._marquee_stop()
+            return
+        target = self.row_targets[row]
+        if self._marquee_off >= self._marquee_hidden(target):
+            self._marquee_stop()         # the tail is showing; nothing left
+            return
+        self._marquee_off += 1
+        self._update_row_cells(row, target)
+
+    def _redraw_key(self, key) -> None:
+        for i, target in enumerate(self.row_targets):
+            if target is not None and (target[0], target[1]) == key:
+                self._update_row_cells(i, target)
+                return
+
     def _row_width(self) -> int:
         """How wide a row may be.
 
@@ -4503,8 +4604,10 @@ class AutotmuxApp(App):
             widths = _row_widths(
                 [x for x in self.row_targets if x is not None],
                 self._row_width())
+            offset = (self._marquee_off
+                      if self._marquee_key == (r[0], r[1]) else 0)
             line = _compose_session(r, widths, self._row_tail(r),
-                                    self._row_width())
+                                    self._row_width(), offset)
             coord = Coordinate(i, 0)
             if str(self.table.get_cell_at(coord)) != str(line):
                 self.table.update_cell_at(coord, line)
@@ -4694,9 +4797,14 @@ class AutotmuxApp(App):
             r = entry[1]
             placed.append(r)
             self.table.add_row(_compose_session(
-                r, widths, self._row_tail(r), self._row_width()))
+                r, widths, self._row_tail(r), self._row_width(),
+                self._marquee_off
+                if self._marquee_key == (r[0], r[1]) else 0))
         self.table.heading_rows = headings
         self.row_targets = placed
+        # The scroll survives a rebuild, because it is keyed by session
+        # rather than by row: a name you had scrolled to read should not go
+        # back to its head every five seconds because the table repainted.
         self.all_sessions = [r for r in placed if r is not None]
         rows = self.all_sessions
 
@@ -5653,6 +5761,10 @@ class AutotmuxApp(App):
         return row[0], row[1]
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        # Whatever else this event means, the cursor moved -- so a name that
+        # was scrolling on the row behind goes back to its head and the new
+        # row starts its own walk if it needs one.
+        self._marquee_reset()
         target = self._row_target(event.row_key)
         if target is None:
             return
