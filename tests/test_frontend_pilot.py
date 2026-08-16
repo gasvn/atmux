@@ -1610,6 +1610,12 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('61%', rail)
         # One fact once: no bar beside the number it repeats.
         self.assertNotIn('█', rail)
+        # And the word runs straight into its right-justified number, so a
+        # column of them lines up without either spending a cell on a gap.
+        self.assertEqual(autotmux._meter(0.13, 'cpu').plain, 'cpu 13%')
+        self.assertEqual(autotmux._meter(1.0, 'cpu').plain, 'cpu100%')
+        self.assertEqual(len(autotmux._meter(0.05, 'gpu').plain),
+                         len(autotmux._meter(1.0, 'gpu').plain))
 
     async def test_the_design_survives_sixteen_colours(self):
         """Over SSH into a cluster, sixteen is often all there is -- and if

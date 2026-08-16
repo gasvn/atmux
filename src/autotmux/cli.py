@@ -2686,13 +2686,17 @@ def _meter(share, label) -> rich.text.Text:
         return out
     style = (tone('danger') if share >= 0.95 else
              tone('warn') if share >= _BUSY else tone('ok'))
-    out.append(label + ' ', style=tone('quiet'))
-    out.append(f'{min(999, round(share * 100)):3d}%', style=style)
+    # The gap between the word and the number is the right-justification,
+    # not a space of its own: `cpu 13%` and `cpu100%` are both seven cells,
+    # so a column of them still lines up and neither spends a cell saying
+    # nothing. Two cells narrower than `cpu ` + `%3d%%` was.
+    out.append(label, style=tone('quiet'))
+    out.append(f'{min(999, round(share * 100)):>3}%', style=style)
     return out
 
 
 # Now that _meter exists, ask it how wide it is rather than counting.
-_RAIL = _WALL_CELLS + 2 * (2 + _meter(0.5, 'cpu').cell_len)
+_RAIL = _WALL_CELLS + 2 * (1 + _meter(0.5, 'cpu').cell_len)
 
 
 def _row_rail(r, room: int = 999) -> rich.text.Text:
@@ -2734,9 +2738,9 @@ def _row_rail(r, room: int = 999) -> rich.text.Text:
         if value is None:
             continue
         cell = _meter(value, label)
-        if rail.cell_len + 2 + cell.cell_len > room:
+        if rail.cell_len + 1 + cell.cell_len > room:
             break
-        rail.append('  ')
+        rail.append(' ')
         rail.append_text(cell)
     return rail
 
