@@ -969,10 +969,12 @@ class DashboardHoldTests(_ServedFixture):
         load and a shell for something the sheet now does in place. It opens
         the same sheet, and what it used to do is the last item in it."""
         self.assertIn('openSheet(row)', self.js)
-        more = self.js[self.js.index("more.addEventListener"):]
-        more = more[:more.index('item.appendChild(more)')]
-        self.assertIn('openSheet(row)', more)
-        self.assertNotIn("go('select', row)", more)
+        more = self.js[self.js.index('entry.more.addEventListener'):]
+        more = more[:more.index('entry.li.appendChild(entry.more)')]
+        # The row it acts on is read now, not captured when the element was
+        # built: the element outlives the poll that made it.
+        self.assertIn('openSheet(entry.row)', more)
+        self.assertNotIn("go('select'", more)
         self.assertIn("'More actions", self.js)
 
 
@@ -4718,6 +4720,373 @@ class PullToRefreshTests(unittest.TestCase):
         self.assertIn('pullState', self.js)
 
 
+@unittest.skipUnless(_node(), 'needs a javascript runtime')
+class DashboardListTests(unittest.TestCase):
+    """The list is updated now, not rebuilt.
+
+    It used to be `list.textContent = ''` and a fresh <li> per row every five
+    seconds. Measured in WebKit at an iPhone's size: every row element
+    replaced, every tick. A finger already down was holding something that
+    had left the document -- the hold's highlight never arrived and the sheet
+    opened over an unlit list -- and a tap whose click had not yet fired was
+    lost outright. A 500ms hold against a 5s poll is one hold in ten.
+
+    Driven through a DOM small enough to reason about, because the property
+    that matters is about element *identity* across a refresh, and identity
+    is exactly what a test rewritten in python could not observe.
+    """
+
+    # Enough of a document for the real functions: parents, siblings, and a
+    # textContent that clears its children the way the real one does.
+    _DOM = """
+      function makeDoc() {
+        function detach(c) { if (c.parentNode) c.parentNode.removeChild(c); }
+        function node(tag) {
+          var n = {
+            tagName: tag, parentNode: null, childNodes: [],
+            className: '', _text: '', attrs: {}, seen: 0,
+            classList: {add: function () {}, remove: function () {},
+                        contains: function () { return false; },
+                        toggle: function () {}},
+            addEventListener: function () {},
+            setAttribute: function (k, v) { n.attrs[k] = v; },
+            appendChild: function (c) {
+              detach(c); c.parentNode = n; n.childNodes.push(c); return c;
+            },
+            insertBefore: function (c, before) {
+              detach(c); c.parentNode = n;
+              var i = before ? n.childNodes.indexOf(before) : -1;
+              if (i < 0) i = n.childNodes.length;
+              n.childNodes.splice(i, 0, c); return c;
+            },
+            removeChild: function (c) {
+              var i = n.childNodes.indexOf(c);
+              if (i >= 0) n.childNodes.splice(i, 1);
+              c.parentNode = null; return c;
+            }
+          };
+          Object.defineProperty(n, 'firstChild', {get: function () {
+            return n.childNodes[0] || null; }});
+          Object.defineProperty(n, 'nextSibling', {get: function () {
+            if (!n.parentNode) return null;
+            var kin = n.parentNode.childNodes;
+            return kin[kin.indexOf(n) + 1] || null; }});
+          Object.defineProperty(n, 'textContent', {
+            get: function () { return n._text; },
+            set: function (v) {
+              n._text = String(v);
+              n.childNodes.slice().forEach(function (c) { n.removeChild(c); });
+            }});
+          return n;
+        }
+        return {createElement: node};
+      }
+      var document = makeDoc();
+      // Registered by name rather than wrapped, so it is read when the row
+      // is built. Everything else the row listens with is inside a closure
+      // nothing here ever calls.
+      function moveHold() {}
+      // What a row looks like from outside: the name is the second child of
+      // the button, which is the first child of the <li>.
+      function readRow(li) {
+        if (li.className === 'band') return {band: li.textContent};
+        var button = li.childNodes[0];
+        return {name: button.childNodes[1].textContent,
+                meta: button.childNodes[2].textContent,
+                dot: button.childNodes[0].className,
+                wall: button.childNodes[3].childNodes[0].textContent,
+                rail: button.childNodes[3].childNodes[1].childNodes
+                        .map(function (c) { return c.textContent; })};
+      }
+      function readList() { return list.childNodes.map(readRow); }
+      // Identity, the only thing this file is really about: stamp every
+      // element, sync again, and see which stamps came back.
+      function stamp() {
+        list.childNodes.forEach(function (n, i) { n.seen = i + 1; });
+      }
+      function stamps() {
+        return list.childNodes.map(function (n) { return n.seen; });
+      }
+    """
+
+    _ROWS = """
+      function row(over) {
+        var base = {node: 'gpu1', node_label: 'gpu1', session: 'train',
+                    kind: 'session', label: 'train', windows: '2',
+                    left: '2:00:00', status: 'Active', idle_label: '',
+                    tier: '', cpu: '96', load: '48', gpu: '', keepalive: '',
+                    band: 'working'};
+        for (var k in over) base[k] = over[k];
+        return base;
+      }
+      var ROWS = [
+        row({}),
+        row({session: 'tb', label: 'tb', band: 'just stopped',
+             tier: 'idle', idle_label: '15m'}),
+        row({session: '', kind: 'empty', label: '<shell>',
+             band: 'start something here', status: 'No sessions'})
+      ];
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(web.ASSETS, 'dash.js'), encoding='utf-8') as f:
+            cls.source = f.read()
+        parts = [cls._DOM]
+        tiers = re.search(r'var TIERS = [^;]*;', cls.source)
+        assert tiers, 'TIERS'
+        parts.append(tiers.group(0))
+        for name in ('tierClass', 'share', 'gpuShare', 'level', 'paintRail',
+                     'keyOf', 'bandKey', 'planList', 'makeBand', 'makeRow',
+                     'paint', 'syncList'):
+            parts.append(_extract(cls.source, name))
+        parts.append("var list = document.createElement('ul');")
+        parts.append('var kept = new Map();')
+        parts.append(cls._ROWS)
+        cls.harness = '\n'.join(parts)
+
+    def node_js(self, body):
+        import subprocess
+        out = subprocess.run([_node(), '-e', self.harness + '\n' + body],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    # ── the numbers on the right ──────────────────────────────────────────
+
+    def test_the_load_is_shown_as_a_share_of_the_cores(self):
+        """`38.42/64` is a load average over a core count: true, and nothing
+        anyone reads at a glance. It is what "后面那些数字是什么，看不懂"
+        was about, and the table answered it months before this page did."""
+        self.assertEqual(self.node_js(
+            "console.log(JSON.stringify(["
+            "share('48', '96'), share('96', '96'), share('4.0', '96'),"
+            "share('0', '96')]));"), [50, 100, 4, 0])
+
+    def test_a_share_nobody_can_compute_is_absent_rather_than_wrong(self):
+        """A missing figure draws nothing. NaN% draws `cpu NaN%`."""
+        self.assertEqual(self.node_js(
+            "console.log(JSON.stringify(["
+            "share('', '96'), share('4', ''), share('4', '0'),"
+            "share('x', 'y'), share(null, null)]));"), [None] * 5)
+
+    def test_a_wedged_machine_is_clamped_for_width_not_for_truth(self):
+        """Load counts runnable processes, so it can pass the core count by
+        a lot. Past 999% the exact figure has stopped being the point."""
+        self.assertEqual(self.node_js(
+            "console.log(JSON.stringify([share('9600', '96'),"
+            " share('96000', '96')]));"), [999, 999])
+
+    def test_only_the_first_gpu_field_is_a_percentage(self):
+        """"mean-util used total count" -- the rest are megabytes, and a
+        client reading the wrong one reports 41231% utilisation."""
+        self.assertEqual(self.node_js(
+            "console.log(JSON.stringify([gpuShare('87 41231 81920 4'),"
+            " gpuShare('0 12 24576 2'), gpuShare(''), gpuShare('  '),"
+            " gpuShare(null), gpuShare('n/a')]));"),
+            [87, 0, None, None, None, None])
+
+    def test_the_colour_is_kept_for_the_one_state_that_costs_anything(self):
+        """The first draft lit both numbers amber above 60%, and the result
+        was a list whose loudest thing was the hardware: a GPU at 87% is a
+        job running *well*, and warning-coloured says the opposite."""
+        self.assertEqual(self.node_js(
+            "console.log(JSON.stringify([level(0), level(60), level(99),"
+            " level(100), level(999)]));"), ['', '', '', ' hot', ' hot'])
+
+    def test_the_gpu_reaches_the_phone_at_all(self):
+        """The model has sent it since the walltime came back and its own
+        comment says the browser list draws the same rail the table does.
+        It did not: this was the one screen with no GPU on it."""
+        rows = self.node_js(
+            "syncList([row({gpu: '87 41231 81920 4'})], 'none');"
+            "console.log(JSON.stringify(readList()));")
+        self.assertEqual(rows[-1]['rail'], ['cpu 50%', 'gpu 87%'])
+
+    # ── what a row is called ──────────────────────────────────────────────
+
+    def test_a_machine_row_is_named_for_the_machine(self):
+        """Four rows reading `<shell>` was this page showing the model's
+        sentinel to the reader and calling it a list."""
+        rows = self.node_js("syncList(ROWS, 'none');"
+                       "console.log(JSON.stringify(readList()));")
+        names = [r.get('name') for r in rows if 'name' in r]
+        self.assertIn('gpu1', names)
+        for name in names:
+            self.assertNotIn('shell', name)
+            self.assertNotIn('<', name)
+
+    def test_the_word_that_never_varies_is_gone(self):
+        """'Active' is what a status says when nothing is wrong, which is
+        almost always. The green dot already says it; the word only wrapped
+        the line it was on."""
+        rows = self.node_js("syncList(ROWS, 'none');"
+                       "console.log(JSON.stringify(readList()));")
+        metas = [r.get('meta', '') for r in rows]
+        self.assertFalse([m for m in metas if 'Active' in m])
+        # And the ones that mean something survive.
+        self.assertTrue([m for m in metas if 'No sessions' in m])
+
+    def test_an_unreachable_machine_is_not_the_same_grey_as_an_offer(self):
+        both = self.node_js(
+            "syncList([row({kind: 'offline', session: '', band: 'x'}),"
+            "          row({kind: 'empty', session: '', band: 'x'})], 'n');"
+            "console.log(JSON.stringify(readList().map(function (r) {"
+            "  return r.dot; })));")
+        self.assertEqual([d for d in both if d], ['dot stale', 'dot none'])
+
+    # ── the headings ──────────────────────────────────────────────────────
+
+    def test_each_band_is_headed_once_in_the_order_it_arrives(self):
+        plan = self.node_js(
+            "console.log(JSON.stringify(planList(["
+            "row({band: 'working'}), row({session: 'b', band: 'working'}),"
+            "row({session: 'c', band: 'quiet a while'})"
+            "]).map(function (i) { return i.band || i.row.session; })));")
+        self.assertEqual(plan, ['working', 'train', 'b',
+                                'quiet a while', 'c'])
+
+    def test_a_server_that_sends_no_band_gets_no_headings(self):
+        """An older daemon than this page. A blank strip across the list is
+        worse than the flat list this replaces."""
+        plan = self.node_js(
+            "console.log(JSON.stringify(planList([row({band: ''}),"
+            " row({session: 'b', band: undefined})]).map(function (i) {"
+            "  return i.band || null; })));")
+        self.assertEqual(plan, [None, None])
+
+    def test_a_heading_can_never_collide_with_a_row(self):
+        """They share one map. A band that keys the same as a row would take
+        that row's element and paint a heading over it."""
+        clash = self.node_js(
+            "var keys = ROWS.map(keyOf).concat(['working', 'just stopped',"
+            "  'start something here', 'not reachable'].map(bandKey));"
+            "console.log(JSON.stringify(keys.length - new Set(keys).size));")
+        self.assertEqual(clash, 0)
+
+    def test_an_offer_and_a_session_of_the_same_name_are_two_rows(self):
+        keys = self.node_js(
+            "console.log(JSON.stringify(["
+            "keyOf({node: 'g', kind: 'session', session: 'x'}),"
+            "keyOf({node: 'g', kind: 'empty', session: ''}),"
+            "keyOf({node: 'g', kind: 'session', session: 'my run'}),"
+            "keyOf({node: 'h', kind: 'session', session: 'x'})]));")
+        self.assertEqual(len(set(keys)), 4)
+
+    # ── identity, which is the whole point ────────────────────────────────
+
+    def test_a_refresh_keeps_every_element_it_can(self):
+        """The defect this fixes. A row whose element survives is a row that
+        keeps its press state, its focus ring and whatever gesture is part
+        way through on it."""
+        seen = self.node_js("syncList(ROWS, 'none'); stamp();"
+                       "syncList(ROWS, 'none');"
+                       "console.log(JSON.stringify(stamps()));")
+        self.assertTrue(all(seen), f'{seen} — an element was replaced')
+        self.assertEqual(seen, sorted(seen))
+
+    def test_a_row_that_changed_is_repainted_in_place(self):
+        """Not replaced -- the same element, with the new numbers in it."""
+        after = self.node_js(
+            "syncList([row({})], 'none'); stamp();"
+            "syncList([row({load: '96', idle_label: '15m', tier: 'idle'})],"
+            "         'none');"
+            "console.log(JSON.stringify({stamps: stamps(),"
+            "  rail: readList()[readList().length - 1].rail,"
+            "  dot: readList()[readList().length - 1].dot}));")
+        self.assertTrue(all(after['stamps']))
+        self.assertEqual(after['rail'], ['cpu 100%'])
+        self.assertEqual(after['dot'], 'dot hint')
+
+    def test_a_session_that_ends_takes_its_element_with_it(self):
+        gone = self.node_js(
+            "syncList(ROWS, 'none'); stamp();"
+            "syncList([ROWS[0]], 'none');"
+            "console.log(JSON.stringify({rows: readList().length,"
+            "  kept: kept.size, stamps: stamps()}));")
+        # One heading and one row, and the surviving row is the old element.
+        self.assertEqual(gone['rows'], 2)
+        self.assertEqual(gone['kept'], 2)
+        self.assertTrue(all(gone['stamps']))
+
+    def test_a_row_that_moves_band_is_moved_not_rebuilt(self):
+        """A session going quiet re-sorts it into another band. That is a
+        move, and a move that rebuilds is the original bug with extra steps.
+        """
+        moved = self.node_js(
+            "syncList(ROWS, 'none'); stamp();"
+            "var later = [ROWS[1], ROWS[0], ROWS[2]];"
+            "syncList(later, 'none');"
+            "console.log(JSON.stringify({stamps: stamps(),"
+            "  names: readList().map(function (r) {"
+            "    return r.band || r.name; })}));")
+        self.assertTrue(all(moved['stamps']),
+                        f'{moved} — a reorder rebuilt something')
+        self.assertEqual(moved['names'][0], 'just stopped')
+
+    def test_an_empty_answer_clears_the_list(self):
+        empty = self.node_js(
+            "syncList(ROWS, 'none'); syncList([], 'connecting…');"
+            "console.log(JSON.stringify({n: list.childNodes.length,"
+            "  text: list.childNodes[0].textContent,"
+            "  cls: list.childNodes[0].className, kept: kept.size}));")
+        self.assertEqual(empty['n'], 1)
+        self.assertEqual(empty['text'], 'connecting…')
+        self.assertEqual(empty['cls'], 'empty')
+        # Nothing left pointing at elements that are no longer in the page.
+        self.assertEqual(empty['kept'], 0)
+
+    def test_the_placeholder_is_swept_when_rows_come_back(self):
+        """It is not in the map, so only the trailing sweep can remove it --
+        and an <li> reading "no sessions" left under a full list is the kind
+        of thing that survives every test that only counts rows."""
+        back = self.node_js(
+            "syncList([], 'no sessions'); syncList(ROWS, 'none');"
+            "console.log(JSON.stringify(readList().map(function (r) {"
+            "  return r.band || r.name; })));")
+        self.assertNotIn('no sessions', back)
+        self.assertEqual(len(back), 6)      # three bands, three rows
+
+    # ── and the source-level half ─────────────────────────────────────────
+
+    def test_the_poll_no_longer_empties_the_list(self):
+        """Named against what it clears, not against the word: render still
+        writes the age and the queue, and an assertion on `textContent`
+        alone passes today and for the wrong reason tomorrow."""
+        render = _extract(self.source, 'render')
+        self.assertNotIn('list.textContent', render)
+        self.assertNotIn('appendChild', render)
+        self.assertIn('syncList', render)
+
+    def test_a_handler_reads_the_row_it_is_on_now(self):
+        """The element outlives any single poll, so a closure over the row
+        it was built from would act on a session that has since gone quiet,
+        moved band, or gone away."""
+        body = _extract(self.source, 'makeRow')
+        self.assertIn('entry.row', body)
+        # No row parameter to capture in the first place.
+        self.assertIn('function makeRow()', body)
+
+    def test_nothing_moves_under_a_finger(self):
+        """A row that reorders under a thumb is a row you meant to press and
+        did not."""
+        busy = _extract(self.source, 'busy')
+        for guard in ('holdEl', 'holdArmed', 'sheet.hidden'):
+            self.assertIn(guard, busy)
+        render = _extract(self.source, 'render')
+        self.assertIn('busy()', render)
+        # And the held update is applied the moment the gesture is over.
+        self.assertIn('flush', _extract(self.source, 'closeSheet'))
+
+    def test_the_source_carries_no_control_bytes(self):
+        """A NUL inside a string literal runs, and makes grep call the file
+        binary and stop reporting matches in it."""
+        with open(os.path.join(web.ASSETS, 'dash.js'), 'rb') as handle:
+            raw = handle.read()
+        self.assertNotIn(b'\x00', raw)
+        self.assertNotIn(b'\x01', raw)
+
+
 class DashboardStateTests(unittest.TestCase):
     """What /api/state promises a client, without a server in the way."""
 
@@ -4939,10 +5308,23 @@ class AttachLinkTests(unittest.TestCase):
         self.assertIn("act === 'select'", self.dash)
         self.assertIn("stopPropagation", self.dash)
 
-    def test_a_row_with_no_session_offers_no_actions_menu(self):
-        """There is nothing for the other verbs to act on."""
-        body = _extract(self.dash, 'build')
-        self.assertIn("row.kind === 'session'", body)
+    def test_every_row_offers_the_actions_menu(self):
+        """It used to be sessions only, on the grounds that a machine with
+        nothing running has one thing you can do to it and the row does
+        that. Two things were wrong: the sheet offers a machine three verbs,
+        and a column present on some rows and absent on others left the
+        numbers down the right of the list ending 56px apart."""
+        body = _extract(self.dash, 'makeRow')
+        self.assertIn("entry.more = document.createElement('button')", body)
+        # Unconditional: at the function's own brace depth, not inside an if.
+        depth = 0
+        for line in body.splitlines():
+            if 'entry.more = document.createElement' in line:
+                break
+            depth += line.count('{') - line.count('}')
+        else:
+            self.fail('the ⋯ button is not built in makeRow')
+        self.assertEqual(depth, 1, 'the ⋯ button is built conditionally')
 
     def test_the_list_puts_the_session_in_the_link(self):
         body = _extract(self.dash, 'go')

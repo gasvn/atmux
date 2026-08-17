@@ -151,15 +151,44 @@
   .dot.hint { background: var(--hint); }
   .dot.stale { background: var(--stale); }
   .dot.none { background: #3a3a42; }
+  /* Two lines, then an ellipsis. A run named
+     `diffusion-pretrain-stage2-resume-from-ckpt-40k` wrapped to five lines
+     on a 320px phone and made one row 184px tall -- the same complaint the
+     table answered with a clip and a marquee. Two lines is ~40 characters,
+     which is enough to tell two similar runs apart; one line is not. */
   .name { grid-column: 2; grid-row: 1; font-weight: 600;
-          overflow-wrap: anywhere; }
-  .name .placeholder { color: var(--dim); font-weight: 400; }
+          overflow-wrap: anywhere;
+          display: -webkit-box; -webkit-box-orient: vertical;
+          -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
   .meta { grid-column: 2; grid-row: 2; color: var(--dim); font-size: 13px;
           overflow-wrap: anywhere; }
   .right { grid-column: 3; grid-row: 1 / span 2;
            text-align: right; color: var(--dim);
            font-size: 13px; white-space: nowrap; }
-  .right b { display: block; color: var(--ink); font-weight: 600; }
+  .right b { display: block; color: var(--ink); font-weight: 600;
+             font-variant-numeric: tabular-nums; }
+  /* Two numbers with their names on them. They used to read `38.42/64` --
+     a load average over a core count, which is true and unreadable while
+     walking. The table beside this page says `cpu 60%`; so does this, and
+     the GPU it has been sending all along is finally on the screen. */
+  .rail { display: flex; gap: 7px; justify-content: flex-end;
+          font-variant-numeric: tabular-nums; font-size: 12px; }
+  .rail:empty { display: none; }
+  /* One colour, for the one state that costs the reader something: load
+     past the core count. See level() -- a GPU at 87% is a job running well,
+     and the first draft painted it the colour of a warning. */
+  .chip.hot { color: var(--stale); }
+  /* What a group of rows is. The table has headed its bands since the day
+     the list stopped sorting by hostname; this page had the same order and
+     none of the words for it, so four rows you cannot attach to sat under
+     four you can with nothing in between saying so. */
+  li.band {
+    display: block; padding: 16px 14px 6px;
+    color: var(--dim); font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .07em;
+    border-bottom: 1px solid var(--line); background: var(--bg);
+  }
+  li.band:first-child { padding-top: 10px; }
   .tag {
     display: inline-block; margin-left: 6px; padding: 1px 6px;
     border-radius: 999px; font-size: 11px; vertical-align: 1px;
@@ -184,7 +213,12 @@
     overflow-x: auto; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo,
                             monospace; color: var(--ink);
   }
-  .empty { color: var(--dim); padding: 28px 14px; text-align: center; }
+  /* display:block, because `li` above is a flex container and a bare text
+     node in one becomes a flex item sized to its own content -- which is
+     why "no sessions" was centred in the stylesheet and left-aligned on
+     the screen. */
+  li.empty { display: block; color: var(--dim); padding: 28px 14px;
+             text-align: center; border-bottom: 0; }
   .err {
     margin: 10px 14px; padding: 10px 12px; border-radius: 8px;
     background: #2a1a1a; color: #f0a0a0; font-size: 13px;

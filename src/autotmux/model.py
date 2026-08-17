@@ -96,6 +96,17 @@ OFFER_RANK = 4
 OFFER_TITLE = 'start something here'
 
 
+def band_title(rank: int) -> str:
+    """What the band at this rank is called.
+
+    One lookup, so the table and the browser list head the same group with
+    the same words. The phone had no headings at all, which is how four rows
+    reading `<shell>` ended up under four rows of real work with nothing
+    between them saying they were a different kind of thing.
+    """
+    return BAND_TITLES.get(rank, OFFER_TITLE)
+
+
 def session_rank(row) -> int:
     """How much this row wants a decision. See _attention_rank."""
     return _attention_rank(row)
@@ -377,6 +388,8 @@ def sessions(state: dict, keepalive_entries=()) -> list[dict]:
             # opinion about the same number.
             idle_seconds = _idle_seconds_of(state, node, name)
         kind = _placeholder(name)
+        rank = _attention_rank((node, name, wins, time_left, status,
+                               cpu, load, gpu))
         out.append({
             # Both: `node` is what routes a command, `node_label` is what a
             # person reads. Showing the routing name is how a phone ends up
@@ -404,8 +417,11 @@ def sessions(state: dict, keepalive_entries=()) -> list[dict]:
             # The browser list draws the same rail the table does.
             'gpu': gpu,
             'keepalive': _keepalive_field(state, node, keepalive_entries),
-            'attention': _attention_rank((node, name, wins, time_left,
-                                          status, cpu, load, gpu)),
+            'attention': rank,
+            # The heading this row belongs under, sent rather than guessed:
+            # the client already receives the rank, and a client turning a
+            # rank into words is a second place the bands are named.
+            'band': band_title(rank),
         })
     return out
 

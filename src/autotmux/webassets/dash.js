@@ -43,30 +43,200 @@
   var TIERS = { '': 'live', idle: 'hint', stale: 'stale' };
 
   function tierClass(row) {
+    // A machine nothing can reach is not the same grey as a machine you
+    // could start something on. It was, and the two sat side by side.
+    if (row.kind === 'offline') return 'stale';
     if (row.kind !== 'session') return 'none';
     return TIERS[row.tier] || 'live';
   }
 
-  function build(row) {
+  // ── how busy the machine is ────────────────────────────────────────────
+  // These two numbers used to read `38.42/64`: a load average over a core
+  // count. True, and nothing anyone can read at a glance -- which is what
+  // "后面那些数字是什么，看不懂" was about. The table beside this page says
+  // `cpu 60%`, so this says `cpu 60%`.
+
+  function share(load, cpu) {
+    var used = parseFloat(load), have = parseFloat(cpu);
+    if (!isFinite(used) || !isFinite(have) || have <= 0) return null;
+    // A load average counts runnable processes, so it can exceed the cores
+    // by a lot on a wedged node. Clamped for width, not for truth: past
+    // 999% the exact figure has stopped being the point.
+    return Math.max(0, Math.min(999, Math.round(used / have * 100)));
+  }
+
+  // "mean-util used total count" -- the daemon's own field order. Only the
+  // first is a percentage; the memory figures are megabytes.
+  function gpuShare(gpu) {
+    var util = parseFloat(String(gpu || '').trim().split(/\s+/)[0]);
+    if (!isFinite(util)) return null;
+    return Math.max(0, Math.min(100, Math.round(util)));
+  }
+
+  // One colour, and only where it is a problem. The first draft lit both
+  // numbers amber above 60% and the result was a list whose loudest thing
+  // was the hardware: a GPU at 87% is a job running *well*, and painting it
+  // the colour of a warning says the opposite. Past 100% the load exceeds
+  // the cores, which is the one state here that costs the reader something.
+  function level(pct) { return pct >= 100 ? ' hot' : ''; }
+
+  function paintRail(rail, row) {
+    rail.textContent = '';
+    // The GPU has been in the payload since the walltime came back, and the
+    // model's own comment says the browser list draws the same rail the
+    // table does. It did not: the phone was the one screen with no GPU on it.
+    var cpu = share(row.load, row.cpu);
+    [['cpu', cpu, level(cpu)],
+     ['gpu', gpuShare(row.gpu), '']].forEach(function (pair) {
+      if (pair[1] === null) return;
+      var chip = document.createElement('span');
+      chip.className = 'chip' + pair[2];
+      chip.textContent = pair[0] + ' ' + pair[1] + '%';
+      rail.appendChild(chip);
+    });
+  }
+
+  // ── the list, updated rather than rebuilt ──────────────────────────────
+  // It used to be `list.textContent = ''` and a fresh <li> per row, every
+  // five seconds. Measured in WebKit at an iPhone's size: every row element
+  // replaced, every tick. A finger already down was then holding something
+  // that had left the document -- the hold's highlight never arrived and the
+  // sheet opened over an unlit list -- and a tap whose click had not yet
+  // fired was lost outright. A 500ms hold against a 5s poll is one hold in
+  // ten; a tap is one in fifty.
+  //
+  // So a row is keyed by what it is about and kept. The poll writes the
+  // changed fields into the element that is already there, which is also
+  // what makes the press state, the focus ring and the scroll position
+  // survive a refresh.
+  var kept = new Map();
+
+  function keyOf(row) {
+    // A machine's offer row and a session of the same name on it are
+    // different rows; the kind is what tells them apart. A space joins them
+    // safely because only the last field can contain one: a tmux session
+    // may be called "my run", a hostname and a kind may not.
+    return [row.node, row.kind, row.session || ''].join(' ');
+  }
+
+  // Distinct from every row key for the same reason: `kind` is one of
+  // session/empty/offline, so no row key's second word is ever a band's
+  // first.
+  function bandKey(title) { return 'band ' + title; }
+
+  // What the list should be, in order, headings included -- a heading that
+  // is not part of the plan is a heading nothing keeps in place.
+  function planList(rows) {
+    var plan = [], band = null;
+    rows.forEach(function (row) {
+      var title = row.band || '';
+      if (title && title !== band) {
+        band = title;
+        plan.push({key: bandKey(title), band: title});
+      }
+      plan.push({key: keyOf(row), row: row});
+    });
+    return plan;
+  }
+
+  function makeBand(title) {
     var item = document.createElement('li');
+    item.className = 'band';
+    item.textContent = title;
+    return {li: item};
+  }
+
+  function makeRow() {
+    var entry = {li: document.createElement('li'), row: null};
     var button = document.createElement('button');
     button.className = 'row';
     button.type = 'button';
 
-    var dot = document.createElement('span');
-    dot.className = 'dot ' + tierClass(row);
-    button.appendChild(dot);
+    entry.dot = document.createElement('span');
+    button.appendChild(entry.dot);
 
-    var name = document.createElement('div');
-    name.className = 'name';
-    if (row.kind === 'session') {
-      name.textContent = row.label;
-    } else {
-      var span = document.createElement('span');
-      span.className = 'placeholder';
-      span.textContent = row.label;
-      name.appendChild(span);
-    }
+    entry.name = document.createElement('div');
+    entry.name.className = 'name';
+    button.appendChild(entry.name);
+
+    entry.meta = document.createElement('div');
+    entry.meta.className = 'meta';
+    button.appendChild(entry.meta);
+
+    entry.right = document.createElement('div');
+    entry.right.className = 'right';
+    entry.wall = document.createElement('b');
+    entry.rail = document.createElement('span');
+    entry.rail.className = 'rail';
+    entry.right.appendChild(entry.wall);
+    entry.right.appendChild(entry.rail);
+    button.appendChild(entry.right);
+
+    // Every handler reads entry.row rather than a row captured when the
+    // element was made. The element now outlives any single poll, so a
+    // closure over the row it was built from would act on a session that
+    // has since gone quiet, moved band, or gone away.
+    //
+    // Land *on* the session, not on a second copy of this list. A row with
+    // no session yet cannot be attached to -- starting one there is what you
+    // actually want, and it is the same one tap.
+    button.addEventListener('click', function (event) {
+      // A hold has already acted; the click the browser sends afterwards is
+      // not a second instruction.
+      if (Date.now() - actedAt < 700) { event.preventDefault(); return; }
+      go(entry.row.kind === 'session' ? 'attach' : 'shell', entry.row);
+    });
+    // Hold to act on this row without leaving the list.
+    button.addEventListener('touchstart', function (event) {
+      armHold(event, entry.row);
+    }, {passive: true});
+    button.addEventListener('touchmove', moveHold, {passive: true});
+    button.addEventListener('touchend', function (event) {
+      endHold(event);
+      flush();
+    });
+    button.addEventListener('touchcancel', function () {
+      cancelHold();
+      flush();
+    });
+    // And a mouse, so the same actions exist on a laptop.
+    button.addEventListener('contextmenu', function (event) {
+      event.preventDefault();
+      openSheet(entry.row);
+    });
+    entry.li.appendChild(button);
+
+    // The other verb. Everything the dashboard can do -- renew, kill, note,
+    // view output, ssh, new window -- acts on the highlighted row, so
+    // opening it *on* this row makes all of them reachable.
+    //
+    // On every row, not only on sessions. The sheet has three things to
+    // offer a machine with nothing running on it, and a column that exists
+    // on some rows and not others left the numbers down the right of the
+    // list ending 56px apart.
+    entry.more = document.createElement('button');
+    entry.more.className = 'more';
+    entry.more.type = 'button';
+    entry.more.textContent = '⋯';
+    entry.more.setAttribute('aria-haspopup', 'dialog');
+    entry.more.addEventListener('click', function (event) {
+      event.stopPropagation();
+      openSheet(entry.row);
+    });
+    entry.li.appendChild(entry.more);
+    return entry;
+  }
+
+  function paint(entry, row) {
+    entry.row = row;
+    entry.dot.className = 'dot ' + tierClass(row);
+
+    // A session is named by its name; a machine you could start something on
+    // is named by the machine. `<shell>` is the model's sentinel for the
+    // second, and four rows of it was this page showing an internal name to
+    // the reader and calling it a list.
+    var title = row.kind === 'session' ? row.label : row.node_label;
+    entry.name.textContent = title;
     if (row.keepalive) {
       var tag = document.createElement('span');
       tag.className = 'tag' + (row.keepalive === 'healthy' ? ''
@@ -74,79 +244,78 @@
       tag.textContent = row.keepalive === 'renewing' ? 'renewing'
                       : row.keepalive === 'paused' ? 'renew paused'
                       : 'auto-renew';
-      name.appendChild(tag);
+      entry.name.appendChild(tag);
     }
-    button.appendChild(name);
 
-    var meta = document.createElement('div');
-    meta.className = 'meta';
     // The node first: on a phone it is the thing that tells two identically
-    // named sessions apart.
-    meta.textContent = [row.node_label, row.idle_label, row.status]
-      .filter(Boolean).join(' · ');
-    button.appendChild(meta);
+    // named sessions apart. On a row named for the machine it would be the
+    // name twice.
+    // 'Active' is what a session's status says when nothing is wrong, which
+    // is almost always -- a word on every row that never varies, wrapping
+    // the line it is on. The green dot already says it. What is left is the
+    // statuses that mean something: DEGRADED, OFFLINE, No sessions.
+    var status = row.status === 'Active' ? '' : row.status;
+    entry.meta.textContent = (row.kind === 'session'
+      ? [row.node_label, row.idle_label, status]
+      : [status]).filter(Boolean).join(' · ');
 
-    var right = document.createElement('div');
-    right.className = 'right';
-    if (row.left && row.left !== '-') {
-      var left = document.createElement('b');
-      left.textContent = row.left;
-      right.appendChild(left);
+    entry.wall.textContent = (row.left && row.left !== '-') ? row.left : '';
+    paintRail(entry.rail, row);
+    entry.more.setAttribute('aria-label', 'actions for ' + title);
+  }
+
+  function syncList(rows, emptyText) {
+    if (!rows.length) {
+      kept.clear();
+      list.textContent = '';
+      var blank = document.createElement('li');
+      blank.className = 'empty';
+      blank.textContent = emptyText;
+      list.appendChild(blank);
+      return;
     }
-    if (row.load) right.appendChild(document.createTextNode(
-      row.load + (row.cpu ? '/' + row.cpu : '')));
-    button.appendChild(right);
-
-    // Land *on* the session, not on a second copy of this list. A tap that
-    // opens the dashboard is a screen that costs a tap and answers nothing,
-    // which is exactly what it did before the target rode along.
-    // A row with no session yet cannot be attached to -- there is nothing
-    // there. Starting one on that machine is what you actually want, and it
-    // is the same one tap.
-    button.addEventListener('click', function (event) {
-      // A hold has already acted; the click the browser sends afterwards is
-      // not a second instruction.
-      if (Date.now() - actedAt < 700) { event.preventDefault(); return; }
-      go(row.kind === 'session' ? 'attach' : 'shell', row);
+    var want = {};
+    var at = list.firstChild;
+    planList(rows).forEach(function (item) {
+      want[item.key] = true;
+      var entry = kept.get(item.key);
+      if (!entry) {
+        entry = item.band ? makeBand(item.band) : makeRow();
+        kept.set(item.key, entry);
+      }
+      if (item.row) paint(entry, item.row);
+      // Already in the right place, or moved there. insertBefore on an
+      // element that is already in the document moves it and keeps it --
+      // its listeners, its classes, and any gesture in progress on it.
+      if (entry.li === at) at = at.nextSibling;
+      else list.insertBefore(entry.li, at);
     });
-    // Hold to act on this row without leaving the list.
-    button.addEventListener('touchstart', function (event) {
-      armHold(event, row);
-    }, {passive: true});
-    button.addEventListener('touchmove', moveHold, {passive: true});
-    button.addEventListener('touchend', endHold);
-    button.addEventListener('touchcancel', cancelHold);
-    // And a mouse, so the same actions exist on a laptop.
-    button.addEventListener('contextmenu', function (event) {
-      event.preventDefault();
-      openSheet(row);
-    });
-    item.appendChild(button);
-
-    // The other verb. Everything the dashboard can do -- renew, kill, note,
-    // view output, ssh, new window -- acts on the highlighted row, so opening
-    // it *on* this row makes all of them reachable rather than adding a
-    // button here for each and a flag over there for each.
-    // ⋯ only where there is a session to act on. A machine with none has
-    // exactly one thing you can do to it, and the row itself does that.
-    if (row.kind === 'session') {
-      var more = document.createElement('button');
-      more.className = 'more';
-      more.type = 'button';
-      more.textContent = '⋯';
-      more.setAttribute('aria-label', 'actions for ' + row.label);
-      // The same sheet the hold opens. It used to jump straight into the
-      // console standing on this row, which is a page load and a shell for
-      // something the sheet now does in place -- and two affordances that
-      // did different things were two things to learn. What it used to do
-      // is still there, as the last item.
-      more.addEventListener('click', function (event) {
-        event.stopPropagation();
-        openSheet(row);
-      });
-      item.appendChild(more);
+    // Everything the plan did not claim now sits after it. Swept before the
+    // map is pruned, so nothing is asked to remove a node twice.
+    while (at) {
+      var next = at.nextSibling;
+      list.removeChild(at);
+      at = next;
     }
-    return item;
+    kept.forEach(function (entry, key) {
+      if (!want[key]) kept.delete(key);
+    });
+  }
+
+  // A finger is down on a row, or the sheet is standing on one. Nothing in
+  // the list may move until neither is true: a row that reorders under a
+  // thumb is a row you meant to press and did not.
+  function busy() {
+    return holdEl !== null || holdArmed !== null || !sheet.hidden;
+  }
+
+  var pending = null;
+
+  function flush() {
+    if (!pending || busy()) return;
+    var held = pending;
+    pending = null;
+    syncList(held.rows, held.empty);
   }
 
   // ── acting on a row without leaving the list ──────────────────────────
@@ -270,6 +439,8 @@
       if (done) return;
       done = true;
       sheet.hidden = true;
+      // Whatever the poll had to hold back while this was open.
+      flush();
     };
     card.addEventListener('transitionend', finish, {once: true});
     setTimeout(finish, 400);
@@ -369,15 +540,11 @@
     age.classList.toggle('stale', !!data.stale);
 
     var rows = data.sessions || [];
-    list.textContent = '';
-    if (!rows.length) {
-      var empty = document.createElement('li');
-      empty.className = 'empty';
-      empty.textContent = data.age === null ? 'connecting…' : 'no sessions';
-      list.appendChild(empty);
-    } else {
-      rows.forEach(function (row) { list.appendChild(build(row)); });
-    }
+    var empty = data.age === null ? 'connecting…' : 'no sessions';
+    // The age and any error still land: they are not under anyone's finger.
+    // The list waits, and flush() applies it the moment the gesture is over.
+    if (busy()) pending = {rows: rows, empty: empty};
+    else syncList(rows, empty);
 
     var q = data.queue || {};
     var text = (q.long || '').trim();

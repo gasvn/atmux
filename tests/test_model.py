@@ -302,6 +302,67 @@ class KeepaliveTests(unittest.TestCase):
             'renewing')
 
 
+class BandOnTheRecordTests(unittest.TestCase):
+    """The heading a row belongs under, sent rather than guessed.
+
+    The browser list had the ranks and none of the words for them, so four
+    rows nobody can attach to sat directly under four rows of real work with
+    nothing in between saying they were a different kind of thing. Naming
+    them on the client would have been a second place the bands are named,
+    and two places drift.
+    """
+
+    def test_every_rank_the_table_heads_has_a_title(self):
+        for rank, title in model.BANDS:
+            with self.subTest(rank=rank):
+                self.assertEqual(model.band_title(rank), title)
+
+    def test_the_offers_get_the_offer_title(self):
+        self.assertEqual(model.band_title(model.OFFER_RANK),
+                         model.OFFER_TITLE)
+
+    def test_a_rank_nobody_named_still_reads_as_an_offer(self):
+        """Ranks come from _attention_rank, which is the only producer, so
+        this is the shape of the fallback rather than a case that happens:
+        a heading that is the empty string is a heading that draws a blank
+        strip across the list."""
+        for rank in (5, 99, -1):
+            with self.subTest(rank=rank):
+                self.assertTrue(model.band_title(rank))
+
+    def test_a_record_carries_the_heading_it_belongs_under(self):
+        rows = model.sessions(state(n1=node([('train', 2, 0)])))
+        by_kind = {r['kind']: r for r in rows}
+        self.assertEqual(by_kind['session']['band'], model.BAND_TITLES[2])
+        self.assertEqual(by_kind['empty']['band'], model.OFFER_TITLE)
+
+    def test_an_unreachable_machine_is_headed_as_such(self):
+        st = state(n1={'alive': False, 'info': {}, 'sessions': [],
+                       'last_error': 'no route to host'})
+        self.assertEqual(model.sessions(st)[0]['band'], model.BAND_TITLES[0])
+
+    def test_the_bands_match_the_table_row_for_row(self):
+        """The one that matters. Two renderings of one derivation: if the
+        list ever heads a row differently from the table, one of them is
+        describing a sort order that is not the one on the screen."""
+        model.IDLE_HINT_SECONDS, model.IDLE_STALE_SECONDS = 300, 3600
+        st = state(busy=node([('a', 1, 10)]),
+                   idle=node([('b', 1, 900)]),
+                   stale=node([('c', 1, 9000)]),
+                   gone={'alive': False, 'info': {}, 'sessions': [],
+                         'last_error': 'down'})
+        plan = model.plan_rows(model.build_session_rows(st))
+        # The heading each row sits under, walking the table's own plan.
+        expected, heading = [], ''
+        for item in plan:
+            if item[0] == 'band':
+                heading = item[1]
+            else:
+                expected.append(heading)
+        self.assertEqual([r['band'] for r in model.sessions(st)], expected)
+        self.assertEqual(len(set(expected)), 5)   # every band exercised
+
+
 class QueueTests(unittest.TestCase):
     def test_the_queue_is_passed_through_as_text(self):
         """`squeue -l` columns differ between sites, so parsing it here to
