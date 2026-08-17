@@ -61,10 +61,32 @@ def _usable_xdg_runtime_dir(xdg: str | None) -> bool:
     )
 
 
-def _pick_base() -> str:
-    """Choose a writable, node-local runtime base dir and create it securely."""
+def _runtime_dir() -> str | None:
+    """The per-user runtime directory, however this process was started.
+
+    ``XDG_RUNTIME_DIR`` is exported by a login session and by systemd --user,
+    and is simply absent over plain ``ssh host command``. Taking that absence
+    as "there is no runtime directory" made the path depend on how you
+    happened to log in rather than on the machine: a daemon started over SSH
+    put its socket in /tmp while atmux-web under systemd looked in
+    /run/user/<uid>, so the two never met and every action from the browser
+    came back "no daemon is running on this machine" while one was.
+
+    So the variable is preferred and the conventional location is the
+    fallback -- checked the same way, because a directory nobody vouched for
+    is not somewhere to put an authenticated SSH multiplex socket.
+    """
     xdg = os.environ.get('XDG_RUNTIME_DIR')
     if _usable_xdg_runtime_dir(xdg):
+        return xdg
+    guess = f'/run/user/{_UID}'
+    return guess if _usable_xdg_runtime_dir(guess) else None
+
+
+def _pick_base() -> str:
+    """Choose a writable, node-local runtime base dir and create it securely."""
+    xdg = _runtime_dir()
+    if xdg is not None:
         base = os.path.join(xdg, 'autotmux')
         # Unix-domain socket paths are limited to roughly 104–108 bytes.  Even
         # our hashed fallback needs some filename room; a deeply nested custom

@@ -10,6 +10,59 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from autotmux import paths
 
 
+
+class RuntimeDirTests(unittest.TestCase):
+    """Where the socket goes must be a property of the machine, not of how
+    you happened to log in.
+
+    XDG_RUNTIME_DIR is exported by a login session and by systemd --user, and
+    is simply absent over `ssh host command`. Reading that absence as "there
+    is no runtime directory" put an SSH-started daemon's socket in /tmp while
+    atmux-web under systemd looked in /run/user/<uid> -- so every action from
+    the browser came back "no daemon is running on this machine" while one
+    was.
+    """
+
+    def test_the_variable_wins_when_it_is_usable(self):
+        with tempfile.TemporaryDirectory() as room:
+            good = os.path.join(room, 'rt')
+            os.mkdir(good, 0o700)
+            with mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': good}):
+                self.assertEqual(paths._runtime_dir(), good)
+
+    def test_the_conventional_place_is_the_fallback(self):
+        """Not /tmp, when the machine has the directory the spec describes
+        and every systemd process on it is already using.
+
+        The path is built from the uid rather than taken as an argument, so
+        what this pins is that the fallback is `/run/user/<uid>` and that it
+        is offered to the same check the variable goes through."""
+        conventional = f'/run/user/{paths._UID}'
+        asked = []
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('XDG_RUNTIME_DIR', None)
+            with mock.patch.object(
+                    paths, '_usable_xdg_runtime_dir',
+                    lambda value: asked.append(value) or value == conventional):
+                self.assertEqual(paths._runtime_dir(), conventional)
+        self.assertIn(conventional, asked, 'the fallback was never vetted')
+
+    def test_an_unvouched_directory_is_still_refused(self):
+        """The fallback is checked the same way as the variable. A directory
+        nobody vouched for is not somewhere to put an authenticated SSH
+        multiplex socket."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('XDG_RUNTIME_DIR', None)
+            with mock.patch.object(paths, '_usable_xdg_runtime_dir',
+                                   lambda value: False):
+                self.assertIsNone(paths._runtime_dir())
+
+    def test_a_machine_without_one_still_gets_a_base(self):
+        """macOS has no /run/user at all, and must keep the /tmp base it
+        has always had."""
+        with mock.patch.object(paths, '_runtime_dir', lambda: None):
+            self.assertTrue(paths._pick_base().startswith('/tmp/autotmux_'))
+
 class PickBaseTests(unittest.TestCase):
     def setUp(self):
         self._saved = os.environ.get('XDG_RUNTIME_DIR')
