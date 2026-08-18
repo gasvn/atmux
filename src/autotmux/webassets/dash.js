@@ -681,6 +681,13 @@
       if (row.node) url.searchParams.set('shell', row.node);
     } else if (row.kind === 'session' && row.node && row.session) {
       url.searchParams.set(verb, row.node + ':' + row.session);
+    } else if (verb === 'select' && row.node) {
+      // A machine has no session to name, and used to send nothing at all --
+      // so "More actions…" on one opened a console standing on whatever the
+      // dashboard happened to select, which is the same screen as having
+      // pressed nothing. The node alone lands on its own row, which is the
+      // row `n` and Enter act on.
+      url.searchParams.set(verb, row.node);
     }
     // Carried, because this is the one navigation between the list and the
     // terminal: a readout you can only reach by typing ?attach=NODE:SESSION

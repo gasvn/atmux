@@ -5322,6 +5322,124 @@ class DashboardListTests(unittest.TestCase):
         self.assertNotIn(b'\x01', raw)
 
 
+class FreshAfterAChangeTests(unittest.TestCase):
+    """The moment after something has been changed rather than read.
+
+    The daemon applies a kill or a new session to its published state at
+    once. This cache did not, and answered the page's follow-up poll from the
+    previous tick -- measured through the running server, 4.0s before a new
+    session appeared and 7.1s before a killed one left. What the reader saw
+    in between was the list they already had, which is exactly what a button
+    that does nothing looks like.
+    """
+
+    def setUp(self):
+        from autotmux import statesource
+        self.statesource = statesource
+
+    class Pool:
+        """A fetch that can be held open, so the race can be arranged."""
+
+        def __init__(self):
+            self.calls = 0
+            self.gate = threading.Event()
+            self.gate.set()
+            self.entered = threading.Event()
+
+        def fetch_state(self):
+            self.calls += 1
+            self.entered.set()
+            self.gate.wait(5)
+            return True, {'nodes': {}}
+
+    def source(self, pool):
+        made = self.statesource.StateSource(pool=pool, refresh=30.0)
+        self.addCleanup(made.stop)
+        return made
+
+    def test_it_fetches_now_rather_than_at_the_next_tick(self):
+        pool = self.Pool()
+        source = self.source(pool)
+        source.start()
+        for _ in range(200):                     # the loop's first fetch
+            if pool.calls:
+                break
+            time.sleep(0.01)
+        before = pool.calls
+        self.assertTrue(source.refresh_now(timeout=5.0))
+        self.assertGreater(pool.calls, before)
+
+    def test_it_waits_for_a_fetch_that_began_after_the_ask(self):
+        """The one that makes this true rather than merely fast. The loop is
+        often already inside a fetch, and that fetch read the world before
+        the change existed -- counting completions alone would hand the
+        caller a stale answer as if it were its own."""
+        pool = self.Pool()
+        source = self.source(pool)
+        pool.gate.clear()                        # hold the first fetch open
+        source.start()
+        self.assertTrue(pool.entered.wait(5), 'the loop never fetched')
+        started = pool.calls
+        done = []
+
+        def ask():
+            done.append(source.refresh_now(timeout=5.0))
+
+        waiter = threading.Thread(target=ask)
+        waiter.start()
+        time.sleep(0.2)
+        self.assertEqual(done, [], 'returned while the stale fetch was in flight')
+        pool.gate.set()
+        waiter.join(5)
+        self.assertEqual(done, [True])
+        # The in-flight one, and then one that started after the ask.
+        self.assertGreaterEqual(pool.calls, started + 1)
+
+    def test_a_stuck_gateway_does_not_hold_the_request_open(self):
+        """Past the timeout the answer still goes back, just without the
+        change in it yet, and the ordinary poll picks it up as it always
+        did."""
+        pool = self.Pool()
+        pool.gate.clear()
+        source = self.source(pool)
+        source.start()
+        self.assertTrue(pool.entered.wait(5))
+        start = time.monotonic()
+        self.assertFalse(source.refresh_now(timeout=0.3))
+        self.assertLess(time.monotonic() - start, 3.0)
+        pool.gate.set()
+
+    def test_a_source_with_no_loop_fetches_on_the_spot(self):
+        """No thread to wake, so waiting on one would wait forever."""
+        pool = self.Pool()
+        source = self.source(pool)
+        self.assertTrue(source.refresh_now(timeout=1.0))
+        self.assertEqual(pool.calls, 1)
+
+    def test_a_failed_fetch_still_releases_the_caller(self):
+        """Counted however it went: a caller waiting for its change must not
+        be left waiting on a gateway that is simply down."""
+        class Broken:
+            def fetch_state(self):
+                raise OSError('no route to host')
+
+        source = self.source(Broken())
+        source.start()
+        self.assertTrue(source.refresh_now(timeout=5.0))
+
+    def test_a_change_that_went_through_is_read_back_before_answering(self):
+        """And a refusal is not: nothing changed, so there is nothing to
+        re-read, and an SSH round trip per rejected press is a cost paid for
+        no reason."""
+        import inspect
+        handler = inspect.getsource(web.Handler.do_POST)
+        self.assertIn('refresh_now', handler)
+        after = handler[handler.index("if answer.get('ok'):"):]
+        self.assertIn('refresh_now', after)
+        # Nowhere else in the method: a refused verb changed nothing.
+        self.assertEqual(handler.count('refresh_now'), 1)
+
+
 class DashboardStateTests(unittest.TestCase):
     """What /api/state promises a client, without a server in the way."""
 
@@ -5461,14 +5579,63 @@ class AttachTargetTests(_ServedFixture):
         """This arrives in a URL, and a URL is untrusted: anyone who can
         reach this socket can craft one. Refusing leaves the dashboard, which
         is the safe thing to open."""
-        for value in ('--version', '-rf:x', 'nocolon', 'node:sess;rm -rf /',
+        for value in ('--version', '-rf:x', 'node:sess;rm -rf /',
                       'a' * 200 + ':b', 'n:s\nmore', '', ':', 'n:', ':s',
-                      '$(id):x', '../../etc:passwd'):
+                      '$(id):x', '../../etc:passwd', 'n:s:more'):
             for verb in ('attach', 'select'):
                 with self.subTest(verb=verb, value=value):
                     path = (f'/ws?{verb}='
                             + urllib.parse.quote(value, safe=''))
                     self.assertEqual(self.argv_for(path), list(self.COMMAND))
+        # A bare node is a target for one of them and not the other: there is
+        # a row for a machine, and there is no session on it to attach to.
+        self.assertEqual(self.argv_for('/ws?attach=nocolon'),
+                         list(self.COMMAND))
+        self.assertEqual(self.argv_for('/ws?select=nocolon'),
+                         list(self.COMMAND) + ['--select=nocolon'])
+
+    def test_a_machine_row_can_be_stood_on(self):
+        """"More actions…" on a machine used to send nothing at all -- go()
+        had a branch for a session and a branch for a shell and no third one
+        -- so it opened a console standing on whatever the dashboard happened
+        to select. That is the same screen as having pressed nothing, which
+        is what "很多功能都是假的" was about."""
+        self.assertEqual(self.argv_for('/ws?select=holygpu8a15504'),
+                         list(self.COMMAND) + ['--select=holygpu8a15504'])
+        # And it is still one argv element that cannot be read as an option.
+        extra = self.argv_for('/ws?select=holygpu8a15504')[len(self.COMMAND):]
+        self.assertEqual(len(extra), 1)
+
+    def test_the_two_shapes_select_takes_are_both_anchored(self):
+        """Composing this pattern from the other two produced `^A:B|C$`,
+        where the alternation binds looser than the anchors -- the first
+        branch had no `$` left on it, so `gpu1:train:anything` matched as a
+        prefix and was passed straight on."""
+        for good in ('gpu1:train', 'gpu1', 'localhost',
+                     'login--zgx:autoscientists', 'a.b-c_@1'):
+            with self.subTest(good=good):
+                self.assertTrue(web.Handler._SELECT.match(good), good)
+        for bad in ('gpu1:train:evil', 'gpu1:', ':train', '-x', 'a b', '',
+                    'a' * 121, 'gpu1:' + 'b' * 121, 'gpu1\ntrain'):
+            with self.subTest(bad=bad):
+                self.assertIsNone(web.Handler._SELECT.match(bad), bad)
+
+    def test_the_page_forwards_every_verb_the_server_accepts(self):
+        """The contract this file exists for, and the one nothing checked.
+
+        The page navigates to console/?shell=NODE and app.js rebuilds the
+        query for the socket -- which is where the server reads it, because
+        that is when the pty is made. `shell` was missing from that rebuild
+        and from nowhere else, so tapping a machine and "Open a shell here"
+        both landed on a plain dashboard: the one screen that looks enough
+        like success to be mistaken for it.
+        """
+        with open(os.path.join(web.ASSETS, 'app.js'), encoding='utf-8') as f:
+            js = f.read()
+        forwarded = re.search(r"\[([^\]]*)\]\.forEach\(function \(verb\)", js)
+        self.assertIsNotNone(forwarded, 'app.js forwards no verbs at all')
+        names = set(re.findall(r"'(\w+)'", forwarded.group(1)))
+        self.assertEqual(names, set(web.Handler._VERBS))
 
     def test_the_socket_closes_saying_the_program_finished(self):
         """A phone drops this socket every time it locks, so the page

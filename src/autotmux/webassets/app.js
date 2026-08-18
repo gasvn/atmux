@@ -89,10 +89,20 @@
     //   attach  which session to land in, forwarded from the page's own URL
     //           so that tapping a row on the list goes to that session
     //           rather than to a second copy of the list
+    //   select  land on that row, where every other action reaches it
+    //   shell   there is no session yet -- start one, on that machine
+    //
+    // All three the server accepts, and every one it accepts. `shell` was
+    // missing here and nowhere else: the dashboard wrote console/?shell=NODE,
+    // this page dropped it on the way to the socket, and the server -- which
+    // reads the query off the *socket* URL, because that is when the pty is
+    // made -- saw nothing to open. So tapping a machine, and "Open a shell
+    // here", both landed on a plain dashboard: the one screen that looks
+    // enough like success to be mistaken for it.
     var query = [];
     if (touch) query.push('touch=1');
     var here = new URLSearchParams(location.search);
-    ['attach', 'select'].forEach(function (verb) {
+    ['attach', 'select', 'shell'].forEach(function (verb) {
       var target = here.get(verb);
       if (target) query.push(verb + '=' + encodeURIComponent(target));
     });

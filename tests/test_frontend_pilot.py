@@ -731,8 +731,17 @@ class FrontendPilotTests(unittest.IsolatedAsyncioTestCase):
                 app._render_preview_now()
                 await pilot.pause()
                 text = str(app.log_view.render())
-                self.assertIn('gpu1:train', text)
-                self.assertIn('connecting', text)
+                head = text.splitlines()[0]
+                # The heading, which is what this is about. Not the body: on
+                # a machine with a live daemon the body may be "connecting",
+                # or already "node is no longer allocated", or not there yet
+                # at all -- three legitimate states, and which one lands is a
+                # race with an IPC round trip. Pinning one made this fail on a
+                # loaded machine and pass on an idle one, which is worse than
+                # not checking it. The heading is the invariant, and the
+                # invariant is what the name promises.
+                self.assertIn('gpu1:train', head)
+                self.assertIn('3: scroll', head)
 
     async def test_ages_are_read_at_a_glance_rather_than_converted(self):
         """Every age on this screen was raw seconds, which is fine for the
@@ -1847,6 +1856,51 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
             row = table_row(app, 'quiet')
             self.assertTrue(
                 str(app.table.get_cell_at(Coordinate(row, 0))).startswith('● 2h'))
+
+class SelectTargetTests(unittest.TestCase):
+    """What a browser may ask the dashboard to stand on.
+
+    Same scepticism as --attach: this reaches the process from a URL by way
+    of the web server, and a value that is not a target should open the
+    dashboard rather than something surprising.
+    """
+
+    def test_a_session_row_is_named_by_both_halves(self):
+        self.assertEqual(autotmux._valid_select('gpu1:train'),
+                         ('gpu1', 'train'))
+        self.assertEqual(autotmux._valid_select('localhost:x'),
+                         ('localhost', 'x'))
+
+    def test_a_machine_lands_on_its_own_row(self):
+        """A machine has no session to name. The row it does have is the one
+        `n` and Enter act on, so a bare node means that row -- otherwise
+        "More actions…" on a machine sends nothing and opens a console
+        standing on whatever was already selected."""
+        for node in ('gpu1', 'localhost', 'login--zgx'):
+            with self.subTest(node=node):
+                self.assertEqual(autotmux._valid_select(node),
+                                 (node, autotmux._START_SHELL_SESSION))
+
+    def test_the_row_it_names_is_a_row_that_exists(self):
+        """The sentinel is not a name this invents: it is what the model
+        calls that row, and matching it is what makes the cursor land."""
+        state = state_with_offer()
+        rows = autotmux.build_session_rows(state)
+        wanted = autotmux._valid_select('gpu1')
+        self.assertIn(wanted, [(r[0], r[1]) for r in rows])
+
+    def test_nothing_else_is_a_target(self):
+        for value in ('', ':', 'gpu1:', ':train', '-oProxyCommand=x',
+                      'a b', 'gpu1:train:more', None, 5, 'a' * 200):
+            with self.subTest(value=value):
+                self.assertIsNone(autotmux._valid_select(value))
+
+
+def state_with_offer():
+    return {'nodes': {'gpu1': {'alive': True,
+                               'info': {'time': '1:00:00', 'sessions': []},
+                               'sessions': [], 'last_error': ''}}}
+
 
 class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
     """`z` trades panes for room.
@@ -3145,10 +3199,12 @@ class PreselectedRowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(autotmux.config.load_layout(), 'jobs')
 
     async def test_a_target_that_is_not_one_is_refused_before_it_gets_here(self):
-        for value in ('--version', 'nocolon', '', ':', 'n:', ':s', None,
-                      'a b:c'):
+        for value in ('--version', '', ':', 'n:', ':s', None, 'a b:c',
+                      'n:s:more'):
             with self.subTest(value=value):
                 self.assertIsNone(autotmux._valid_select(value))
+        # A bare node is a target now: it names the machine's own row, which
+        # is what "More actions…" on a machine had nothing to send before.
         self.assertEqual(autotmux._valid_select('gpu1:train'),
                          ('gpu1', 'train'))
 

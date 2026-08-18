@@ -441,6 +441,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({'ok': False,
                         'reason': ' '.join(str(error).split())[:200]}, 502)
             return
+        if answer.get('ok'):
+            # The world just changed, so read it again before saying so.
+            # The daemon applies a kill or a new session to its published
+            # state at once; this server's cache did not, and answered the
+            # page's follow-up poll from the previous tick -- measured
+            # through the running server, 4.0s before a new session appeared
+            # and 7.1s before a killed one left. What the reader saw in
+            # between was the list they already had, which is exactly what a
+            # button that does nothing looks like.
+            source = self.server.state
+            if source is not None:
+                try:
+                    source.refresh_now()
+                except Exception:
+                    pass                # the ordinary poll still picks it up
         self._json(answer, 200 if answer.get('ok') else 409)
 
     def _same_origin(self) -> bool:
@@ -670,6 +685,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          r':(?![-])[A-Za-z0-9._@-]{1,120}$')
     # A node on its own, for the row that has no session yet.
     _NODE = re.compile(r'^(?![-])[A-Za-z0-9._@-]{1,120}$')
+    # Either shape, for `select`: a session row sends NODE:SESSION, and a
+    # machine row -- which has no session to name -- sends the node alone and
+    # lands on its "start something here" row. Same character class and the
+    # same refusal of a leading dash either way; only the colon is optional.
+    #
+    # Written out rather than composed from the two above. Gluing their
+    # sources with `|` produced `^A:B|C$`, where the alternation binds looser
+    # than the anchors -- the first branch had no `$` left on it, so
+    # `gpu1:train:anything` matched as a prefix. Anchored both ends here.
+    _SELECT = re.compile(r'^(?![-])[A-Za-z0-9._@-]{1,120}'
+                         r'(?::(?![-])[A-Za-z0-9._@-]{1,120})?$')
 
     def _query(self) -> dict:
         raw = self.path.split('?', 1)[1] if '?' in self.path else ''
@@ -694,7 +720,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     #   select  land on that row, where every other action reaches it
     #   shell   there is no session yet -- start one, on that machine
     _VERBS = {'attach': ('--attach', _ATTACH),
-              'select': ('--select', _ATTACH),
+              'select': ('--select', _SELECT),
               'shell': ('--shell', _NODE)}
 
     def _client_argv(self) -> list:

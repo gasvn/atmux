@@ -6765,18 +6765,31 @@ def _published_direct_preference(node: str) -> bool:
 
 
 def _valid_select(target) -> tuple[str, str] | None:
-    """`NODE:SESSION` for --select, or None.
+    """`NODE:SESSION`, or a bare `NODE`, for --select. None if neither.
 
     Same shape and the same scepticism as --attach: this reaches the process
     from a browser URL by way of the web server, and a value that is not a
     target should open the dashboard rather than something surprising.
+
+    A bare node lands on that machine's "start something here" row, which is
+    a real row and the one `n` and Enter act on. Without it the browser's
+    "More actions…" on a machine had nothing to send -- it opened a console
+    standing on nothing, which is the same screen as having pressed nothing.
     """
-    if not isinstance(target, str) or ':' not in target:
+    if not isinstance(target, str) or not 0 < len(target) <= 241:
         return None
-    node, _, session = target.partition(':')
-    if not node or not session:
+    node, sep, session = target.partition(':')
+    if not node or len(node) > 120:
         return None
     if node != 'localhost' and not _valid_node(node):
+        return None
+    if not sep:
+        return node, _START_SHELL_SESSION
+    # One colon, not the first of several. tmux reads ':' and '.' inside a
+    # target as a window and a pane, so a name carrying one can never be
+    # addressed reliably afterwards -- which is why NEW_SESSION_RE refuses
+    # them at the other end. A row named with one is a row nothing can act on.
+    if not session or len(session) > 120 or ':' in session:
         return None
     return node, session
 

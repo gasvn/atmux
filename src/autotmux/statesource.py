@@ -72,6 +72,18 @@ class StateSource:
         self._error = ''
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        # Set to ask the loop to fetch now rather than at the next tick, and
+        # bumped once each attempt so a caller can tell "mine has landed"
+        # from "one was already in flight when I asked".
+        self._wake = threading.Event()
+        # Two counts, not one. A caller that only watched completions could
+        # be handed a fetch that *began* before its change existed -- the
+        # loop is often already inside one -- and would report a stale answer
+        # as its own. Waiting for a fetch that started after the ask is the
+        # only version of this that is true.
+        self._started = 0
+        self._finished = 0
+        self._fetched = threading.Condition()
 
     # ── the pool ─────────────────────────────────────────────────────────
 
@@ -107,14 +119,31 @@ class StateSource:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             self.refresh()
-            self._stop.wait(self._refresh)
+            # Whichever comes first: the ordinary tick, or somebody having
+            # just changed the world and wanting the change back.
+            self._wake.wait(self._refresh)
+            self._wake.clear()
 
     def refresh(self) -> bool:
         """Fetch once. Returns whether it produced a usable state."""
+        with self._fetched:
+            self._started += 1
+        try:
+            return self._fetch()
+        finally:
+            # Counted however it went, including on failure: a caller waiting
+            # for its change to appear must not be left waiting on a gateway
+            # that is simply down.
+            with self._fetched:
+                self._finished += 1
+                self._fetched.notify_all()
+
+    def _fetch(self) -> bool:
         try:
             if self._pool is not None:
                 ok, state = self._pool.fetch_state()
@@ -133,6 +162,38 @@ class StateSource:
             self._fetched_at = self._clock()
             self._ok = True
             self._error = ''
+        return True
+
+    def refresh_now(self, timeout: float = 2.0) -> bool:
+        """Fetch as soon as the loop can, and wait for it. True if it landed.
+
+        For the moment after something has been *changed* rather than read.
+        The daemon applies a kill or a new session to its published state
+        immediately, and this cache still answered from the previous tick --
+        measured through the running server: 4.0s before a new session
+        appeared and 7.1s before a killed one left. The page polls this cache
+        the instant its request returns, so what the reader saw was the list
+        they already had, which is what a button that does nothing looks like.
+
+        Bounded, because a slow gateway must not hold a request open: past
+        the timeout the answer still goes back, just without the change in it
+        yet, and the ordinary poll picks it up as it always did.
+        """
+        if self._thread is None:
+            return self.refresh()
+        with self._fetched:
+            # The fetch that answers this one is the (started + 1)-th, so it
+            # is done when that many have finished. If one is already in
+            # flight this waits for both, which is the point.
+            want = self._started + 1
+        self._wake.set()
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._fetched:
+            while self._finished < want:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._fetched.wait(left)
         return True
 
     # ── reading ──────────────────────────────────────────────────────────
