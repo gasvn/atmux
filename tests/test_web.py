@@ -53,6 +53,17 @@ def _extract(source: str, name: str) -> str:
     raise AssertionError(f'unbalanced braces in {name}')
 
 
+def _declarations(block: str) -> str:
+    """A CSS rule's declarations, with its comments taken out.
+
+    Assertions in this file have matched a comment rather than a declaration
+    more than once, and this is the worst version of it: a comment saying why
+    a property is *not* used is exactly the text an assertNotIn on that
+    property finds.
+    """
+    return re.sub(r'/\*.*?\*/', '', block, flags=re.S)
+
+
 def _extract_list(source: str, name: str) -> str:
     """One top-level `var NAME = [...]` out of app.js, by bracket depth.
 
@@ -1386,7 +1397,7 @@ class TouchKeypadTests(unittest.TestCase):
         # Backgrounds are the panel behind each: the sheet is flat #17171d so
         # a pinned heading can sit on it invisibly, and the grip is #141418.
         for selector, background in (('.ghead', '#17171d'),
-                                     ('body.touch.nopad #grip', '#141418')):
+                                     ('#edge button', '#141418')):
             with self.subTest(selector=selector):
                 measured = ratio(colour_of(selector), background)
                 self.assertGreaterEqual(
@@ -1867,6 +1878,87 @@ class SafeAreaTests(unittest.TestCase):
         # Hidden chrome, not hidden overflow: wheel scrollback still works.
         self.assertNotIn('overflow-y: hidden', viewport.group(1))
         self.assertIn('::-webkit-scrollbar', self.html)
+
+
+class BottomEdgeTests(unittest.TestCase):
+    """What is on screen when the console has just opened.
+
+    The pad arrives collapsed, deliberately: a session should land in a full
+    screen of terminal. That put `‹ list` -- which lives in the settings row
+    inside the pad -- at 0x0 on the screen you land on, so the only way back
+    to the session list was a browser gesture this page is built not to have
+    (it is installed to the home screen). What was left was the handle, 26px
+    tall, below anyone's minimum.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(web.ASSETS, 'index.html'), encoding='utf-8') as f:
+            cls.html = f.read()
+        with open(os.path.join(web.ASSETS, 'app.js'), encoding='utf-8') as f:
+            cls.js = f.read()
+        start = cls.html.index('<div id="edge">')
+        cls.edge = cls.html[start:cls.html.index('</div>', start)]
+
+    def test_the_way_out_is_on_the_strip_that_is_always_there(self):
+        for what in ('id="exit"', 'id="grip"'):
+            with self.subTest(what=what):
+                self.assertIn(what, self.edge)
+        self.assertIn('‹ list', self.edge)
+
+    def test_the_strip_appears_exactly_where_the_pad_does_not(self):
+        """One or the other, never neither: the pad's own row has `‹ list`
+        in it, so a second copy while it is open would be two of the same
+        button."""
+        self.assertIn('body.touch.nopad #pad { display: none; }', self.html)
+        self.assertIn('body.touch.nopad #edge {', self.html)
+        self.assertIn('#edge { display: none; }', self.html)
+
+    def test_both_targets_clear_the_minimum(self):
+        rule = re.search(r'#edge button \{(.*?)\}', self.html, re.S)
+        self.assertIsNotNone(rule)
+        size = re.search(r'min-height:\s*(\d+)px', rule.group(1))
+        self.assertIsNotNone(size)
+        self.assertGreaterEqual(int(size.group(1)), 44)
+
+    def test_a_short_screen_may_shrink_it_but_not_below_the_other_floor(self):
+        """Height is the one dimension a short screen cannot spend, and 40 is
+        Android's minimum where 44 is Apple's -- the same trade the keys
+        make. This strip carries the only way back, so not below that."""
+        block = re.search(
+            r'@media \(orientation: landscape\)[^{]*\{(.*?)\n  \}',
+            self.html, re.S)
+        self.assertIsNotNone(block)
+        rule = re.search(r'#edge button \{([^}]*)\}', block.group(1))
+        if rule is None:
+            return                      # not shrunk there at all, which is fine
+        size = re.search(r'min-height:\s*(\d+)px', rule.group(1))
+        self.assertIsNotNone(size)
+        self.assertGreaterEqual(int(size.group(1)), 40)
+
+    def test_the_two_back_buttons_cannot_drift_apart(self):
+        """Two elements, one meaning, never both on screen. One handler, so
+        they cannot come to do different things -- which is what "one
+        affordance" is actually about."""
+        self.assertIn("['back', 'exit'].forEach", self.js)
+        # And exactly one place that sends the detach.
+        self.assertEqual(self.js.count("prefixSeq + 'd'"), 1)
+
+    def test_a_key_label_breaks_at_its_spaces(self):
+        """`overflow-wrap: anywhere` puts a break opportunity between every
+        pair of letters, and `hyphens: auto` then supplies a hyphen for it:
+        measured on a 72px key, "New window" came out "New win-dow" and
+        "Auto-renew job" came out "Auto-re / new job"."""
+        rule = re.search(r'\n  \.key \{(.*?)\n  \}', self.html, re.S)
+        self.assertIsNotNone(rule)
+        body = _declarations(rule.group(1))
+        self.assertIn('overflow-wrap: break-word', body)
+        self.assertNotIn('overflow-wrap: anywhere', body)
+        self.assertNotIn('hyphens: auto', body)
+        # Still wrapping, not clipping: a truncated label is a button whose
+        # meaning you have to already know.
+        self.assertIn('white-space: normal', body)
+        self.assertNotIn('text-overflow', body)
 
 
 class BackgroundColourTests(unittest.TestCase):
@@ -4455,15 +4547,21 @@ That reasoning was about the clipboard, which needs a user gesture. The
               [!!document.body._cls.nopad, store[PAD_STATE]]));'''),
             [True, 'hidden'])
 
-    def test_hiding_it_leaves_exactly_one_way_back(self):
+    def test_hiding_it_leaves_a_way_back_to_both_places(self):
         """A hidden pad with no way back is a terminal you have to reload to
-        type in. The grip is outside #pad, so hiding the pad cannot hide it."""
+        type in. The strip is outside #pad, so hiding the pad cannot hide it.
+
+        Both places, now: to the keys, and to the session list. This page
+        opens with the pad collapsed, so `‹ list` inside the pad was 0x0 on
+        the screen you land on -- and it is installed to the home screen,
+        where there is no browser chrome to fall back on."""
         self.assertIn('id="grip"', self.html)
+        self.assertIn('id="exit"', self.html)
         pad = self.html[self.html.index('<div id="pad">'):]
-        self.assertLess(pad.index('</div>'), pad.index('id="grip"'))
+        self.assertLess(pad.index('</div>'), pad.index('id="edge"'))
         css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
         self.assertRegex(css, r'body\.touch\.nopad #pad \{[^}]*display: none')
-        self.assertRegex(css, r'body\.touch\.nopad #grip \{[^}]*display: block')
+        self.assertRegex(css, r'body\.touch\.nopad #edge \{[^}]*display: flex')
 
     def test_the_controls_all_fit_across_a_phone(self):
         """Seven buttons and a spacer in 390px. Measured in a browser --
@@ -4485,7 +4583,7 @@ That reasoning was about the clipboard, which needs a user gesture. The
         self.assertEqual(controls,
                          ['selcopy', 'selpaste', 'seldone', 'hist', 'newbuild',
                           'edit', 'grab', 'back', 'fontminus', 'fontauto',
-                          'fontplus', 'kbd', 'sel', 'hide', 'grip'])
+                          'fontplus', 'kbd', 'sel', 'hide', 'exit', 'grip'])
         row = self.html[self.html.index('<div id="tabs">'):]
         row = row[:row.index('</div>')]
         self.assertEqual(re.findall(r'<button id="(\w+)"', row),

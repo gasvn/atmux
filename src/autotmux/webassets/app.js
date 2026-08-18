@@ -1448,14 +1448,21 @@
   // seventh into the sheet under `tmux`, and this page is built to be
   // installed to the home screen, where there is no browser chrome to fall
   // back on.
-  var backButton = document.getElementById('back');
-  keepFocus(backButton);
-  if (backButton) backButton.addEventListener('click', function (event) {
-    event.preventDefault();
-    // Through typed(), so that reading history is left first: sending the
-    // prefix into a pane that is still in copy-mode reaches nothing at all.
-    typed(prefixSeq + 'd');
-    haptic();
+  // Two elements, one meaning, and never both on screen: `#back` is in the
+  // settings row inside the pad, `#exit` is on the strip that is all there
+  // is when the pad is hidden. One handler, so they cannot drift into doing
+  // different things -- which is what "one affordance" is actually about.
+  ['back', 'exit'].forEach(function (id) {
+    var button = document.getElementById(id);
+    if (!button) return;
+    keepFocus(button);
+    button.addEventListener('click', function (event) {
+      event.preventDefault();
+      // Through typed(), so that reading history is left first: sending the
+      // prefix into a pane still in copy-mode reaches nothing at all.
+      typed(prefixSeq + 'd');
+      haptic();
+    });
   });
 
   // ── getting out of the way ────────────────────────────────────────────

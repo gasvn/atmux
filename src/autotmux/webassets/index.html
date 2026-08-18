@@ -287,21 +287,29 @@
   #pins { flex: 0 0 auto; padding: 5px 7px 0; }
   /* Hidden means hidden: no smaller pad, no row of controls left behind. */
   body.touch.nopad #pad { display: none; }
-  #grip { display: none; }
-  body.touch.nopad #grip {
-    flex: 0 0 auto; display: block; width: 100%;
-    /* Short, but it sits on the bottom edge -- a thumb cannot overshoot the
-       end of the screen, so the target is larger than its height. */
-    height: calc(26px + env(safe-area-inset-bottom));
-    padding: 0 0 env(safe-area-inset-bottom);
-    background: #141418; border: 0; border-top: 1px solid #2a2a30;
-    /* Raised from #6e6e78, which measured 3.64:1 here. This strip is the only
-       way back to the keys once they are hidden; it cannot be the hardest
-       thing on the screen to see. */
+  #edge { display: none; }
+  body.touch.nopad #edge {
+    flex: 0 0 auto; display: flex; align-items: stretch; width: 100%;
+    background: #141418; border-top: 1px solid #2a2a30;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  #edge button {
+    /* 44, not the 26 the handle used to be. It sits on the bottom edge, so
+       a thumb cannot overshoot it downward -- but there are two targets
+       here now, and 26px of height between them is a row a thumb has to
+       aim at rather than land on. */
+    min-height: 44px; border: 0; background: none;
+    /* Raised from #6e6e78, which measured 3.64:1 here. This strip is the
+       only way back to the keys once they are hidden, and now the only way
+       back to the list; it cannot be the hardest thing on screen to see. */
     color: #9096a0; font: 13px/1 ui-monospace, Menlo, monospace;
     -webkit-tap-highlight-color: transparent;
   }
-  body.touch.nopad #grip:active { background: #26262c; }
+  #edge button:active { background: #26262c; }
+  /* The way out on the left, where the back gesture already lives, and the
+     handle taking the rest -- it is the one you reach for without looking. */
+  #exit { flex: 0 0 auto; padding: 0 16px; border-right: 1px solid #2a2a30; }
+  #grip { flex: 1 1 auto; }
 
   /* ── selecting text ───────────────────────────────────────────────────
      Two things kept a finger from ever selecting anything. xterm's own
@@ -646,10 +654,16 @@
     /* The labels are the app's own descriptions -- "Auto-renew job", not a
        bare `k` -- so they wrap rather than clip. A truncated label is a
        button whose meaning you have to already know, which is the problem
-       these replaced. */
+       these replaced.
+       At the spaces, though. `anywhere` puts a break opportunity between
+       every pair of letters and `hyphens: auto` then supplies a hyphen for
+       it, so "New window" came out as "New win-dow" and "Auto-renew job" as
+       "Auto-re / new job": two labels a reader has to reassemble.
+       `break-word` splits inside a word only when the word alone will not
+       fit, which is the case these were written for. */
     font: 11px/1.15 ui-monospace, SFMono-Regular, Menlo, monospace;
     letter-spacing: .01em;
-    white-space: normal; overflow-wrap: anywhere; hyphens: auto;
+    white-space: normal; overflow-wrap: break-word; hyphens: manual;
     -webkit-tap-highlight-color: transparent;
     /* None on the fixed rows: there is nothing under them to scroll, and a
        drag through them must not move something else. The drawer overrides
@@ -832,7 +846,11 @@
     .key { min-height: 40px; }
     #nav .key.glyph { font-size: 16px; }
     #tabs button { min-height: 40px; }
-    #grip { height: calc(22px + env(safe-area-inset-bottom)); }
+    /* Height is the one dimension a short screen cannot spend, and 40 is
+       Android's floor where 44 is Apple's -- the same trade the keys make
+       four rules up. Not below that: this strip carries the only way back
+       to the list. */
+    #edge button { min-height: 40px; }
   }
 </style>
 </head>
@@ -969,9 +987,19 @@
       <button id="hide" aria-label="hide the keys">hide</button>
     </div>
   </div>
-  <!-- The way back, and the only thing left when the pad is hidden. At the
-       very bottom edge, where a thumb cannot overshoot it. -->
-  <button id="grip" aria-label="show the keys">⌃</button>
+  <!-- All that is left when the pad is hidden, at the very bottom edge where
+       a thumb cannot overshoot it.
+
+       It used to be the handle alone, and the handle alone was a trap: this
+       page opens with the pad collapsed -- deliberately, so a session lands
+       in a full screen of terminal -- and `‹ list` lives in the settings row
+       inside the pad, so a console you had just opened had no visible way
+       back to the list. Measured: `‹ list` was 0x0 until the pad was up.
+       Two targets now, and the strip is 44 tall rather than 26. -->
+  <div id="edge">
+    <button id="exit" aria-label="back to the session list">‹ list</button>
+    <button id="grip" aria-label="show the keys">⌃</button>
+  </div>
 </div>
 <div id="status"></div>
 <!-- Shown until the terminal actually starts. A Content-Security-Policy that
