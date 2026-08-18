@@ -267,7 +267,17 @@
   /* Movement sits closest to the thumb and stays put. Nothing below it may
      reflow it: a navigation key that moves because the app published a
      different number of actions is a key you have to look for every time. */
-  #nav { flex: 0 0 auto; padding: 7px 7px 0; }
+  /* Two clusters side by side: the modifiers you press once, and the four
+     you press over and over. Both three wide and two deep, so the row is the
+     height it always was and the cross keeps its shape when the phone turns.
+     The movement cluster is the narrower of the two -- its labels are single
+     glyphs, and `ctrl` is a word. */
+  #nav { flex: 0 0 auto; padding: 7px 7px 0; display: flex; gap: 5px; }
+  .navmods, .dpad {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px;
+  }
+  .navmods { flex: 1 1 auto; }
+  .dpad { flex: 0 0 44%; }
   /* Five across a 390px phone is 70px each, so `ctrl` fits on one line at the
      same size as everything else. The 11px this used to run at existed only
      to squeeze ten keys into a single row, which also left them 33px wide --
@@ -627,6 +637,16 @@
   .krow { display: flex; gap: 5px; margin-bottom: 5px; }
   .krow .key { flex: 1 1 0; min-width: 0; }
   .key.gap { background: none; border-color: transparent; }
+  /* The one key on this pad that ends what you are looking at. It sat beside
+     `new win` in the same grey, which is the pad reading as an
+     undifferentiated slab in the place it matters most. Not red -- nothing
+     is lost and it is not a warning -- just plainly a different kind of
+     thing from the keys that type. */
+  .key.leave { color: var(--label); box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.45),
+      inset 2px 0 0 #7a6a3a,
+      0 1px 2px rgba(0, 0, 0, 0.55); }
   /* ── the panel ────────────────────────────────────────────────────────
      A terminal is an instrument, not an app, so the pad is built as one: a
      key is a machined cap sitting proud of the surface, lit from above, with

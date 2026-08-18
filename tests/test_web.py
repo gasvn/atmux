@@ -1281,9 +1281,13 @@ class TouchKeypadTests(unittest.TestCase):
         attaches on a single click, so routing taps into it would turn a
         mis-tap into an attach.
         """
-        nav = re.search(r'var NAV_KEYS = \[(.*?)\];', self.js, re.S)
-        self.assertIsNotNone(nav, 'the client has no movement keys of its own')
-        sent = re.findall(r"k: '([^']*)'", nav.group(1))
+        # Two tables now: the modifiers, and the cross the four movement
+        # keys are laid out in. Both are the client's own.
+        sent = []
+        for name in ('MOD_KEYS', 'DPAD_KEYS'):
+            table = re.search(r'var ' + name + r' = \[(.*?)\];', self.js, re.S)
+            self.assertIsNotNone(table, f'the client has no {name}')
+            sent += re.findall(r"k: '([^']*)'", table.group(1))
         self.assertIn('\\x1b[A', sent, 'no way to move up')
         self.assertIn('\\x1b[B', sent, 'no way to move down')
         self.assertIn('\\x1b', sent, 'no way out of anything')
@@ -1305,7 +1309,8 @@ class TouchKeypadTests(unittest.TestCase):
         self.assertIn("keys.textContent = ''", render)
         self.assertNotIn('nav.', render)
         build = _extract(self.js, 'renderNav')
-        self.assertIn('NAV_KEYS', build)
+        self.assertIn('MOD_KEYS', build)
+        self.assertIn('DPAD_KEYS', build)
         self.assertIn('id="nav"', self.html)
 
     def test_no_button_sends_a_key_atmux_does_not_bind(self):
@@ -1476,7 +1481,10 @@ class TouchKeypadTests(unittest.TestCase):
         """
         self.assertEqual(list(keypad.EXTERNAL_KEYS), [])
         self.assertNotIn('x02d', self.js)
-        self.assertIn("{ l: 'detach', s: 'd' }", self.js)
+        # Built from the prefix, never spelled out -- and now carrying the
+        # one mark on this pad, because it is the only key here that ends
+        # what you are looking at.
+        self.assertIn("{ l: 'detach', s: 'd', tone: 'leave' }", self.js)
 
     def test_what_the_app_cannot_be_asked_travels_instead(self):
         """The prefix byte. A client cannot work it out and `set -g prefix
@@ -2555,7 +2563,10 @@ class KeypadVocabularyTests(unittest.TestCase):
     tmux binding from inside the session you had just attached to.
     """
 
-    TABLES = ('NAV_KEYS', 'TMUX_VERBS', 'CTRL_KEYS', 'MOVE_KEYS', 'TYPE_KEYS')
+    # NAV_KEYS is derived from the two clusters rather than written out,
+    # so the harness rebuilds it the same way the page does.
+    TABLES = ('MOD_KEYS', 'DPAD_KEYS', 'TMUX_VERBS', 'CTRL_KEYS',
+              'MOVE_KEYS', 'TYPE_KEYS')
     FUNCTIONS = ('bufferType', 'swipeKind',
                  'showDebug', 'feed', 'holdWrites', 'flushHeld', 'flushSoon',
                  'swipeBy', 'emitScroll', 'scrollSoon', 'payScroll',
@@ -2604,6 +2615,9 @@ class KeypadVocabularyTests(unittest.TestCase):
             assert match, head
             parts.append(match.group(0))
         parts += [_extract_list(cls.js, name) for name in cls.TABLES]
+        derived = re.search(r'var NAV_KEYS = [^;]*;', cls.js, re.S)
+        assert derived, 'NAV_KEYS'
+        parts.append(derived.group(0))
         parts += [_extract(cls.js, name) for name in cls.FUNCTIONS]
         cls.harness = '\n'.join(parts)
 
@@ -2714,27 +2728,32 @@ class KeypadVocabularyTests(unittest.TestCase):
         only: ten keys across a 390px phone measured 33px wide -- a quarter
         under the minimum in the direction you actually aim. Five is 71px,
         measured on the same viewport."""
+        # Three across each cluster, not ten across one: on a 390px phone
+        # that is 65px for a modifier and 52px for an arrow, both clear of
+        # the minimum in the direction a thumb aims.
         self.assertEqual(self.run_js("""
             nav = new El('div'); navColumns = 0;
             renderNav(perRow(390));
-            console.log(JSON.stringify(nav.children.map(function (row) {
-              return buttons(row, []).map(function (k) { return k.textContent; });
-            })));"""),
-            [['esc', 'ctrl', 'alt', 'pfx', 'tab'], ['⏎', '←', '↓', '↑', '→']])
+            console.log(JSON.stringify(nav.children.map(function (part) {
+              return buttons(part, []).length;
+            })));"""), [6, 4])
 
-    def test_landscape_puts_the_same_ten_keys_on_one_row(self):
-        """Measured at 844x390 before this: two rows of five made each key
-        162px wide -- four times what a thumb needs -- and cost 51px of a
-        390px-tall screen to do it. The terminal had twelve rows, which is
-        less room than the keys attached to it."""
-        self.assertEqual(self.run_js("""
-            nav = new El('div'); navColumns = 0;
-            renderNav(perRow(844));
-            console.log(JSON.stringify(nav.children.map(function (row) {
-              return buttons(row, []).map(function (k) { return k.textContent; });
-            })));"""),
-            [['esc', 'ctrl', 'alt', 'pfx', 'tab',
-              '⏎', '←', '↓', '↑', '→']])
+    def test_the_cross_keeps_its_shape_when_the_phone_turns(self):
+        """The old slicing put all ten keys on one row in landscape, which
+        dissolved the arrangement exactly where there was most room to draw
+        it. Two clusters, always: the modifiers and an inverted T."""
+        for width in (320, 390, 844, 1400):
+            with self.subTest(width=width):
+                self.assertEqual(self.run_js(f"""
+                    nav = new El('div'); navColumns = 0;
+                    renderNav(perRow({width}));
+                    console.log(JSON.stringify(nav.children.map(
+                      function (part) {{
+                        return buttons(part, []).map(
+                          function (k) {{ return k.textContent; }});
+                      }})));"""),
+                    [['esc', 'ctrl', 'alt', 'pfx', 'tab', '⏎'],
+                     ['↑', '←', '↓', '→']])
 
     def test_an_armed_modifier_survives_the_row_being_rebuilt(self):
         """Rotating rebuilds the navigation row, and the buttons showing a
@@ -2750,7 +2769,7 @@ class KeypadVocabularyTests(unittest.TestCase):
             var ctrl = keyLabelled(nav, 'ctrl');
             console.log(JSON.stringify(
               [nav.children.length, !!ctrl._cls.on, applyLatch('c')]));"""),
-            [1, True, '\x03'])
+            [2, True, '\x03'])
 
     def test_a_fixed_key_acts_on_the_way_down(self):
         """The fixed rows cannot scroll, so waiting for the finger to lift is
@@ -2872,12 +2891,76 @@ class KeypadVocabularyTests(unittest.TestCase):
             self.assertTrue(chord['k'].startswith('\x02'), chord)
             self.assertLessEqual(len(chord['k']), 2, chord)
 
+    def test_the_four_movement_keys_form_a_cross(self):
+        """The one that says why any of this changed. `↑` sat to the *right*
+        of `↓` -- array order, and no order a thumb has -- so every movement
+        needed a look first. Read as geometry rather than as a list: up in
+        the middle of the top, and left/down/right under it."""
+        shape = self.run_js("""
+            console.log(JSON.stringify(DPAD_KEYS.map(function (entry) {
+              return entry ? entry.l : null; })));""")
+        self.assertEqual(shape, [None, '↑', None, '←', '↓', '→'])
+        # Three across, so the second row sits under the first: `↑` over `↓`,
+        # with `←` and `→` either side of it.
+        self.assertEqual(shape[1], '↑')
+        self.assertEqual(shape[4], '↓')
+        self.assertEqual([shape[3], shape[5]], ['←', '→'])
+
+    def test_the_holes_in_the_cross_are_real_elements(self):
+        """A cross with its corners closed up is a row again."""
+        self.assertEqual(self.run_js("""
+            nav = new El('div'); navColumns = 0;
+            renderNav(5);
+            var cross = nav.children[1];
+            console.log(JSON.stringify(cross.children.map(function (cell) {
+              return cell._cls.gap ? 'gap' : cell.textContent; })));"""),
+            ['gap', '↑', 'gap', '←', '↓', '→'])
+
+    def test_switching_windows_is_a_swipe_and_left_goes_forward(self):
+        """Two of the five buttons the pad shows without being asked were
+        spent on this, for the tmux action people take most after detaching
+        -- and aiming at a 72px target is the part that never felt like a
+        phone. Left goes forward, the way every set of pages on this device
+        already works."""
+        body = _extract(self.js, 'swipeWindow')
+        self.assertIn("published !== 'external'", body)
+        self.assertIn("dx < 0 ? 'n' : 'p'", body)
+        self.assertIn('prefixSeq', body)
+
+    def test_the_swipe_never_takes_the_gesture_the_scrollback_owns(self):
+        """A drag is one thing or the other. It must be decisively sideways,
+        it must not start where iOS owns the stripe -- that is Back -- and a
+        scroll that drifts must not become a window switch half way down."""
+        move = self.js[self.js.index('SWITCH_TRAVEL'):]
+        move = move[:move.index('showDebug(dy)')]
+        for guard in ('!swiped', '!switched', 'SWITCH_BIAS', 'EDGE_GUARD'):
+            with self.subTest(guard=guard):
+                self.assertIn(guard, move)
+        # And it is only offered where tmux is the thing on the other end.
+        self.assertNotIn("published === 'app'", _extract(self.js, 'swipeWindow'))
+
+    def test_the_visible_verbs_are_the_ones_no_gesture_covers(self):
+        """The pad shows the first few without being asked, so those should
+        be what a swipe cannot already do. The two it can are still here --
+        a button is the right answer when the swipe is the wrong one."""
+        verbs = [v['l'] for v in self.table('TMUX_VERBS')]
+        self.assertEqual(verbs[:5],
+                         ['detach', 'new win', 'zoom', 'scroll', 'windows'])
+        for gestured in ('◀ win', 'win ▶'):
+            with self.subTest(verb=gestured):
+                self.assertIn(gestured, verbs)
+                self.assertGreaterEqual(verbs.index(gestured), 5)
+
     def test_detach_is_the_first_of_them(self):
         """It is the one key nobody can guess, and being stuck inside a
         session is the failure this whole feature would otherwise create. It
         has to survive into the two rows a closed drawer shows."""
-        self.assertEqual(self.table('TMUX_VERBS')[0],
-                         {'l': 'detach', 's': 'd'})
+        first = self.table('TMUX_VERBS')[0]
+        self.assertEqual(first['l'], 'detach')
+        self.assertEqual(first['s'], 'd')
+        # And it is the one key here that ends what you are looking at, so
+        # it does not wear the same grey as `new win`.
+        self.assertEqual(first.get('tone'), 'leave')
 
     def test_the_chords_follow_a_rebound_prefix(self):
         """`set -g prefix C-a` is a thing people do, and nothing on the wire
@@ -3002,8 +3085,8 @@ class KeypadVocabularyTests(unittest.TestCase):
                       var row = rows(node, [])[0];
                       return row ? row.children.length : 0; }};
                     console.log(JSON.stringify(
-                      [wide(nav), wide(keys), wide(sheetKeys), columnsUsed]));
-                    '''), [columns] * 4)
+                      [wide(keys), wide(sheetKeys), columnsUsed]));
+                    '''), [columns] * 3)
 
     # ── the sheet ─────────────────────────────────────────────────────────
 
@@ -3050,22 +3133,32 @@ class KeypadVocabularyTests(unittest.TestCase):
               [fits - settled,
                pad.getBoundingClientRect().height - before]));'''), [1, 44])
 
-    def test_a_rotation_that_changes_the_rows_resizes_it(self):
-        """Ten keys on one row instead of two is a row of the pad given back,
-        and the terminal has to be told or it keeps drawing rows that are now
-        behind the keys."""
+    def test_anything_that_changes_the_pad_height_resizes_the_terminal(self):
+        """A row of the pad appearing or leaving is rows of terminal taken or
+        given back, and the terminal has to be told or it keeps drawing where
+        the keys now are.
+
+        This used to be demonstrated by a rotation: ten navigation keys went
+        from two rows to one at 844px. They do not any more -- the cluster is
+        three across and two deep at every width, which is what lets the four
+        movement keys be an inverted T instead of a line, and it costs one
+        row in landscape. Pins are what change the height now, and the
+        guarantee is the same one.
+        """
         self.assertEqual(self.run_js('''
             var fits = 0;
             refit = function () { fits++; };
             store[PINS] = '[]'; pins = loadPins();
             keys._width = 390; current = []; expanded = false;
             renderKeys();
-            var narrow = pad.getBoundingClientRect().height;
+            var bare = pad.getBoundingClientRect().height;
             var settled = fits;
-            keys._width = 844; renderKeys();
+            store[PINS] = JSON.stringify(["^C"]); pins = loadPins();
+            renderKeys();
             console.log(JSON.stringify(
-              [fits - settled, narrow - pad.getBoundingClientRect().height]));
-            '''), [1, 44])
+              [fits - settled,
+               pad.getBoundingClientRect().height - bare > 0]));
+            '''), [1, True])
 
     def test_a_drag_cannot_shrink_it_past_being_useful_or_grow_it_past_the_room(
             self):

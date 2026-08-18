@@ -344,7 +344,18 @@
   // Nine across a 390px screen is ~37px each. That is narrower than Apple's
   // 44pt guidance and wider than the iOS keyboard's own letter keys, which are
   // about 32px and which nobody has trouble hitting.
-  var NAV_KEYS = [
+  // Two clusters, not one row of ten.
+  //
+  // They were laid out in array order -- esc ctrl alt pfx tab / ⏎ ← ↓ ↑ → --
+  // which put `↑` to the *right* of `↓`, so every movement needed a look
+  // first. An inverted T is what every keyboard since the Model M has used
+  // for these four, and for the reason that matters here: you find it once by
+  // shape and after that your thumb knows where it is. On a screen with no
+  // edges to feel, that is the only way a key gets found without looking.
+  //
+  // The two clusters are laid out side by side and both are two rows deep, so
+  // this costs exactly what the row of ten cost.
+  var MOD_KEYS = [
     { l: 'esc', k: '\x1b' },
     { l: 'ctrl', m: 'ctrl' },
     { l: 'alt', m: 'alt' },
@@ -358,12 +369,20 @@
     // binding table.
     { l: 'pfx', m: 'prefix' },
     { l: 'tab', k: '\t' },
-    { l: '⏎', k: '\r' },
+    { l: '⏎', k: '\r' }
+  ];
+
+  // Three across, two deep, corners empty. `null` is a hole rather than a
+  // missing element: the shape is the point, and a cross with its corners
+  // closed up is a row again.
+  var DPAD_KEYS = [
+    null, { l: '↑', k: '\x1b[A' }, null,
     { l: '←', k: '\x1b[D' },
     { l: '↓', k: '\x1b[B' },
-    { l: '↑', k: '\x1b[A' },
     { l: '→', k: '\x1b[C' }
   ];
+
+  var NAV_KEYS = MOD_KEYS.concat(DPAD_KEYS.filter(Boolean));
 
   // ── modifiers, which latch ────────────────────────────────────────────
   // A thumb cannot hold one key and press another, so ctrl and alt are taps:
@@ -440,23 +459,31 @@
   // 'external' (it has handed the screen to tmux). Read by swipeKind, which
   // has to know which of the two is listening.
   var published = '';
+  // Order matters: the first few are what the pad shows without being asked,
+  // so they should be the things a gesture cannot already do. Switching
+  // windows is a sideways swipe now, and two of the five visible buttons
+  // were spent on it -- they are still here, further down, because a button
+  // you can aim at is the right answer when the swipe is the wrong one.
+  //
+  // `detach` is marked. It is the only one on this pad that ends what you
+  // are looking at, and it sat next to `new win` wearing the same grey.
   var TMUX_VERBS = [
-    { l: 'detach', s: 'd' },
+    { l: 'detach', s: 'd', tone: 'leave' },
     { l: 'new win', s: 'c' },
-    { l: '◀ win', s: 'p' },
-    { l: 'win ▶', s: 'n' },
     { l: 'zoom', s: 'z' },
     { l: 'scroll', s: '[' },
+    { l: 'windows', s: 'w' },
+    { l: '◀ win', s: 'p' },
+    { l: 'win ▶', s: 'n' },
     { l: 'split ─', s: '"' },
     { l: 'split │', s: '%' },
-    { l: 'windows', s: 'w' },
     { l: 'pane ▶', s: 'o' },
     { l: 'rename', s: ',' },
     { l: 'prefix', s: '' }
   ];
   function tmuxKeys() {
     return TMUX_VERBS.map(function (verb) {
-      return { l: verb.l, k: prefixSeq + verb.s };
+      return { l: verb.l, k: prefixSeq + verb.s, tone: verb.tone };
     });
   }
 
@@ -859,14 +886,28 @@
     navColumns = columns;
     nav.textContent = '';
     modButtons = {};
-    for (var start = 0; start < NAV_KEYS.length; start += columns) {
-      var line = document.createElement('div');
-      line.className = 'krow';
-      NAV_KEYS.slice(start, start + columns).forEach(function (entry) {
-        line.appendChild(buildKey(entry, true));
-      });
-      nav.appendChild(line);
-    }
+    // Both clusters are three wide and two deep whatever the screen is, so
+    // the shape holds when the phone turns -- which the old slicing did not:
+    // at ten columns the whole thing became one row and the cross was gone
+    // exactly when there was most room to draw it.
+    var mods = document.createElement('div');
+    mods.className = 'navmods';
+    MOD_KEYS.forEach(function (entry) {
+      mods.appendChild(buildKey(entry, true));
+    });
+    var cross = document.createElement('div');
+    cross.className = 'dpad';
+    DPAD_KEYS.forEach(function (entry) {
+      if (!entry) {
+        var hole = document.createElement('span');
+        hole.className = 'key gap';
+        cross.appendChild(hole);
+        return;
+      }
+      cross.appendChild(buildKey(entry, true));
+    });
+    nav.appendChild(mods);
+    nav.appendChild(cross);
     // The latch survives the rebuild; the buttons showing it do not, so it
     // has to be repainted onto the new ones or an armed ctrl goes invisible
     // and starts modifying keystrokes nobody asked it to.
@@ -1249,6 +1290,7 @@
     // Derived rather than flagged, same as `repeats` below: a label that is a
     // single symbol is a glyph and wants the room a word does not.
     if (label.length === 1 && !/\w/.test(label)) button.classList.add('glyph');
+    if (entry.tone) button.classList.add(entry.tone);
     // While editing, a key is a thing you are choosing rather than pressing,
     // and it has to look like one -- a row that types when you meant to keep
     // is worse than no editing at all.
@@ -2393,6 +2435,27 @@
 
   var pinchStart = 0, pinchFont = 0;
   var dragFrom = 0, swiped = false;
+  // ── swiping between tmux windows ──────────────────────────────────────
+  // The vertical drag has always been the scrollback; sideways was doing
+  // nothing at all. `◀ win` and `win ▶` are two of the five buttons the pad
+  // spends its front row on, for the tmux action people take most after
+  // detaching -- and switching windows by aiming at a 72px target is the
+  // part of this that never felt like a phone.
+  //
+  // Left goes forward, the way every set of pages and tabs on this device
+  // already works.
+  var dragFromX = 0, switched = false;
+  var SWITCH_TRAVEL = 60;      // far enough that a crooked scroll is not one
+  var SWITCH_BIAS = 1.6;       // and decisively sideways rather than merely
+  var EDGE_GUARD = 24;         // iOS owns the first stripe: that is Back
+
+  function swipeWindow(dx) {
+    if (published !== 'external' || !prefixSeq) return false;
+    typed(prefixSeq + (dx < 0 ? 'n' : 'p'));
+    haptic();
+    say(dx < 0 ? 'window ▶' : '◀ window');
+    return true;
+  }
   host.addEventListener('touchstart', function (event) {
     // Selecting is the browser's gesture, all of it. Not even holding the
     // writes: a repaint mid-selection is the browser's business now.
@@ -2406,7 +2469,9 @@
       swiped = false;
     } else if (event.touches.length === 1) {
       dragFrom = event.touches[0].clientY;
+      dragFromX = event.touches[0].clientX;
       swiped = false;
+      switched = false;
       moves = 0;
       scrolled = 0;
       showDebug(0);
@@ -2470,6 +2535,23 @@
       }
     }
     var dy = event.touches[0].clientY - dragFrom;
+    var dx = event.touches[0].clientX - dragFromX;
+    // Sideways first, and only while nothing vertical has already been
+    // claimed: a gesture is one thing or the other, and a scroll that drifts
+    // must not turn into a window switch half way down.
+    if (!swiped && !switched &&
+        Math.abs(dx) > SWITCH_TRAVEL &&
+        Math.abs(dx) > SWITCH_BIAS * Math.abs(dy) &&
+        dragFromX > EDGE_GUARD &&
+        dragFromX < window.innerWidth - EDGE_GUARD) {
+      cancelPress();
+      if (swipeWindow(dx)) {
+        switched = true;
+        event.preventDefault();
+      }
+      return;
+    }
+    if (switched) return;      // the rest of this finger belongs to that
     showDebug(dy);
     // Slop first, so a tap that trembles is still a tap; after that the
     // content follows the finger one row per row-height, which is what makes
