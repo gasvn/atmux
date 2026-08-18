@@ -2565,6 +2565,32 @@ _WALL_CELLS = 6
 _RAIL = 0            # set below, once _meter exists to be measured
 
 
+# Below this a session name has stopped being one. `case_st…` and
+# `missing…` are both eight characters of a name the reader is trying to
+# tell apart from the one under it.
+_NAME_FLOOR = 14
+
+
+def _rail_budget(total: int, fixed: int, name: int) -> int:
+    """How many columns the numbers on the right may reserve.
+
+    They used to reserve all of them, always: the widths are shared by every
+    row so they have to hold the worst case, and the worst case is a walltime
+    and two meters -- 22 columns. On a 50-column phone that is 44% of the row
+    spoken for before the name gets anything, and the name came out as
+    `tend-mg…`.
+
+    So the rail yields instead. It is already built to drop whole fields off
+    its right end when the room is short; this is the same decision made one
+    level up, where it can be traded against the thing the reader is actually
+    looking for.
+    """
+    for budget in (_RAIL, _WALL_CELLS, 0):
+        if total - fixed - budget >= name:
+            return budget
+    return 0
+
+
 def _row_widths(rows, total: int) -> tuple:
     """How wide the fixed fields are, from the rows actually present.
 
@@ -2575,13 +2601,15 @@ def _row_widths(rows, total: int) -> tuple:
     name = min(_NAME_CAP,
                max([7] + [len(_session_cell(r[1], r[2])) for r in rows]))
     where = max([4] + [len(_node_label(r[0])) for r in rows])
-    spare = total - (lead + name + where + 6) - _RAIL
+    rail = _rail_budget(total, lead + where + 6, min(name, _NAME_FLOOR))
+    spare = total - (lead + name + where + 6) - rail
     if spare < 0:
         # The machine gives way first: its name is the more guessable of the
         # two, and the session name is what the reader navigates by.
         give = min(where - 6, -spare)
         where = max(6, where - max(0, give))
-        spare = total - (lead + name + where + 6) - _RAIL
+        rail = _rail_budget(total, lead + where + 6, min(name, _NAME_FLOOR))
+        spare = total - (lead + name + where + 6) - rail
         if spare < 0:
             name = max(8, name + spare)
     return lead, name, where

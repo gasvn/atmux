@@ -88,7 +88,20 @@ _LAYOUT_FILE_LIMIT = 4 * 1024
 #                 56% of too little and the preview is too narrow to read.
 LAYOUT_SPLIT_WIDTH = 118
 LAYOUT_TABLE_WIDTH = 65
-LAYOUT_WIDTHS = (LAYOUT_SPLIT_WIDTH, LAYOUT_TABLE_WIDTH)
+# And one for a phone held upright, where 65 columns is not a layout choice
+# but a font size: 393 CSS pixels over 65 columns is 9.5px type, measured,
+# which is what "手机上字太小看不清" was. 50 columns buys 12.5px on the same
+# screen.
+#
+# 65 was the floor because the table was a grid of columns and the last one
+# read "STATU" below it. It is one self-composing column now -- it windows
+# the name, and drops whole fields off the right end when there is no room
+# for them -- so it degrades rather than truncates. Rendered at 66, 56, 50
+# and 44 columns to pick this: at 50 the session name, the machine and the
+# walltime are all still there and only the machine name starts eliding; at
+# 44 the machine name stops being worth reading.
+LAYOUT_PHONE_WIDTH = 50
+LAYOUT_WIDTHS = (LAYOUT_SPLIT_WIDTH, LAYOUT_TABLE_WIDTH, LAYOUT_PHONE_WIDTH)
 # The other way the preview can fit: under the table rather than beside it.
 #
 # The width rule above is right about *beside* and had never considered

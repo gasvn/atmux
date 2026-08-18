@@ -1857,6 +1857,63 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 str(app.table.get_cell_at(Coordinate(row, 0))).startswith('● 2h'))
 
+class NarrowRowTests(unittest.TestCase):
+    """What a row gives up first when the terminal is a phone.
+
+    The widths are shared by every row, so they hold the worst case -- and
+    the worst case reserved a walltime and two meters, 22 columns, always.
+    On the 50-column layout that is 44% of the row spoken for before the
+    name gets anything, and the names came out `tend-mg…`, `case_st…`,
+    `missing…`: eight characters each, of names the reader is trying to tell
+    apart from the one under it.
+    """
+
+    def test_the_numbers_yield_before_the_name_does(self):
+        wide = autotmux._rail_budget(122, 6 + 14 + 6, autotmux._NAME_FLOOR)
+        narrow = autotmux._rail_budget(50, 6 + 14 + 6, autotmux._NAME_FLOOR)
+        self.assertEqual(wide, autotmux._RAIL)
+        self.assertLess(narrow, autotmux._RAIL)
+
+    def test_it_gives_up_the_meters_before_the_walltime(self):
+        """Three states, in order: everything, the walltime alone, nothing.
+        The walltime is the one of the three that says when the row stops
+        existing."""
+        seen = [autotmux._rail_budget(total, 6 + 6 + 6,
+                                      autotmux._NAME_FLOOR)
+                for total in range(20, 130)]
+        self.assertEqual(sorted(set(seen)),
+                         sorted({0, autotmux._WALL_CELLS, autotmux._RAIL}))
+        # Never up again as the room shrinks.
+        self.assertEqual(seen, sorted(seen))
+
+    def test_a_name_keeps_its_floor_wherever_there_is_one(self):
+        """The point of the trade. Measured against the real names on this
+        cluster at the width a phone actually gets."""
+        rows = [('holygpu8a13103', 'tend-mgr-tendsystemoptimizer', '1',
+                 '1-12:00:00', 'Active', '96', '4.0', '0 0 81559 1'),
+                ('login--zgx', 'missing_tool', '1', '', 'Active',
+                 '20', '0.2', ''),
+                ('holygpu8a13501', 'case_study', '2', '1-13:00:00',
+                 'Active', '96', '1.0', '')]
+        for total, least in ((50, 12), (66, 14), (122, 18)):
+            with self.subTest(total=total):
+                _lead, name, _where = autotmux._row_widths(rows, total)
+                self.assertGreaterEqual(name, least)
+
+    def test_the_widest_row_still_fits_its_budget(self):
+        """The reason the rail was unconditional: the widths are shared, so
+        whatever they allow, every row has to compose inside."""
+        rows = [('holygpu8a13103', 'tend-mgr-tendsystemoptimizer20260810',
+                 '3', '1-12:00:00', 'Active', '96', '138.0',
+                 '87 41231 81920 4')]
+        for total in range(30, 140):
+            widths = autotmux._row_widths(rows, total)
+            line = autotmux._compose_session(rows[0], widths, '', total)
+            with self.subTest(total=total):
+                self.assertLessEqual(line.cell_len, total,
+                                     f'{total} columns overflowed')
+
+
 class SuspendedPollingTests(unittest.IsolatedAsyncioTestCase):
     """Nothing polls while the screen belongs to something else.
 

@@ -2187,13 +2187,56 @@ class AutoFontTests(unittest.TestCase):
     def columns(self, width, font):
         return int(width // (font * self.RATIO))
 
-    def test_a_phone_gets_every_column_of_the_table(self):
-        """390px is an iPhone in portrait. Before this it got 56 columns and
-        the header read LOAD with STATUS off the edge."""
+    def test_a_phone_gets_a_whole_layout_and_can_read_it(self):
+        """390px is an iPhone in portrait, and it used to land on the
+        65-column layout -- which on that screen is not a layout choice but a
+        font size: 9.5px, measured, which is what "字太小看不清" was.
+
+        The floor is what it lands on now, and the point is that it lands on
+        one of the published widths rather than between two of them: a width
+        the dashboard has no layout for is how it once ended up at 56
+        columns, truncating a column away and growing a scrollbar inside a
+        full-screen app."""
         from autotmux import config
         font = self.font_for(390)
-        self.assertGreaterEqual(self.columns(390, font),
-                                config.LAYOUT_TABLE_WIDTH)
+        cols = self.columns(390, font)
+        self.assertGreaterEqual(cols, config.LAYOUT_PHONE_WIDTH)
+        self.assertGreaterEqual(font, 11.0, 'still too small to read')
+
+    def test_every_screen_lands_on_a_published_width(self):
+        """The contract the widths exist for, over every real device to
+        hand: whatever the font solves for, the grid it makes has to reach a
+        width the dashboard actually has a layout for."""
+        from autotmux import config
+        widths = sorted(config.LAYOUT_WIDTHS, reverse=True)
+        for width in (320, 375, 390, 393, 430, 744, 820, 834, 1024, 1280,
+                      1512, 1920, 2560):
+            font = self.font_for(width)
+            cols = self.columns(width, font)
+            with self.subTest(width=width):
+                # The widest layout this screen reached, or the narrowest
+                # there is when it could not reach even that.
+                wanted = next((w for w in widths if cols >= w), widths[-1])
+                self.assertGreaterEqual(
+                    cols, min(wanted, widths[-1]),
+                    f'{width}px -> {font}px -> {cols} columns, '
+                    f'which is no layout')
+
+    def test_the_extra_width_of_a_big_screen_goes_into_the_letters(self):
+        """The ceiling used to be 16px on the theory that extra width is
+        better spent on columns than on letter height. That is only true
+        while there is a wider layout to spend it on: 118 is the widest the
+        dashboard has, so a 2560px screen was drawing 258 columns of which
+        140 were blank by construction, at the smallest type the page uses.
+        """
+        from autotmux import config
+        small = self.font_for(1280)
+        big = self.font_for(2560)
+        self.assertGreater(big, 16.0)
+        self.assertGreaterEqual(big, small)
+        # And it still reaches the widest layout it is spending width on.
+        self.assertGreaterEqual(self.columns(2560, big),
+                                config.LAYOUT_SPLIT_WIDTH)
 
     def test_a_tablet_gets_the_split_view(self):
         """820px is an iPad in portrait -- the width where the preview pane
@@ -2225,17 +2268,42 @@ class AutoFontTests(unittest.TestCase):
                         cols, wanted,
                         f'{width}px at {font}px -> {cols} cols, wanted {wanted}')
 
-    def test_it_stays_legible_and_stops_growing(self):
-        """A screen too small for any layout should get the smallest legible
-        size rather than an illegible one that happens to fit; a huge screen
-        should spend the room on columns, not on letter height."""
-        low, high = float(self.bounds.group(1)), float(self.bounds.group(2))
-        self.assertEqual(self.font_for(280), low)
+    def test_a_screen_too_small_for_any_layout_still_lands_on_one(self):
+        """It used to take the floor instead, and the floor is a font size,
+        not a width: a 320px phone came out at 48 columns, which is not a
+        layout the dashboard has. Landing between two of them is the whole
+        failure this list exists to prevent -- it is how a phone once got 56
+        columns, one short of the table, and grew a scrollbar inside a
+        full-screen app.
+
+        So the narrowest layout wins there, at whatever size it costs.
+        """
+        from autotmux import config
+        low = float(self.bounds.group(1))
+        narrowest = min(config.LAYOUT_WIDTHS)
+        for width in (240, 280, 320):
+            font = self.font_for(width)
+            with self.subTest(width=width):
+                self.assertGreaterEqual(self.columns(width, font), narrowest)
+                # Below the floor is the price, and it is paid knowingly.
+                self.assertLess(font, low)
+                self.assertGreaterEqual(font, 6)
+
+    def test_it_stops_growing(self):
+        """A screen with more width than the widest layout needs spends the
+        rest on letter height -- but not without end."""
+        high = float(self.bounds.group(2))
         self.assertEqual(self.font_for(3000), high)
         for width in (320, 390, 428, 768, 820, 1024, 1180, 1680, 2560):
             with self.subTest(width=width):
-                self.assertGreaterEqual(self.font_for(width), low)
                 self.assertLessEqual(self.font_for(width), high)
+
+    def test_a_screen_that_can_reach_the_floor_does(self):
+        """The floor only yields where no layout can be had above it."""
+        low = float(self.bounds.group(1))
+        for width in (390, 393, 430, 768, 820, 1024, 1512, 2560):
+            with self.subTest(width=width):
+                self.assertGreaterEqual(self.font_for(width), low)
 
 
 class ControlSurfaceTests(_ServedFixture):

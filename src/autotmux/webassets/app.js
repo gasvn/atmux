@@ -2558,7 +2558,7 @@
       .map(function (n) { return parseInt(n, 10); })
       .filter(function (n) { return n >= 20 && n <= 500; })
       .sort(function (a, b) { return b - a; });
-    return out.length ? out : [118, 65];
+    return out.length ? out : [118, 65, 50];
   }
 
   // What one cell costs, in CSS pixels. xterm measures this from the rendered
@@ -2576,9 +2576,20 @@
     return null;
   }
 
-  // Below this a phone is unreadable; above it a desktop is just wasteful,
-  // and the extra width is better spent on columns than on letter height.
-  var MIN_AUTO = 9, MAX_AUTO = 16;
+  // The two ends of what the font may be.
+  //
+  // The floor was 9, and a phone sat on it: 393 CSS pixels over the 65-column
+  // layout is 9.5px type, which is what "字太小看不清" was about. It is high
+  // enough now that a phone reaches for the 50-column layout instead and gets
+  // ~12.5px, and low enough that an iPad and a phone on its side still afford
+  // the 118-column split -- both land at ~11, measured.
+  //
+  // The ceiling was 16, on the theory that extra width is better spent on
+  // columns than on letter height. That is only true while there is a wider
+  // layout to spend it on, and there is not: 118 is the widest the dashboard
+  // has. A 2560px screen was drawing a 258-column grid of which 140 columns
+  // were blank by construction, at the smallest type this page ever uses.
+  var MIN_AUTO = 11, MAX_AUTO = 20;
 
   // The widest layout this screen can afford at a legible size. Cell width is
   // exactly proportional to font size -- checked across 7px to 16px, the
@@ -2589,13 +2600,21 @@
     if (!cell || !term.options.fontSize) return term.options.fontSize;
     var perPoint = cell.w / term.options.fontSize;
     var widths = layoutWidths();
+    var size = 0;
     for (var i = 0; i < widths.length; i++) {
       // Round down: rounding up lands one column short of the target, which
       // is the one place it must not land.
-      var size = Math.floor(width / widths[i] / perPoint * 2) / 2;
+      size = Math.floor(width / widths[i] / perPoint * 2) / 2;
       if (size >= MIN_AUTO) return Math.min(size, MAX_AUTO);
     }
-    return MIN_AUTO;
+    // No layout reaches the floor -- a 320px phone is the case. Take the
+    // narrowest layout at whatever it costs rather than the floor at
+    // whatever width it happens to land on: `return MIN_AUTO` gave a 320px
+    // screen 48 columns, which is not a width the dashboard has a layout
+    // for, and landing between two of them is the entire failure this list
+    // exists to prevent. It is how a phone once got 56 columns and grew a
+    // scrollbar inside a full-screen app.
+    return Math.max(size, 6);
   }
 
   function applyGrid() {
