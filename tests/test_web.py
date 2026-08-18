@@ -1974,6 +1974,22 @@ class LayoutContractTests(unittest.TestCase):
         from autotmux import cli
         self.assertEqual(cli.preview_fit(119, 28), 'beside')
 
+    def test_the_queue_only_offers_the_arrows_when_it_is_cut(self):
+        """squeue prints ~95 columns and the pane wraps nothing on purpose.
+        The tail is reachable, and nothing said so; a pane that fits must
+        not say it anyway."""
+        from autotmux import cli
+        for widest, room, want in ((95, 64, '← → more'),
+                                   (65, 64, '← → more'),
+                                   (64, 64, ''),      # exactly fits
+                                   (10, 64, ''),
+                                   # Before the first layout the pane has no
+                                   # width, and 0 is not "everything is cut".
+                                   (95, 0, ''),
+                                   (0, 0, '')):
+            with self.subTest(widest=widest, room=room):
+                self.assertEqual(cli.queue_hint(widest, room), want)
+
     def test_the_page_is_told_the_widths(self):
         from autotmux import config
         meta = web._layout_meta()

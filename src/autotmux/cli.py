@@ -2803,6 +2803,23 @@ def _heading(title: str, note: str = '', key: str = '') -> rich.text.Text:
     return line
 
 
+def queue_hint(widest: int, room: int) -> str:
+    """What the queue heading says when its rows are wider than the pane.
+
+    The pane wraps nothing, deliberately -- a row interleaved with its own
+    continuation is harder to read than one with the tail off, and the
+    leading columns are the ones worth seeing. The tail is not lost: focus
+    the pane and the arrow keys walk it, which is measured and true.
+
+    Nothing said so. On a phone the only sign that `TIME` was really
+    `TIME_LIMIT`, `NODES` and `NODELIST` was a scrollbar one cell tall,
+    which reads as a stray mark rather than as an offer.
+    """
+    if room <= 0 or widest <= room:
+        return ''
+    return '← → more'
+
+
 def _band_cells(title: str, count: int) -> tuple:
     """A band heading, as the six cells a DataTable row is made of.
 
@@ -5383,7 +5400,19 @@ class AutotmuxApp(App):
             when = f'  ⚠ {fmt_age(age)} old'
         else:
             when = f'  {fmt_age(age)} old'
-        head = _heading(title[0], (title[1] + when).strip(), 'j: switch')
+        # Only where something is actually cut off. On a desktop the rows fit
+        # and a standing offer to scroll a pane that does not scroll is one
+        # more thing on screen that is not true.
+        try:
+            room = int(self.query_one('#jobs_scroll').content_size.width)
+        except Exception:
+            room = 0
+        widest = max((len(line) for line in text.splitlines()), default=0)
+        keys = 'j: switch'
+        hint = queue_hint(widest, room)
+        if hint:
+            keys = f'{keys}  {hint}'
+        head = _heading(title[0], (title[1] + when).strip(), keys)
         self.jobs_view.update(head + rich.text.Text('\n' + text))
 
     async def action_toggle_jobs_view(self) -> None:

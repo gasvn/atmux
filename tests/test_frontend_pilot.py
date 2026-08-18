@@ -2097,6 +2097,56 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(
                     app.query_one('#left_column').has_class('-full'))
 
+    async def test_the_queue_says_when_it_has_more_to_the_right(self):
+        """The pane wraps nothing on purpose, and the tail really is
+        reachable -- focus it and the arrows walk it, measured: 10 presses
+        moved it 10 columns of the 24 it had. Nothing said so, and on a
+        phone the only sign was a scrollbar one cell tall."""
+        wide = ('JOBID PARTITION     NAME     USER    STATE       TIME '
+                'TIME_LIMI  NODES NODELIST(REASON)\n'
+                '39803486 kempner_h    h100x4   shgao   RUNNING  6:24:11 '
+                '3-00:00:00      1 holygpu8a11201')
+        with tempfile.TemporaryDirectory() as td:
+            state = copy.deepcopy(SYNTH_STATE)
+            state['squeue_long'] = wide
+            path = os.path.join(td, 'state.json')
+            with open(path, 'w') as handle:
+                json.dump(state, handle)
+            with open(os.path.join(td, 'snap.json'), 'w') as handle:
+                json.dump({}, handle)
+            autotmux.STATE_FILE = path
+            autotmux.SNAPSHOT_FILE = os.path.join(td, 'snap.json')
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(66, 75)) as pilot:
+                await pilot.pause()
+                app.layout_mode = 'split'
+                app._apply_layout()
+                await pilot.pause()
+                app._refresh_jobs(app._last_state)
+                await pilot.pause()
+                self.assertIn('← →', str(app.jobs_view.render()))
+                # And the offer is true.
+                jobs = app.query_one('#jobs_scroll')
+                self.assertGreater(jobs.max_scroll_x, 0)
+                jobs.focus()
+                await pilot.pause()
+                for _ in range(6):
+                    await pilot.press('right')
+                await pilot.pause()
+                self.assertGreater(jobs.scroll_offset.x, 0)
+
+    async def test_a_queue_that_fits_makes_no_offer(self):
+        """A standing invitation to scroll a pane that does not scroll is
+        one more thing on the screen that is not true."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(150, 40)) as pilot:
+                await pilot.pause()
+                app._refresh_jobs(app._last_state)
+                await pilot.pause()
+                self.assertNotIn('← →', str(app.jobs_view.render()))
+
     async def test_a_screen_with_room_in_neither_direction_keeps_the_table(self):
         """The rule the width test guarded is still there underneath: a
         terminal too narrow to split and too short to stack spends what it
