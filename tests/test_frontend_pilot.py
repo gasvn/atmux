@@ -4,6 +4,7 @@ These don't need a running daemon — they point STATE_FILE at a temp
 file with synthetic content and exercise the UI logic directly.
 """
 import asyncio
+import copy
 import inspect
 import json
 import os
@@ -56,11 +57,22 @@ SYNTH_STATE = {
 }
 
 
-def _setup_state(tmpdir):
+def _setup_state(tmpdir, sessions=None):
+    """The synthetic state, optionally with a different session list on gpu1.
+
+    `sessions` is for the one question the fixed fixture cannot answer: what
+    a layout does when the table has more rows than the screen.
+    """
+    state = SYNTH_STATE
+    if sessions is not None:
+        state = copy.deepcopy(SYNTH_STATE)
+        node = state['nodes']['gpu1']
+        node['sessions'] = [list(s) for s in sessions]
+        node['info']['sessions'] = [list(s) for s in sessions]
     state_path = os.path.join(tmpdir, 'state.json')
     snap_path = os.path.join(tmpdir, 'snap.json')
     with open(state_path, 'w') as f:
-        json.dump(SYNTH_STATE, f)
+        json.dump(state, f)
     with open(snap_path, 'w') as f:
         json.dump({}, f)
     autotmux.STATE_FILE = state_path
@@ -2060,9 +2072,11 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(
                     app.query_one('#left_pane').region.width, 66)
 
-    async def test_rotating_the_phone_brings_the_preview_back(self):
-        """Landscape is wide enough for a split that portrait is not, and a
-        phone changes shape without anyone pressing a key."""
+    async def test_rotating_the_phone_moves_the_preview_rather_than_losing_it(
+            self):
+        """A phone changes shape without anyone pressing a key, and the two
+        shapes have room in different directions: upright there are rows to
+        spare and no columns, on its side the opposite."""
         with tempfile.TemporaryDirectory() as td:
             _setup_state(td)
             app = autotmux.AutotmuxApp()
@@ -2071,10 +2085,49 @@ class LayoutModeTests(unittest.IsolatedAsyncioTestCase):
                 app.layout_mode = 'split'
                 app._apply_layout()
                 await pilot.pause()
-                self.assertFalse(app.query_one('#right_pane_scroll').display)
+                upper = app.query_one('#upper')
+                self.assertTrue(app.query_one('#right_pane_scroll').display)
+                self.assertTrue(upper.has_class('-stacked'))
+                # Underneath means the table keeps the whole width.
+                self.assertTrue(app.query_one('#left_column').has_class('-full'))
                 await pilot.resize_terminal(130, 24)
                 await pilot.pause()
                 self.assertTrue(app.query_one('#right_pane_scroll').display)
+                self.assertFalse(upper.has_class('-stacked'))
+                self.assertFalse(
+                    app.query_one('#left_column').has_class('-full'))
+
+    async def test_a_screen_with_room_in_neither_direction_keeps_the_table(self):
+        """The rule the width test guarded is still there underneath: a
+        terminal too narrow to split and too short to stack spends what it
+        has on the list."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(58, 24)) as pilot:
+                await pilot.pause()
+                app.layout_mode = 'split'
+                app._apply_layout()
+                await pilot.pause()
+                self.assertFalse(app.query_one('#right_pane_scroll').display)
+                self.assertFalse(app.query_one('#upper').has_class('-stacked'))
+
+    async def test_the_stacked_table_stops_growing_before_it_squeezes_out(self):
+        """`height: auto` is what removes the void -- 20 sessions no longer
+        sit in a 50-row pane. The cap is what stops the other end: a hundred
+        sessions must not push the preview off the bottom of the screen."""
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td, sessions=[('s%03d' % n, 1, 0) for n in range(120)])
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(66, 75)) as pilot:
+                await pilot.pause()
+                app.layout_mode = 'split'
+                app._apply_layout()
+                await pilot.pause()
+                preview = app.query_one('#right_pane_scroll')
+                self.assertTrue(preview.display)
+                # Still on the screen, and still worth reading in.
+                self.assertGreaterEqual(preview.region.height, 12)
 
     async def test_the_narrow_view_is_not_a_mode_and_is_not_remembered(self):
         """A small screen is a property of the screen. Persisting it would

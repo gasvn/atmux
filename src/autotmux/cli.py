@@ -3778,6 +3778,24 @@ _LAYOUT_SPECS = {
 # font to land on these same numbers -- a breakpoint only one side knows about
 # is a breakpoint the other side lands just short of.
 _MIN_SPLIT_WIDTH = config.LAYOUT_SPLIT_WIDTH
+# And the height at which it fits underneath instead. See config.
+_MIN_STACK_HEIGHT = config.LAYOUT_STACK_HEIGHT
+
+
+def preview_fit(width: int, height: int) -> str:
+    """Where the preview goes on a screen this size: 'beside', 'below', ''.
+
+    Pure, and separate from the app, because it is the whole of the decision
+    and everything around it is Textual plumbing. It had been a single
+    comparison against the width, which is correct about *beside* and was
+    never asked about *below* -- so a phone held upright, which has no width
+    to spare and rows going begging, got no preview and 63% blank screen.
+    """
+    if width >= _MIN_SPLIT_WIDTH:
+        return 'beside'
+    if height >= _MIN_STACK_HEIGHT:
+        return 'below'
+    return ''
 
 
 def layout_spec(mode) -> dict:
@@ -3938,6 +3956,42 @@ class AutotmuxApp(App):
     #right_pane {
         width: 100%;
         height: auto;
+    }
+    /* ── the preview, underneath ────────────────────────────────────────
+       A screen with no width to spare and rows going begging: a phone held
+       upright is 66 columns by 75 rows, and the width rule alone left 47 of
+       those rows blank. #upper turns from a row into a column and the same
+       three panes stack -- nothing moves in the tree, so `z`, the digits and
+       the focus ring all keep meaning what they meant.
+
+       The table sizes to its own rows here rather than taking 1fr, because
+       1fr is what put the void there: 20 sessions in a 50-row pane. Capped
+       at 60% so a hundred sessions cannot push the preview off the bottom;
+       past the cap the table scrolls, which is what it does anyway. */
+    #upper.-stacked {
+        layout: vertical;
+    }
+    #upper.-stacked #left_column {
+        width: 100%;
+        height: auto;
+        max-height: 60%;
+    }
+    #upper.-stacked #left_pane {
+        height: auto;
+        max-height: 100%;
+    }
+    #upper.-stacked #right_pane_scroll {
+        width: 100%;
+        height: 1fr;
+        /* The divider follows the pane to the edge it is now against. A
+           left border on a full-width pane is a frame, and reads as
+           clipped content -- the same reason the table has never had one. */
+        border-left: none;
+        border-top: round $primary;
+    }
+    #upper.-stacked #right_pane_scroll:focus {
+        border-left: none;
+        border-top: thick $accent;
     }
     /* Sized to what it holds, up to a cap. It was a fixed 35% -- fourteen
        lines standing over the three or four rows a queue usually has. */
@@ -5344,16 +5398,24 @@ class AutotmuxApp(App):
         """Whether the live pane is on screen under the current layout."""
         return bool(layout_spec(getattr(self, 'layout_mode', None))['preview'])
 
-    def _room_for_preview(self) -> bool:
-        """Whether the screen can afford the live pane beside the table.
+    def _preview_fit(self) -> str:
+        """Where the preview goes on this screen: 'beside', 'below', or ''.
 
         Measured on a phone: at 58 columns the table gets 56% of them, which
         is 32 -- so ``tu_improve`` renders as ``tu_impr`` and LEFT, LOAD and
         STATUS vanish entirely, while the 25 columns spent on the preview are
         too few to read anything in. The split view is a desktop layout, and
-        below this width it costs the table everything and buys nothing.
+        below that width it costs the table everything and buys nothing.
+
+        That was the whole rule, and it left the pane off a phone entirely --
+        where the screen has no width to give and 47 spare rows. Held
+        upright there is room underneath, which is where it goes.
         """
-        return self.size.width >= _MIN_SPLIT_WIDTH
+        return preview_fit(int(self.size.width), int(self.size.height))
+
+    def _room_for_preview(self) -> bool:
+        """Whether the preview fits anywhere on this screen."""
+        return bool(self._preview_fit())
 
     # ── publishing what you can do (touch clients) ───────────────────────
 
@@ -5436,7 +5498,8 @@ class AutotmuxApp(App):
         # Not a mode of its own: `z` still cycles the same four, and split
         # simply looks like wide until there is room. A narrow terminal is a
         # property of the screen, not a choice to be remembered.
-        show_preview = spec['preview'] and self._room_for_preview()
+        fit = self._preview_fit()
+        show_preview = bool(spec['preview'] and fit)
 
         # #upper is 1fr high: leaving it displayed with both children hidden
         # would reserve the whole body to draw nothing in. The queue lives in
@@ -5448,7 +5511,13 @@ class AutotmuxApp(App):
         column.display = show_left
         table.display = spec['table']
         preview.display = show_preview
-        column.set_class(not show_preview, '-full')
+        # Beside, or underneath. The class turns #upper's own layout from a
+        # row into a column; nothing moves in the tree, so which pane holds
+        # the keyboard and what `z` cycles are unchanged by it.
+        upper.set_class(show_preview and fit == 'below', '-stacked')
+        # Full width whenever nothing is beside it -- which is both when
+        # there is no preview and when the preview is under it.
+        column.set_class(not show_preview or fit == 'below', '-full')
         jobs.display = spec['jobs']
         jobs.set_class(spec['expand_jobs'], '-full')
         table_arrived = bool(spec['table']) and not was_table

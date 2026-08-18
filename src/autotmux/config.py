@@ -89,6 +89,19 @@ _LAYOUT_FILE_LIMIT = 4 * 1024
 LAYOUT_SPLIT_WIDTH = 118
 LAYOUT_TABLE_WIDTH = 65
 LAYOUT_WIDTHS = (LAYOUT_SPLIT_WIDTH, LAYOUT_TABLE_WIDTH)
+# The other way the preview can fit: under the table rather than beside it.
+#
+# The width rule above is right about *beside* and had never considered
+# *below*. Measured on a phone held upright -- 66 columns by 75 rows -- the
+# preview was off, and 47 of those 75 rows were blank: 63% of the screen,
+# on the one device where there is least of it. The rows the split view
+# cannot use across, this one uses down.
+#
+# 40 rows, so that a terminal short enough for the two panes to crowd each
+# other keeps the layout it has: a phone upright has 75, a phone on its side
+# has 28 and is wide enough to split properly anyway, and the 24-row terminal
+# a laptop opens by default is left alone.
+LAYOUT_STACK_HEIGHT = 40
 # Session lifecycle, shared by the daemon that runs the command and the agent
 # that forwards it. A name tmux will accept as a target without ambiguity: it
 # uses ':' and '.' to address windows and panes, so a session carrying either

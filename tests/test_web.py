@@ -1948,6 +1948,31 @@ class LayoutContractTests(unittest.TestCase):
         its font to land on a breakpoint the TUI does not have."""
         from autotmux import cli, config
         self.assertEqual(cli._MIN_SPLIT_WIDTH, config.LAYOUT_SPLIT_WIDTH)
+        self.assertEqual(cli._MIN_STACK_HEIGHT, config.LAYOUT_STACK_HEIGHT)
+
+    def test_where_the_preview_fits_on_a_screen_this_shape(self):
+        """The rule was a single comparison against the width -- correct
+        about *beside*, and never asked about *below*. Measured on a phone
+        held upright, 66x75: no preview, and 47 of the 75 rows blank."""
+        from autotmux import cli, config
+        wide, tall = config.LAYOUT_SPLIT_WIDTH, config.LAYOUT_STACK_HEIGHT
+        for width, height, want in (
+                (wide, 24, 'beside'),      # a desktop terminal
+                (wide + 40, 100, 'beside'),
+                (wide - 1, tall, 'below'),  # a phone held upright
+                (66, 75, 'below'),
+                (wide - 1, tall - 1, ''),   # room in neither direction
+                (58, 24, ''),
+                # Width wins where both fit: side by side keeps the rows for
+                # the list, which is the pane people navigate by.
+                (wide, tall, 'beside')):
+            with self.subTest(size=(width, height)):
+                self.assertEqual(cli.preview_fit(width, height), want)
+
+    def test_a_phone_on_its_side_still_splits_properly(self):
+        """119x28: too short to stack, and wide enough not to need to."""
+        from autotmux import cli
+        self.assertEqual(cli.preview_fit(119, 28), 'beside')
 
     def test_the_page_is_told_the_widths(self):
         from autotmux import config
