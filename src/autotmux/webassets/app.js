@@ -2584,12 +2584,23 @@
   // ~12.5px, and low enough that an iPad and a phone on its side still afford
   // the 118-column split -- both land at ~11, measured.
   //
-  // The ceiling was 16, on the theory that extra width is better spent on
-  // columns than on letter height. That is only true while there is a wider
-  // layout to spend it on, and there is not: 118 is the widest the dashboard
-  // has. A 2560px screen was drawing a 258-column grid of which 140 columns
-  // were blank by construction, at the smallest type this page ever uses.
-  var MIN_AUTO = 11, MAX_AUTO = 20;
+  // The ceiling is not one number, because a size in CSS pixels means
+  // different things on different screens. A Retina display draws two device
+  // pixels per CSS pixel, so 13px type there is laid down with as many dots
+  // as 26px type on a 1x monitor: it stays sharp at a density that would be
+  // mush on the other one.
+  //
+  // Measured on the machine this was reported from -- a 14" MacBook Pro,
+  // 3024x1964 behind 1512 CSS pixels. A native terminal on it shows around
+  // 200 columns. Stretching the font until exactly the 118-column layout
+  // fitted gave 122, and 118 is the *minimum* for the split view, not a
+  // target: past it the extra columns go to the table and the preview in
+  // the same 56/44 proportion, which is the thing a big screen is for.
+  var MIN_AUTO = 11;
+
+  function maxAuto() {
+    return (window.devicePixelRatio || 1) >= 2 ? 13 : 16;
+  }
 
   // The widest layout this screen can afford at a legible size. Cell width is
   // exactly proportional to font size -- checked across 7px to 16px, the
@@ -2605,7 +2616,7 @@
       // Round down: rounding up lands one column short of the target, which
       // is the one place it must not land.
       size = Math.floor(width / widths[i] / perPoint * 2) / 2;
-      if (size >= MIN_AUTO) return Math.min(size, MAX_AUTO);
+      if (size >= MIN_AUTO) return Math.min(size, maxAuto());
     }
     // No layout reaches the floor -- a 320px phone is the case. Take the
     // narrowest layout at whatever it costs rather than the floor at

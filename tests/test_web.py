@@ -2162,19 +2162,21 @@ class AutoFontTests(unittest.TestCase):
     def setUpClass(cls):
         with open(os.path.join(web.ASSETS, 'app.js'), encoding='utf-8') as f:
             cls.app = f.read()
-        cls.source = _extract(cls.app, 'autoFont')
-        cls.bounds = re.search(r'var MIN_AUTO = ([\d.]+), MAX_AUTO = ([\d.]+)',
-                               cls.app)
+        cls.source = (_extract(cls.app, 'autoFont') + '\n'
+                      + _extract(cls.app, 'maxAuto'))
+        cls.floor = float(re.search(r'var MIN_AUTO = ([\d.]+)',
+                                    cls.app).group(1))
 
-    def font_for(self, width, widths=None):
+    def font_for(self, width, widths=None, dpr=2):
         from autotmux import config
         widths = list(widths or config.LAYOUT_WIDTHS)
         harness = f"""
         var RATIO = {self.RATIO};
+        var window = {{ devicePixelRatio: {dpr} }};
         var term = {{ options: {{ fontSize: 13 }} }};
         function cellSize() {{ return {{ w: 13 * RATIO, h: 13 * 1.2 }}; }}
         function layoutWidths() {{ return {json.dumps(widths)}; }}
-        var MIN_AUTO = {self.bounds.group(1)}, MAX_AUTO = {self.bounds.group(2)};
+        var MIN_AUTO = {self.floor};
         {self.source}
         console.log(JSON.stringify(autoFont({width})));
         """
@@ -2222,21 +2224,16 @@ class AutoFontTests(unittest.TestCase):
                     f'{width}px -> {font}px -> {cols} columns, '
                     f'which is no layout')
 
-    def test_the_extra_width_of_a_big_screen_goes_into_the_letters(self):
-        """The ceiling used to be 16px on the theory that extra width is
-        better spent on columns than on letter height. That is only true
-        while there is a wider layout to spend it on: 118 is the widest the
-        dashboard has, so a 2560px screen was drawing 258 columns of which
-        140 were blank by construction, at the smallest type the page uses.
-        """
+    def test_a_big_screen_is_never_narrower_than_the_split_needs(self):
+        """Whatever the ceiling is, the screen that can afford the widest
+        layout has to actually get it."""
         from autotmux import config
-        small = self.font_for(1280)
-        big = self.font_for(2560)
-        self.assertGreater(big, 16.0)
-        self.assertGreaterEqual(big, small)
-        # And it still reaches the widest layout it is spending width on.
-        self.assertGreaterEqual(self.columns(2560, big),
-                                config.LAYOUT_SPLIT_WIDTH)
+        for width in (1280, 1512, 1920, 2560):
+            for dpr in (1, 2):
+                with self.subTest(width=width, dpr=dpr):
+                    font = self.font_for(width, dpr=dpr)
+                    self.assertGreaterEqual(self.columns(width, font),
+                                            config.LAYOUT_SPLIT_WIDTH)
 
     def test_a_tablet_gets_the_split_view(self):
         """820px is an iPad in portrait -- the width where the preview pane
@@ -2254,7 +2251,7 @@ class AutoFontTests(unittest.TestCase):
         fraction it rounded away -- 117 columns where 118 was the point.
         """
         from autotmux import config
-        floor = float(self.bounds.group(1))
+        floor = self.floor
         for width in (320, 375, 390, 414, 428, 744, 768, 820, 834, 1024,
                       1133, 1180, 1280, 1440, 1680, 1920, 2560):
             font = self.font_for(width)
@@ -2279,7 +2276,7 @@ class AutoFontTests(unittest.TestCase):
         So the narrowest layout wins there, at whatever size it costs.
         """
         from autotmux import config
-        low = float(self.bounds.group(1))
+        low = self.floor
         narrowest = min(config.LAYOUT_WIDTHS)
         for width in (240, 280, 320):
             font = self.font_for(width)
@@ -2289,18 +2286,33 @@ class AutoFontTests(unittest.TestCase):
                 self.assertLess(font, low)
                 self.assertGreaterEqual(font, 6)
 
+    def test_a_sharper_screen_is_allowed_denser_type(self):
+        """A ceiling in CSS pixels means different things on different
+        screens: a Retina display draws two device pixels per CSS pixel, so
+        13px type there is laid down with as many dots as 26px type on a 1x
+        monitor. Measured on the machine this was reported from -- a 14"
+        MacBook Pro, 3024x1964 behind 1512 CSS pixels, where a native
+        terminal shows around 200 columns and the console was showing 122.
+        """
+        retina = self.font_for(1512, dpr=2)
+        plain = self.font_for(1512, dpr=1)
+        self.assertLess(retina, plain)
+        self.assertGreaterEqual(self.columns(1512, retina), 180)
+
     def test_it_stops_growing(self):
         """A screen with more width than the widest layout needs spends the
         rest on letter height -- but not without end."""
-        high = float(self.bounds.group(2))
-        self.assertEqual(self.font_for(3000), high)
-        for width in (320, 390, 428, 768, 820, 1024, 1180, 1680, 2560):
-            with self.subTest(width=width):
-                self.assertLessEqual(self.font_for(width), high)
+        for dpr in (1, 2, 3):
+            biggest = self.font_for(3000, dpr=dpr)
+            with self.subTest(dpr=dpr):
+                self.assertEqual(self.font_for(6000, dpr=dpr), biggest)
+                for width in (320, 390, 428, 768, 820, 1024, 1680, 2560):
+                    self.assertLessEqual(self.font_for(width, dpr=dpr),
+                                         biggest)
 
     def test_a_screen_that_can_reach_the_floor_does(self):
         """The floor only yields where no layout can be had above it."""
-        low = float(self.bounds.group(1))
+        low = self.floor
         for width in (390, 393, 430, 768, 820, 1024, 1512, 2560):
             with self.subTest(width=width):
                 self.assertGreaterEqual(self.font_for(width), low)
