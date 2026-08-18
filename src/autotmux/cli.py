@@ -4177,6 +4177,11 @@ class AutotmuxApp(App):
                  select: tuple[str, str] | None = None) -> None:
         super().__init__()
         self._connection_setup_pending = bool(offer_connection_setup)
+        # Whether the terminal currently belongs to something else. Set here
+        # rather than only in suspend(), because the preview worker reads it
+        # and starts before any handover can happen.
+        self._suspended = False
+        self._background: list = []
         # (node, session) to open on, from --select. See on_mount.
         self._select = select
         self._connection_manager_open = False
@@ -4374,10 +4379,15 @@ class AutotmuxApp(App):
         # longer freeze atmux before its first frame appears.
         self._refresh_table({})
         self._refresh_jobs({})
-        self.set_interval(5, self._refresh_async)
-        # Snapshot reload runs in a worker thread to avoid blocking the
-        # event loop on filesystem hiccups.
-        self.set_interval(30, self._reload_snapshots_async)
+        # Held, so they can be stopped while the screen is not ours. See
+        # suspend(): one state fetch is five SSH round trips and measured
+        # 857ms, and while a session is attached nobody can see the result.
+        self._background = [
+            self.set_interval(5, self._refresh_async),
+            # Snapshot reload runs in a worker thread to avoid blocking the
+            # event loop on filesystem hiccups.
+            self.set_interval(30, self._reload_snapshots_async),
+        ]
         self.run_worker(self._preview_loop(), exclusive=True)
         # Do not hide persisted keep-alive markers for the first five seconds.
         # This remains a bounded background read, so a sick NFS home never
@@ -5500,12 +5510,31 @@ class AutotmuxApp(App):
         draw a button or answer a question about its own keys, so the client
         gets the one static set that situation actually calls for -- and gets
         the app's own back the moment the app is drawing again.
+
+        The polling stops with it. Textual's suspend() gives back the
+        terminal; it does not stop the app's timers, so atmux went on
+        fetching state from every gateway every five seconds and capturing
+        previews for a row nobody could see -- one fetch measured 857ms of
+        SSH round trips, against a session the user was typing into over the
+        same laptop and the same link. Measured on this machine it cost the
+        keystrokes nothing, and it is still five connections' worth of work
+        per five seconds for a screen that is not on screen.
         """
         self._publish_keys('external')
+        self._suspended = True
+        for timer in getattr(self, '_background', ()):
+            timer.pause()
         try:
             with super().suspend():
                 yield
         finally:
+            self._suspended = False
+            for timer in getattr(self, '_background', ()):
+                timer.resume()
+            # The list is however old the handover was long. Ask now rather
+            # than up to five seconds from now: the reason you came back is
+            # usually that you changed something in there.
+            self.call_later(self._refresh_async)
             # Force a re-send: the app's payload is very likely the one that
             # was published before the handover, and unchanged payloads are
             # suppressed.
@@ -5966,6 +5995,11 @@ class AutotmuxApp(App):
             # the session — Textual does not restart a dead worker.
             try:
                 await asyncio.sleep(_PREVIEW_LOOP_TICK)
+                if getattr(self, '_suspended', False):
+                    # The screen belongs to tmux. A capture-pane now is a
+                    # screenful of text over the same link the user is
+                    # typing on, for a pane they are already looking at.
+                    continue
                 # Drop expired backoff so the dicts can't grow without bound over
                 # a long session AND a reused (node,sess) name doesn't inherit a
                 # stale 60s backoff from a since-departed job.

@@ -1857,6 +1857,69 @@ class ComposedRowTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 str(app.table.get_cell_at(Coordinate(row, 0))).startswith('● 2h'))
 
+class SuspendedPollingTests(unittest.IsolatedAsyncioTestCase):
+    """Nothing polls while the screen belongs to something else.
+
+    Textual's suspend() gives back the terminal; it does not stop the app's
+    timers. So atmux went on fetching state from every gateway every five
+    seconds, and capturing previews for a row nobody could see, while the
+    user was typing into an SSH session over the same laptop and the same
+    link. Measured on one machine it cost the keystrokes nothing -- and it is
+    still five connections' worth of work every five seconds for a screen
+    that is not on screen.
+    """
+
+    async def test_the_timers_stop_and_start_again(self):
+        with tempfile.TemporaryDirectory() as td:
+            _setup_state(td)
+            app = autotmux.AutotmuxApp()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                self.assertTrue(app._background, 'no timers were kept')
+                self.assertFalse(any(t._active.is_set() is False
+                                     for t in app._background),
+                                 'a timer was paused before anything happened')
+                # Textual's own suspend refuses to run under the test
+                # driver -- there is no terminal to give back. Ours is the
+                # part under test, so the parent's is stood in for.
+                import contextlib
+                from textual.app import App
+
+                @contextlib.contextmanager
+                def nothing(self):
+                    yield
+
+                with mock.patch.object(App, 'suspend', nothing):
+                    with app.suspend():
+                        self.assertTrue(app._suspended)
+                        for timer in app._background:
+                            self.assertFalse(timer._active.is_set(),
+                                             'a timer kept running')
+                await pilot.pause()
+                self.assertFalse(app._suspended)
+                for timer in app._background:
+                    self.assertTrue(timer._active.is_set(),
+                                    'a timer never came back')
+
+    async def test_the_list_is_asked_for_again_on_the_way_back(self):
+        """However long the handover was, that is how old the list is -- and
+        the reason you were in there is usually that you changed it."""
+        source = inspect.getsource(autotmux.AutotmuxApp.suspend)
+        self.assertIn('_refresh_async', source)
+        after = source[source.index('finally:'):]
+        self.assertIn('_refresh_async', after)
+
+    async def test_the_preview_worker_takes_the_hint_too(self):
+        """It is not a timer, so pausing the timers does not reach it -- and
+        a capture-pane is a screenful of text over the link the user is
+        typing on, for a pane they are already looking at."""
+        source = inspect.getsource(autotmux.AutotmuxApp._preview_loop)
+        self.assertIn("_suspended", source)
+        # Before the work, not after it.
+        head = source[:source.index('_suspended')]
+        self.assertNotIn('ipc.request', head)
+
+
 class SelectTargetTests(unittest.TestCase):
     """What a browser may ask the dashboard to stand on.
 
