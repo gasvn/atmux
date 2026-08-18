@@ -687,6 +687,64 @@
   // Where the drawer's lower edge sits: the top of the handle, which is one
   // row above the settings row. Expressed as an offset from the pad's bottom,
   // because that is what `bottom` on an absolutely positioned box means here.
+  // ── where the drawer rests ────────────────────────────────────────────
+  // Open, at exactly the height of the row it sits over.
+  //
+  // It used to rest closed, behind a button that said `37 more keys`. That
+  // button was a step asked for nothing: the thing behind it is a scrolling
+  // list, and the finger that would press it is the finger that would have
+  // flicked. Making the row *underneath* scroll instead was the obvious
+  // repair and it is the wrong one -- a key in a natively scrolling box needs
+  // `touch-action: pan-y`, the browser then arbitrates tap-versus-scroll, and
+  // a key that never hears the pointercancel types whatever you dragged
+  // across. That happened once already; the drawer is hand-scrolled with
+  // `touch-action: none` throughout for exactly this reason, and it is the
+  // only box here that can hold keys and still be dragged over safely.
+  //
+  // So the scroller that already exists simply stops being shut. #keys stays
+  // in flow underneath and is what reserves this space -- padCover() counts
+  // it, so a drawer resting at that height shifts the terminal by nothing.
+  // Walked, not queried, for the same reason firstRow below is: the
+  // sections are boxed, so the first heading is not a direct child.
+  function firstHead(node) {
+    if (!node) return null;
+    for (var i = 0; i < node.children.length; i++) {
+      var child = node.children[i];
+      if (String(child.className).indexOf('ghead') >= 0) return child;
+      var found = firstHead(child);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function headHeight() {
+    var head = firstHead(sheetKeys);
+    var box = head ? head.getBoundingClientRect().height : 0;
+    return box > 0 ? box : 25;
+  }
+
+  function sheetRest() {
+    if (!keys) return 0;
+    var reserved = keys.getBoundingClientRect();
+    if (!(reserved.width > 0)) return 0;
+    // One heading and one whole row -- which is exactly what the row
+    // underneath was showing, and a half-cut row is a row you can see and
+    // cannot press. The drawer has 8px of top padding the row did not, so
+    // matching its height alone left the keys sliced.
+    //
+    // Never past the pad's own rows: beyond those it would be taking the
+    // terminal's, and resting is meant to cost nothing at all.
+    var want = 8 + headHeight() + sheetRowHeight();
+    return Math.min(Math.round(padCover()),
+                    Math.round(Math.max(reserved.height, want)));
+  }
+
+  // At rest it is the row it replaces; the row is hidden while typing, and a
+  // drawer resting over nothing would be a drawer over the terminal.
+  function sheetResting() {
+    return !expanded && sheetRest() > 0;
+  }
+
   function sheetBase() {
     if (!pad || !expander) return 0;
     return Math.max(0, Math.round(pad.getBoundingClientRect().bottom
@@ -791,8 +849,18 @@
   function sizeSheet(px) {
     if (!sheet) return;
     if (!expanded) {
-      sheet.style.height = '';
+      var rest = sheetRest();
+      if (!rest) {                       // nothing to rest over: stay shut
+        sheet.style.height = '';
+        shiftTerminal(0);
+        return;
+      }
+      // Not remembered: this is where it sits, not a height anyone chose,
+      // and writing it into sheetHeight would lose the one they did.
+      sheet.style.bottom = sheetBase() + 'px';
+      sheet.style.height = rest + 'px';
       shiftTerminal(0);
+      markSheetEnd();
       return;
     }
     // Opening is always the natural size, never a number kept from last
@@ -1052,12 +1120,12 @@
 
     // The sheet, which covers the terminal rather than displacing it.
     if (sheet) {
-      sheet.classList.toggle('open', expanded);
+      sheet.classList.toggle('open', expanded || sheetRest() > 0);
       sheet.classList.toggle('editing', editing);
       sheetKeys.textContent = '';
       var placed = false;
       if (editButton) editButton.hidden = true;
-      if (expanded) {
+      if (expanded || sheetRest() > 0) {
         groups().forEach(function (group) {
           if (!group.keys.length) return;
           // Each section in its own box. A sticky heading is held by its
@@ -1097,14 +1165,20 @@
       //
       // The count says what it counts. `⌄ 38` was a glyph and a bare number,
       // and a number with no noun beside it is something you have to be told.
+      // `37 more keys` was a promise about keys that are now on screen, in
+      // the list resting above this. What is left is a grip, and a grip says
+      // what it does by being one: drag it for as much of the list as you
+      // want, tap it for all of it. Neither is needed to reach a key.
       var more = Math.max(total - drawn, 0);
+      var resting = sheetResting();
       if (grabCount) {
-        grabCount.textContent = expanded ? 'close' : more + ' more keys';
+        grabCount.textContent = expanded ? 'close' : (resting ? '' : more + ' more keys');
       }
       expander.classList.toggle('open', expanded);
       expander.setAttribute('aria-expanded', expanded ? 'true' : 'false');
       expander.setAttribute(
-        'aria-label', expanded ? 'fewer keys' : more + ' more keys');
+        'aria-label', expanded ? 'fewer keys'
+        : (resting ? 'taller list of keys' : more + ' more keys'));
     }
     // Opening the sheet leaves this unchanged, which is the entire point of
     // it being a sheet: refit() resizes the pty, and tmux answers a resize by
@@ -1428,7 +1502,7 @@
       // Nothing is changed yet, on purpose: a tap and a drag start
       // identically, and opening here would make the tap path start from the
       // drag's own floor rather than from the height a tap should give.
-      from = expanded ? (sheetHeight || sheetPeek()) : 0;
+      from = expanded ? (sheetHeight || sheetPeek()) : sheetRest();
     }
 
     function moved(event) {

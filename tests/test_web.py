@@ -2486,6 +2486,24 @@ pad.getBoundingClientRect = function () {
   });
   return { width: keys._width || 0, height: 44 * rows + 51 };
 };
+// And each of the pad's own boxes measures the same way. Without this they
+// are all 0 tall, padCover() is 0, and a drawer that rests at the height of
+// the row it covers rests at nothing -- so the resting state would be
+// untestable here and every test would pass for the wrong reason.
+[nav, pinRow, keys].forEach(function (box) {
+  box.getBoundingClientRect = function () {
+    if (box.style.display === 'none') return { width: 0, height: 0 };
+    // A height set by hand wins: some tests state one directly, and a model
+    // that overrode it would be answering a question nobody asked.
+    if (box._height) return { width: keys._width || 0, height: box._height };
+    var rows = box.children.filter(function (c) { return c._cls.krow; }).length;
+    box.children.forEach(function (child) {
+      if (!child._cls.gsec) return;
+      rows += child.children.filter(function (c) { return c._cls.krow; }).length;
+    });
+    return { width: keys._width || 0, height: rows ? 44 * rows + 11 : 0 };
+  };
+});
 var current = [], expanded = false;
 var sent = [];
 // Enough of localStorage to prove a choice is remembered, and to be thrown
@@ -2584,7 +2602,8 @@ class KeypadVocabularyTests(unittest.TestCase):
                  'padCover', 'sheetBase', 'keepVisibleRow', 'freeSpace',
                  'neededShift', 'reshiftSoon', 'sheetContent',
                  'sheetRowHeight', 'sheetRoom', 'sheetPeek', 'sheetFloor',
-                 'shiftTerminal',
+                 'shiftTerminal', 'firstHead', 'headHeight', 'sheetRest',
+                 'sheetResting',
                  'sizeSheet', 'markSheetEnd')
     SCALARS = ('var published =', 'var debugBox =', 'var moves =',
                'var held =', 'var SLOP =', 'var scrolledBack =',
@@ -3028,20 +3047,27 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     # ── the drawer ────────────────────────────────────────────────────────
 
-    def render(self, published=(), expanded=False, width=390):
+    def render(self, published=(), expanded=False, width=390, rest=True):
         """Whichever surface is showing.
 
         Two surfaces now, not one: #keys is a single row that is always in the
         layout, and the sheet is everything, over the terminal rather than
         displacing it. `row` is the first, `keys` is whichever one you are
         looking at.
+
+        `rest=False` is the case where the drawer has nothing to rest over --
+        the row underneath is what reserves its space, and while the software
+        keyboard is up that row stands down.
         """
         return self.run_js(f'''
             current = {json.dumps(list(published))};
             expanded = {json.dumps(expanded)};
             keys._width = {width};
+            keys.style.display = {json.dumps('' if rest else 'none')};
             renderKeys();
-            var surface = expanded ? sheetKeys : keys;
+            // At rest you are looking at the drawer, not at the row it
+            // covers -- the row is underneath it reserving the space.
+            var surface = (expanded || sheetResting()) ? sheetKeys : keys;
             console.log(JSON.stringify({{
               keys: drawn(surface, []), heads: headings(surface, []),
               rows: rows(surface, []).length,
@@ -3049,23 +3075,28 @@ class KeypadVocabularyTests(unittest.TestCase):
               open: !!sheet._cls.open,
               more: grabCount.textContent }}));''')
 
-    def test_a_closed_drawer_shows_the_apps_own_keys(self):
-        """What you can do on the screen in front of you, two rows of it --
-        which is what it has always shown and what it should keep showing."""
+    def test_a_resting_drawer_leads_with_the_apps_own_keys(self):
+        """What you can do on the screen in front of you comes first, and the
+        rest is a flick below it rather than behind a button."""
         published = [{'k': 'z', 'l': 'Layout'}, {'k': 's', 'l': 'SSH'}]
-        self.assertEqual(self.render(published)['keys'], ['Layout', 'SSH'])
+        shown = self.render(published)['keys']
+        self.assertEqual(shown[:2], ['Layout', 'SSH'])
+        self.assertGreater(len(shown), 2, 'nothing to scroll to')
+        # And the row underneath, which is what reserves the space, still
+        # holds exactly what it always did.
+        self.assertEqual(self.render(published)['row'], ['Layout', 'SSH'])
 
     def test_a_closed_drawer_falls_back_to_tmux_when_nothing_is_published(self):
         """Nothing published means the screen belongs to tmux or a shell.
         Showing an empty drawer there is what put detach behind a tap."""
         shown = self.render()['keys']
         self.assertEqual(shown[0], 'detach')
-        # One row when collapsed, not two -- the pad was taking 45% of the
-        # screen. Five across, because the whole panel is on one pitch now:
-        # the navigation row above holds ten keys and has to divide evenly,
-        # so it picks five, and this follows it. It used to be four here and
-        # five above, and none of the vertical seams lined up.
-        self.assertEqual(len(shown), 5)
+        # One row of it is what rests in view; the rest is a flick below.
+        # Five across, because the whole panel is on one pitch: the
+        # navigation cluster above is three and three, and this follows the
+        # width rather than either of them.
+        self.assertEqual(self.render()['row'], shown[:5])
+        self.assertGreater(len(shown), 5)
 
     def test_an_open_drawer_reaches_every_section(self):
         published = [{'k': 'z', 'l': 'Layout'}]
@@ -3080,26 +3111,75 @@ class KeypadVocabularyTests(unittest.TestCase):
         page = self.render([{'k': 'z', 'l': 'Layout'}], expanded=True)
         self.assertEqual(len(page['keys']), len(set(page['keys'])))
 
-    def test_the_expander_is_offered_even_with_nothing_published(self):
-        """It used to hide itself when the published list fitted, which in a
-        bare shell -- where nothing is published at all -- left the pad at
-        three keys and no way to reach any others."""
-        self.assertTrue(self.render()['more'].endswith('more keys'))
-        self.assertFalse(self.render()['more'].startswith('0 '))
+    def test_the_drawer_rests_open_rather_than_shut(self):
+        """The complaint this answers: `37 more keys` was a button in front
+        of a list that is already a scroller, and the finger that would press
+        it is the finger that would have flicked."""
+        page = self.render()
+        self.assertTrue(page['open'], 'the drawer is still shut at rest')
+        self.assertGreater(page['rows'], 1, 'nothing to scroll to')
 
-    def test_the_count_says_what_it_counts(self):
-        """`⌄ 38` was a chevron and a bare number sitting four buttons away
-        from `▾`, a near-identical chevron meaning "hide the keypad". A number
-        with no noun beside it is something you have to be told."""
+    def test_resting_costs_the_terminal_nothing(self):
+        """The reason it can rest at all. It grows upward over the pad's own
+        rows first, and padCover() counts them -- so a drawer no taller than
+        those shifts the terminal by exactly nothing. That is also the cap:
+        past them it would be taking the terminal's rows to sit still."""
+        self.assertEqual(self.run_js("""
+            current = []; expanded = false; keys._width = 390;
+            renderKeys(); sizeSheet();
+            console.log(JSON.stringify(
+              [sheetRest() <= Math.round(padCover()),
+               neededShift(), host.style.transform]));"""),
+            [True, 0, ''])
+
+    def test_it_rests_at_a_whole_row_rather_than_a_sliced_one(self):
+        """A half-cut row is a row you can see and cannot press, and the row
+        it replaced was pressable. The drawer has 8px of top padding that row
+        did not, so matching its height alone left the keys sliced."""
+        self.assertEqual(self.run_js("""
+            current = []; expanded = false; keys._width = 390;
+            renderKeys();
+            console.log(JSON.stringify(
+              sheetRest() >= 8 + headHeight() + sheetRowHeight()));"""), True)
+
+    def test_with_nothing_to_rest_over_it_is_shut(self):
+        """The row underneath is what reserves the space. While the software
+        keyboard is up that row stands down, and a drawer resting over
+        nothing would be a drawer resting over the terminal."""
+        self.assertEqual(self.run_js("""
+            current = []; expanded = false; keys._width = 390;
+            keys.style.display = 'none';
+            renderKeys(); sizeSheet();
+            console.log(JSON.stringify(
+              [sheetRest(), sheetResting(), !!sheet._cls.open]));"""),
+            [0, False, False])
+
+    def test_a_drag_out_of_rest_starts_from_rest(self):
+        """It used to start from zero, because closed was zero. Dragging up
+        would have jumped the drawer down to nothing first and then grown it
+        from there, out from under the finger."""
+        # The handle's own down(), not the key's -- there are two, and
+        # `function down(event)` finds the wrong one first.
+        down = self.js[self.js.index('var GRAB_SLOP'):]
+        down = down[:down.index('function moved')]
+        self.assertIn('from = expanded ? (sheetHeight || sheetPeek()) '
+                      ': sheetRest();', down)
+
+    def test_the_grip_stops_promising_keys_that_are_on_screen(self):
+        """It said `37 more keys`, and that was the reason it read as a step:
+        keys behind a button you have to press. The drawer rests open now, so
+        they are not behind anything -- what is left is a grip, and a grip
+        says what it does by being one."""
+        self.assertEqual(self.render()['more'], '')
+        # And it still says something when there is genuinely nothing for it
+        # to rest over -- there the drawer really is shut.
+        self.assertTrue(self.render(rest=False)['more'].endswith('more keys'))
+        self.assertFalse(self.render(rest=False)['more'].startswith('0 '))
+
+    def test_it_says_the_way_out_once_it_is_open(self):
+        """A drawer taller than it rests has to say how to put it back."""
         published = [{'k': 'z', 'l': 'Layout'}]
-        closed = self.render(published)
-        opened = self.render(published, expanded=True)
-        self.assertEqual(int(closed['more'].split()[0]),
-                         len(opened['keys']) - len(closed['keys']))
-        self.assertIn('more keys', closed['more'])
-        # And it says what tapping does once it is open, rather than showing
-        # the same chevron upside down.
-        self.assertEqual(opened['more'], 'close')
+        self.assertEqual(self.render(published, expanded=True)['more'], 'close')
 
     # ── how many across ───────────────────────────────────────────────────
 
@@ -3167,7 +3247,10 @@ class KeypadVocabularyTests(unittest.TestCase):
             expanded = false; renderKeys();
             console.log(JSON.stringify(
               [afterOpen - settled, fits - afterOpen, !!sheet._cls.open]));'''),
-            [0, 0, False])
+            # Open at both ends: it rests open over the row it covers, and
+            # opening it further is still free -- which is the whole reason
+            # it is a sheet.
+            [0, 0, True])
 
     def test_the_pad_growing_a_row_does_resize_it(self):
         """The other direction, and the reason this is measured rather than
