@@ -4838,7 +4838,7 @@ class DashboardListTests(unittest.TestCase):
         parts.append(tiers.group(0))
         for name in ('tierClass', 'share', 'gpuShare', 'level', 'paintRail',
                      'keyOf', 'bandKey', 'planList', 'makeBand', 'makeRow',
-                     'paint', 'syncList'):
+                     'paint', 'syncList', 'nextStop'):
             parts.append(_extract(cls.source, name))
         parts.append("var list = document.createElement('ul');")
         parts.append('var kept = new Map();')
@@ -5077,6 +5077,102 @@ class DashboardListTests(unittest.TestCase):
         self.assertIn('busy()', render)
         # And the held update is applied the moment the gesture is over.
         self.assertIn('flush', _extract(self.source, 'closeSheet'))
+
+    # ── the sheet: asking, reporting, and getting out ─────────────────────
+
+    def test_nothing_asks_through_a_system_dialog(self):
+        """The kill confirm went to the trouble of living in the card, and
+        its comment says why -- iOS draws a prompt() as a system dialog over
+        everything, in a wording this page does not choose. `new` reached
+        straight for one anyway."""
+        # Statements only. The comment above the kill confirm names both of
+        # these to say why it does not use them, and an assertion that reads
+        # the comments is an assertion that fails when the code is right.
+        code = '\n'.join(line for line in self.source.splitlines()
+                         if not line.lstrip().startswith('//'))
+        for banned in ('prompt(', 'confirm(', 'alert('):
+            self.assertNotIn(banned, code)
+        body = _extract(self.source, 'askName')
+        self.assertIn("field.type = 'text'", body)
+        # A phone's keyboard would otherwise capitalise a session name and
+        # offer to correct it to an English word.
+        self.assertIn("field.autocapitalize = 'none'", body)
+        self.assertIn('field.spellcheck = false', body)
+        # Enter is what a name field is for.
+        self.assertIn("event.key !== 'Enter'", body)
+
+    def test_the_name_field_is_large_enough_not_to_zoom_the_page(self):
+        """Under 16px iOS zooms the whole document the moment the field
+        takes focus, and the sheet ends up half off the screen."""
+        with open(os.path.join(web.ASSETS, 'dash.html'),
+                  encoding='utf-8') as handle:
+            css = handle.read()
+        rule = re.search(r'\.field \{(.*?)\}', css, re.S)
+        self.assertIsNotNone(rule)
+        size = re.search(r'font-size:\s*(\d+)px', rule.group(1))
+        self.assertIsNotNone(size, 'the field sets no size of its own')
+        self.assertGreaterEqual(int(size.group(1)), 16)
+
+    def test_the_keyboard_cannot_cover_the_card(self):
+        """`position: fixed` is laid out against the layout viewport, which
+        iOS does not shrink for the keyboard. The visual viewport is the one
+        that knows."""
+        self.assertIn('visualViewport', self.source)
+        self.assertIn('paddingBottom', self.source)
+
+    def test_a_failure_you_asked_for_outlives_the_poll(self):
+        """render() used to clear the banner unconditionally on its next
+        tick, so a kill that came back "no such session" said why for at
+        most five seconds -- and for none at all when a poll was already in
+        flight. That is indistinguishable from the button doing nothing."""
+        render = _extract(self.source, 'render')
+        self.assertIn('errHeld', render)
+        self.assertNotIn('err.hidden', render)
+        send = _extract(self.source, 'send')
+        # Held on failure, cleared on success -- not the other way round.
+        self.assertIn('true)', send[send.index('showError'):])
+        self.assertIn('clearError()', send)
+        # And a message about the connection still comes and goes with it.
+        poll = _extract(self.source, 'poll')
+        self.assertIn('showError', poll)
+        self.assertIn('false)', poll[poll.index('showError'):])
+
+    def test_the_held_message_can_be_got_rid_of(self):
+        """Held until acknowledged means there has to be a way to
+        acknowledge it."""
+        self.assertIn("err.addEventListener('click', clearError)", self.source)
+        self.assertIn('tap to dismiss', self.source)
+
+    def test_escape_closes_the_sheet(self):
+        """There were no key listeners on this page at all. On a laptop the
+        sheet opens with a right-click and could not be closed."""
+        self.assertIn("event.key === 'Escape'", self.source)
+        self.assertIn('closeSheet()', self.source)
+
+    def test_the_focus_goes_in_and_comes_back(self):
+        """aria-modal="true" is a claim that the rest of the document is
+        inert. It was made to a screen reader and honoured by nothing."""
+        self.assertIn('sheetOpener', _extract(self.source, 'openSheet'))
+        close = _extract(self.source, 'closeSheet')
+        self.assertIn('sheetOpener.focus', close)
+        # Only if it is still on the page: the list rebuilds around it.
+        self.assertIn('document.contains(sheetOpener)', close)
+
+    def test_a_tab_walks_the_card_and_does_not_leave_it(self):
+        """Six stops, entered from outside, walked in both directions."""
+        self.assertEqual(self.node_js(
+            "console.log(JSON.stringify(["
+            "nextStop(6, -1, false), nextStop(6, -1, true),"
+            "nextStop(6, 0, false), nextStop(6, 5, false),"
+            "nextStop(6, 0, true), nextStop(6, 5, true)]));"),
+            [0, 5, 1, 0, 5, 4])
+
+    def test_a_card_with_nothing_to_focus_keeps_the_key(self):
+        """Every stop disabled -- which is what `send` does while it waits.
+        Moving focus to stops[-1] would throw and eat the Tab besides."""
+        self.assertEqual(self.node_js(
+            "console.log(JSON.stringify([nextStop(0, -1, false),"
+            " nextStop(0, 3, true)]));"), [-1, -1])
 
     def test_the_source_carries_no_control_bytes(self):
         """A NUL inside a string literal runs, and makes grep call the file

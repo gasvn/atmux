@@ -391,7 +391,18 @@
     return true;
   }
 
+  // Where the focus was before the sheet took it, so it can be put back.
+  var sheetOpener = null;
+  var sheetCard = document.getElementById('sheetcard');
+
+  function focusFirst() {
+    var first = sheetActs.querySelector(
+      'input, button:not([disabled])');
+    if (first) { try { first.focus(); } catch (e) {} }
+  }
+
   function openSheet(row) {
+    sheetOpener = document.activeElement;
     var where = row.node_label || row.node;
     sheetTitle.textContent = row.kind === 'session'
       ? row.label + '  ·  ' + where : where;
@@ -422,7 +433,13 @@
     // translateY(100%) before the class that moves it can be a transition
     // rather than a jump.
     requestAnimationFrame(function () {
-      requestAnimationFrame(function () { sheet.classList.add('in'); });
+      requestAnimationFrame(function () {
+        sheet.classList.add('in');
+        // After it has started arriving, not before: focusing an element in
+        // a card still sitting at translateY(100%) asks the browser to
+        // scroll to somewhere off the bottom of the screen.
+        focusFirst();
+      });
     });
   }
 
@@ -433,18 +450,82 @@
     // Hidden after it has left, or it vanishes instead of leaving. The
     // timeout matches the longest transition on the card and is a backstop
     // for the reduced-motion case, where there is no transitionend at all.
-    var card = document.getElementById('sheetcard');
     var done = false;
     var finish = function () {
       if (done) return;
       done = true;
       sheet.hidden = true;
+      // Back where it came from. A dialog that drops the focus on the floor
+      // leaves the next Tab starting from the top of the document, which on
+      // a list this long is a long way from the row you were just on.
+      if (sheetOpener && sheetOpener.focus && document.contains(sheetOpener)) {
+        try { sheetOpener.focus(); } catch (e) {}
+      }
+      sheetOpener = null;
       // Whatever the poll had to hold back while this was open.
       flush();
     };
-    card.addEventListener('transitionend', finish, {once: true});
+    sheetCard.addEventListener('transitionend', finish, {once: true});
     setTimeout(finish, 400);
   }
+
+  // ── the keyboard half of the sheet ────────────────────────────────────
+  // There were no key listeners on this page at all, while the card
+  // declared aria-modal="true" -- a claim that the rest of the document is
+  // inert, made to a screen reader, and honoured by nothing. On a laptop the
+  // sheet opens with a right-click and could not be closed with Escape.
+  document.addEventListener('keydown', function (event) {
+    if (sheet.hidden) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeSheet();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    var stops = sheetCard.querySelectorAll('input, button:not([disabled])');
+    if (!stops.length) return;
+    // Every Tab while the card is open, not only the two at the ends.
+    //
+    // Catching the ends is the usual recipe and it does not hold here: Safari
+    // does not put buttons in the tab order at all unless the reader has
+    // turned that on, so the focus never *reaches* the last stop to be caught
+    // there -- measured, the first Tab left the card entirely. Taking the key
+    // over is deterministic on every browser, and costs nothing: the card's
+    // DOM order is its reading order, so this walks the same ring the
+    // browser would have.
+    var here = Array.prototype.indexOf.call(stops, document.activeElement);
+    var next = nextStop(stops.length, here, event.shiftKey);
+    if (next < 0) return;
+    event.preventDefault();
+    stops[next].focus();
+  });
+
+  // Which stop a Tab moves to. Pure, and separate, because the wrap is the
+  // part that can be wrong: from outside the card it enters at the near end,
+  // and from either end it comes round rather than leaving.
+  function nextStop(count, here, back) {
+    if (count < 1) return -1;
+    if (here < 0) return back ? count - 1 : 0;
+    return (here + (back ? -1 : 1) + count) % count;
+  }
+
+  // The keyboard covers the bottom of the screen and this card lives at the
+  // bottom of the screen. `position: fixed` is laid out against the layout
+  // viewport, which iOS does not shrink when the keyboard comes up, so the
+  // name field would open underneath it. The visual viewport is the one that
+  // knows.
+  (function trackKeyboard() {
+    var view = window.visualViewport;
+    if (!view) return;
+    var lift = function () {
+      var covered = Math.max(
+        0, window.innerHeight - view.height - view.offsetTop);
+      sheet.style.paddingBottom = Math.round(covered) + 'px';
+    };
+    view.addEventListener('resize', lift);
+    view.addEventListener('scroll', lift);
+    lift();
+  })();
 
   function runAct(act, row) {
     if (act === 'attach' || act === 'shell' || act === 'select') {
@@ -469,13 +550,60 @@
       return;
     }
     if (act === 'new') {
-      var name = window.prompt('Name for the new session on '
-                               + (row.node_label || row.node));
-      if (!name) return;
-      send('new', row, name.trim());
+      askName(row);
       return;
     }
     send(act, row);
+  }
+
+  // In the sheet, for the reason the kill confirm above is in the sheet:
+  // iOS draws a prompt() as a system dialog over everything, in a typeface
+  // and a wording this page does not choose, and it arrives while the card
+  // is still animating. `new` reached straight for one anyway.
+  function askName(row) {
+    var where = row.node_label || row.node;
+    sheetTitle.textContent = 'New session on ' + where;
+    sheetActs.textContent = '';
+
+    var field = document.createElement('input');
+    field.type = 'text';
+    field.className = 'field';
+    field.placeholder = 'name';
+    // A phone's keyboard will otherwise capitalise the first letter and
+    // offer to correct a session name to an English word.
+    field.autocapitalize = 'none';
+    field.autocomplete = 'off';
+    field.spellcheck = false;
+    field.enterKeyHint = 'go';
+    field.setAttribute('aria-label', 'name for the new session');
+
+    var create = document.createElement('button');
+    create.type = 'button';
+    create.className = 'act';
+    create.textContent = 'Create';
+    create.disabled = true;
+
+    // What is allowed is the daemon's decision -- it is the one that has to
+    // put this on a command line, and a second opinion here would be a
+    // second place to keep right. This only refuses the empty name, which
+    // is the one the daemon would answer with an error nobody needs to see.
+    var submit = function () {
+      var name = field.value.trim();
+      if (name) send('new', row, name);
+    };
+    field.addEventListener('input', function () {
+      create.disabled = !field.value.trim();
+    });
+    field.addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      submit();
+    });
+    create.addEventListener('click', submit);
+
+    sheetActs.appendChild(field);
+    sheetActs.appendChild(create);
+    field.focus();
   }
 
   function send(verb, row, session) {
@@ -491,22 +619,51 @@
       .then(function (answer) {
         closeSheet();
         if (!answer || !answer.ok) {
-          err.hidden = false;
-          err.textContent = (answer && answer.reason)
-            || 'the ' + verb + ' did not go through';
+          showError((answer && answer.reason)
+                    || 'the ' + verb + ' did not go through', true);
           return;
         }
-        err.hidden = true;
+        clearError();
         // Straight away rather than on the next tick of the poll: the
         // reason you pressed it was to change this list.
         poll();
       })
       .catch(function (error) {
         closeSheet();
-        err.hidden = false;
-        err.textContent = 'could not reach the server — ' + error;
+        showError('could not reach the server — ' + error, true);
       });
   }
+
+  // ── what the banner is saying, and for how long ───────────────────────
+  // render() used to clear it unconditionally, so a kill that came back
+  // "no such session" said why for at most five seconds -- and for none at
+  // all when a poll was already in flight when the answer landed. That is
+  // indistinguishable from the button having done nothing.
+  //
+  // A message about the server's own state still comes and goes with that
+  // state. A message about something *you* pressed stays until you have
+  // acknowledged it or replaced it.
+  var errHeld = false;
+
+  function showError(text, held) {
+    err.textContent = text;
+    if (held) {
+      var hint = document.createElement('span');
+      hint.className = 'dismiss';
+      hint.textContent = 'tap to dismiss';
+      err.appendChild(hint);
+    }
+    err.hidden = false;
+    errHeld = !!held;
+  }
+
+  function clearError() {
+    err.hidden = true;
+    err.textContent = '';
+    errHeld = false;
+  }
+
+  err.addEventListener('click', clearError);
 
   sheet.addEventListener('click', function (event) {
     // The backdrop and Cancel both dismiss. A sheet with only one way out is
@@ -533,8 +690,8 @@
   }
 
   function render(data) {
-    err.hidden = !data.error;
-    if (data.error) err.textContent = data.error;
+    if (data.error) showError(data.error, false);
+    else if (!errHeld) clearError();
 
     age.textContent = fmtAge(data.age);
     age.classList.toggle('stale', !!data.stale);
@@ -599,8 +756,9 @@
       .then(function (r) { return r.json(); })
       .then(render)
       .catch(function (error) {
-        err.hidden = false;
-        err.textContent = 'cannot reach the server — ' + error;
+        // Not held: this one is about the connection, and it goes away by
+        // itself the moment the next poll gets through.
+        showError('cannot reach the server — ' + error, false);
         age.classList.add('stale');
       })
       .then(function () { inflight = false; });
