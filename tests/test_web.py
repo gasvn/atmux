@@ -2891,6 +2891,61 @@ class KeypadVocabularyTests(unittest.TestCase):
             self.assertTrue(chord['k'].startswith('\x02'), chord)
             self.assertLessEqual(len(chord['k']), 2, chord)
 
+    def test_the_keyboard_being_up_is_measured_not_asked(self):
+        """The layout viewport does not shrink for the software keyboard and
+        the visual one does. Nothing else on this page takes a third of the
+        screen -- a collapsing browser URL bar is about 60px of 852, which is
+        nowhere near."""
+        harness = _extract(self.js, 'typingNow')
+        share = re.search(r'var KEYBOARD_SHARE = ([\d.]+)', self.js)
+        self.assertIsNotNone(share)
+        import subprocess
+        out = subprocess.run(
+            [_node(), '-e', f'var KEYBOARD_SHARE = {share.group(1)};\n'
+             + harness + """
+             console.log(JSON.stringify([
+               typingNow(852, 852),      // nothing up
+               typingNow(792, 852),      // a URL bar collapsed
+               typingNow(560, 852),      // the keyboard
+               typingNow(500, 852),
+               typingNow(393, 852),
+               typingNow(0, 852),        // not measured yet
+               typingNow(560, 0)]));"""],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout),
+                         [False, False, True, True, True, False, False])
+
+    def test_what_stands_down_is_what_is_about_reading(self):
+        """Two postures, and the pad only ever had one. Reading, you want
+        detach and the history and the window you are not looking at; typing,
+        you want escape, the modifiers, tab, enter and the arrows. Measured
+        on a 393x852 phone: the pad goes 349px -> 190px, about thirteen rows
+        of terminal handed back to the thing being typed into."""
+        rule = re.search(r'body\.typing ([^{]*)\{([^}]*)\}', self.html)
+        self.assertIsNotNone(rule, 'the pad has only one posture')
+        self.assertIn('display: none', rule.group(2))
+        hidden = {part.strip().lstrip('#') for part in
+                  rule.group(1).replace('body.typing', '').split(',')}
+        self.assertEqual(hidden, {'pins', 'keys'})
+
+    def test_the_rows_you_type_with_stay(self):
+        """Including the handle: the other thirty-seven are one tap away
+        rather than gone."""
+        css = _declarations(self.html)
+        for kept in ('#nav', '#grab', '#tabs'):
+            with self.subTest(kept=kept):
+                self.assertNotRegex(
+                    css, r'body\.typing [^{]*' + re.escape(kept) + r'\b')
+
+    def test_the_terminal_is_told_after_the_rows_stand_down(self):
+        """A row leaving is rows of terminal handed back, and refit is what
+        tells the terminal. Toggled after it, the terminal keeps drawing
+        where the keys used to be until something else resizes it."""
+        body = _extract(self.js, 'syncViewport')
+        self.assertIn("'typing'", body)
+        self.assertLess(body.index("'typing'"), body.index('refit()'))
+
     def test_the_four_movement_keys_form_a_cross(self):
         """The one that says why any of this changed. `↑` sat to the *right*
         of `↓` -- array order, and no order a thumb has -- so every movement

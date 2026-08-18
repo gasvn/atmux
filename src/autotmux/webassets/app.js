@@ -2771,11 +2771,38 @@
   // much, and pinning the page back to 0 undoes it.
   var app = document.getElementById('app');
   var vv = window.visualViewport;
+  // ── the two postures ──────────────────────────────────────────────────
+  // The pad is sized for the one where you are reading: four rows, 41% of a
+  // phone. With the software keyboard up that same 41% comes out of the half
+  // of the screen the keyboard left, and what remains of the terminal is
+  // about sixteen rows -- so the thing you are typing into becomes the
+  // smallest thing on the screen, which is exactly backwards.
+  //
+  // The two postures want different things anyway. Reading, you want detach
+  // and the history and the window you are not looking at. Typing, you want
+  // escape, the modifiers, tab, enter and the arrows -- and nothing else,
+  // because everything else is about acting on what you read.
+  //
+  // Which posture it is is not asked, it is measured: the layout viewport
+  // does not shrink for the keyboard and the visual one does, and on this
+  // page nothing else takes a third of the screen. A collapsing browser URL
+  // bar is about 60px of 852, which is nowhere near.
+  var KEYBOARD_SHARE = 0.75;
+
+  function typingNow(visual, whole) {
+    if (!(visual > 0) || !(whole > 0)) return false;
+    return visual / whole < KEYBOARD_SHARE;
+  }
+
   function syncViewport() {
     if (!vv) return;
     app.style.height = vv.height + 'px';
     app.style.transform = vv.offsetTop
       ? 'translateY(' + vv.offsetTop + 'px)' : '';
+    // Before the refit, not after: the rows that stand down change how much
+    // terminal there is, and refit is what tells the terminal.
+    document.body.classList.toggle(
+      'typing', typingNow(vv.height, window.innerHeight));
     refit();
   }
   if (vv) {
