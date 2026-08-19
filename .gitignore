@@ -10,3 +10,7 @@ build/
 .coverage
 .coverage.*
 htmlcov/
+
+# Not a uv project: this appears only when a uv-run probe borrows the
+# directory, and the install is a plain editable setuptools one.
+uv.lock
