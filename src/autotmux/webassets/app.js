@@ -1491,6 +1491,8 @@
   // Not pointerdown-to-fire like the fixed rows: this one has to know whether
   // the finger moved before it can know what was meant.
   var GRAB_SLOP = 6;
+  // Past shut, and by enough that it cannot be the overshoot of closing.
+  var HIDE_TRAVEL = 64;
   keepFocus(expander);
   if (expander) (function () {
     var from = 0, startedAt = 0, moving = false, live = false;
@@ -1526,7 +1528,8 @@
       if (!moving) { toggleDrawer(); haptic(); return; }
       // Dragged shut: below the smallest useful drawer, the intent is closed
       // rather than tiny.
-      if (sheetHeight <= sheetFloor() && startedAt < event.clientY) {
+      var down = event.clientY - startedAt;                 // down is positive
+      if (sheetHeight <= sheetFloor() && down > 0) {
         // Restored, not kept: the floor is where the gesture passed through
         // on its way to closed, not a height anyone chose. Reopening should
         // give back the one they did choose.
@@ -1535,6 +1538,21 @@
         if (editing) setEditing(false);
         renderKeys();
         sizeSheet();
+        // And kept going past that: the gesture has stopped being about the
+        // drawer and is about the pad. `hide` was a button for this, sitting
+        // in a row of settings and doing something that is not one -- while
+        // the grip was already the thing you pull to decide how much pad
+        // there is. This is the end of that same pull. `⌃` at the bottom
+        // edge brings it back, which is where a thumb already is.
+        //
+        // Only when the pull *began* shut. Measured otherwise: one long drag
+        // from a tall drawer closed it and took the pad with it, because the
+        // finger had travelled far enough for both -- and a gesture that
+        // means two things at once means the second one by accident.
+        if (from <= sheetFloor() && down > HIDE_TRAVEL) {
+          setPad(false);
+          haptic();
+        }
       }
     }
 
@@ -1599,7 +1617,6 @@
   // thumb however few pixels tall it is.
   var PAD_STATE = 'atmux.pad';
   var grip = document.getElementById('grip');
-  var hideButton = document.getElementById('hide');
 
   function setPad(shown) {
     document.body.classList.toggle('nopad', !shown);
@@ -1618,11 +1635,7 @@
     } catch (e) {}
     refit();
   }
-  keepFocus(hideButton); keepFocus(grip);
-  if (hideButton) hideButton.addEventListener('click', function (event) {
-    event.preventDefault();
-    setPad(false);
-  });
+  keepFocus(grip);
   if (grip) grip.addEventListener('click', function (event) {
     event.preventDefault();
     setPad(true);
@@ -1691,19 +1704,14 @@
     announce = true;
     refit();
   }
-  var minus = document.getElementById('fontminus');
-  var plus = document.getElementById('fontplus');
   var autoButton = document.getElementById('fontauto');
   function markAuto() {
-    if (autoButton) autoButton.classList.toggle('on', manualFont === null);
+    // Hidden while the layout is choosing, which is the normal state and was
+    // the state it used to sit there lit in. A control that is on and does
+    // nothing when pressed is a control you have to learn to ignore.
+    if (autoButton) autoButton.hidden = manualFont === null;
   }
-  keepFocus(minus); keepFocus(plus); keepFocus(autoButton);
-  if (minus) minus.addEventListener('click', function (e) {
-    e.preventDefault(); setFont(term.options.fontSize - 1);
-  });
-  if (plus) plus.addEventListener('click', function (e) {
-    e.preventDefault(); setFont(term.options.fontSize + 1);
-  });
+  keepFocus(autoButton);
   if (autoButton) autoButton.addEventListener('click', function (e) {
     e.preventDefault(); setAutoFont();
   });

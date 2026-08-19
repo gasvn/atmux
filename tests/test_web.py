@@ -1562,7 +1562,7 @@ class TouchKeypadTests(unittest.TestCase):
         """A button that takes focus first leaves nothing to bounce, and the
         keyboard then belongs to the button rather than the terminal."""
         self.assertIn('function keepFocus', self.js)
-        for control in ('kbd', 'minus', 'plus', 'expander'):
+        for control in ('kbd', 'autoButton', 'expander', 'grip'):
             with self.subTest(control=control):
                 self.assertRegex(self.js, r'keepFocus\(' + control + r'\)')
 
@@ -3110,6 +3110,37 @@ class KeypadVocabularyTests(unittest.TestCase):
         broken, and the app's own list is deduplicated for the same reason."""
         page = self.render([{'k': 'z', 'l': 'Layout'}], expanded=True)
         self.assertEqual(len(page['keys']), len(set(page['keys'])))
+
+    def test_pulling_the_grip_past_shut_puts_the_pad_away(self):
+        """`hide` was a button in a row of settings, doing something that is
+        not one -- while the grip was already what you pull to decide how
+        much pad there is. This is the end of that same pull."""
+        up = self.js[self.js.index('var HIDE_TRAVEL'):]
+        up = up[:up.index('function cancel')]
+        self.assertIn('setPad(false)', up)
+        self.assertIn('down > HIDE_TRAVEL', up)
+
+    def test_the_pull_that_hides_must_have_begun_shut(self):
+        """Measured otherwise: one long drag from a tall drawer closed it and
+        took the pad with it, because the finger had travelled far enough for
+        both -- and a gesture that means two things at once means the second
+        one by accident."""
+        up = self.js[self.js.index('var HIDE_TRAVEL'):]
+        up = up[:up.index('function cancel')]
+        self.assertIn('from <= sheetFloor() && down > HIDE_TRAVEL', up)
+
+    def test_the_way_back_to_the_pad_survives_it(self):
+        """A gesture that puts something away has to leave the thing that
+        brings it back, and this one is the only way back to every key."""
+        self.assertIn("body.touch.nopad #edge {", self.html)
+        self.assertIn('id="grip"', self.html)
+
+    def test_the_size_control_is_absent_while_the_layout_owns_the_size(self):
+        """Which is the normal state, and the state it used to sit there lit
+        in. A control that is on and does nothing when pressed is a control
+        you have to learn to ignore."""
+        body = _extract(self.js, 'markAuto')
+        self.assertIn('autoButton.hidden = manualFont === null', body)
 
     def test_the_drawer_rests_open_rather_than_shut(self):
         """The complaint this answers: `37 more keys` was a button in front
@@ -4874,17 +4905,19 @@ That reasoning was about the clipboard, which needs a user gesture. The
         self.assertRegex(css, r'body\.touch\.nopad #pad \{[^}]*display: none')
         self.assertRegex(css, r'body\.touch\.nopad #edge \{[^}]*display: flex')
 
-    def test_the_controls_all_fit_across_a_phone(self):
-        """Seven buttons and a spacer in 390px. Measured in a browser --
-        390px of 390 exactly, with the gap down to 5 to make room for the
-        seventh -- and the regression this catches is someone adding an eighth
-        without measuring, because the one that does not fit goes off the edge
-        rather than wrapping.
+    def test_the_settings_row_holds_only_what_no_gesture_covers(self):
+        """It held seven, and four of them duplicated something a finger
+        already does. Verified in the code, not assumed: a long press on the
+        terminal opens the copy view (`setSelecting` on the lift), a pinch
+        sets the font (`setFont(pinchFont * ...)`), and the grip is what you
+        pull to decide how much pad there is.
 
-        `back` is here and `edit` is not, and that is the trade: the way out
-        of a session had to be visible somewhere, and choosing which keys to
-        keep is only meaningful while you can see the keys, which is when the
-        sheet is open. So it moved into the sheet.
+        So `A−` and `A+` are gone -- this row only ever exists on a touch
+        screen, so the pinch is always there -- and `hide` is the end of the
+        pull the grip already answers. `auto` is what a pinch *cannot* do:
+        give the decision back. `copy` stays, because the long press opens
+        the view at the line you pressed and the button opens it at all of
+        them, and because `copy` is the word people look for.
         """
         # Every button on the page, in order. The first three cost the
         # settings row nothing: `selpaste` and `seldone` live inside the
@@ -4893,19 +4926,21 @@ That reasoning was about the clipboard, which needs a user gesture. The
         controls = re.findall(r'<button id="(\w+)"', self.html)
         self.assertEqual(controls,
                          ['selcopy', 'selpaste', 'seldone', 'hist', 'newbuild',
-                          'edit', 'grab', 'back', 'fontminus', 'fontauto',
-                          'fontplus', 'kbd', 'sel', 'hide', 'exit', 'grip'])
+                          'edit', 'grab', 'back', 'fontauto',
+                          'kbd', 'sel', 'exit', 'grip'])
         row = self.html[self.html.index('<div id="tabs">'):]
         row = row[:row.index('</div>')]
         self.assertEqual(re.findall(r'<button id="(\w+)"', row),
-                         ['back', 'fontminus', 'fontauto', 'fontplus',
-                          'kbd', 'sel', 'hide'])
-        # Six, and each of the two that carry a verb gets a word. There was
-        # never room for that at eight, which is why `‹` and `▾` were bare
-        # glyphs -- and `▾` sat four buttons from `⌄`, which meant something
-        # else entirely.
+                         ['back', 'fontauto', 'kbd', 'sel'])
+        # Three of them, usually: `auto` only appears once there is a
+        # decision to give back.
+        self.assertIn('<button id="fontauto" hidden', self.html)
         self.assertIn('>‹ list</button>', self.html)
-        self.assertIn('>hide</button>', self.html)
+        # And what is gone is gone, not merely hidden.
+        for dead in ('fontminus', 'fontplus', '"hide"'):
+            with self.subTest(dead=dead):
+                self.assertNotIn(dead, self.html)
+                self.assertNotIn(dead, self.js)
 
     def test_the_drawer_opens_from_the_last_row(self):
         """It used to open from a button in the settings row, at the far end

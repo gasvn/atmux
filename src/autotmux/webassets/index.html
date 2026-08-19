@@ -999,11 +999,13 @@
            Six buttons, so each gets a word where a word is clearer than a
            glyph -- there was never room for that at eight. -->
       <span class="spacer"></span>
-      <button id="fontminus" aria-label="smaller">A−</button>
-      <!-- Lit while the layout is choosing the size, which is the normal
-           state. Tapping it hands the decision back after a pinch. -->
-      <button id="fontauto" aria-label="automatic size">A</button>
-      <button id="fontplus" aria-label="larger">A+</button>
+      <!-- One, and usually none. `A− A A+` was three buttons for something a
+           pinch already does -- and this row is only ever on a touch screen,
+           so the pinch is always there. What a pinch cannot do is give the
+           decision *back*, so that is the only one left, and it appears only
+           once there is a decision to give back. -->
+      <button id="fontauto" hidden
+              aria-label="size chosen by the layout again">auto</button>
       <button id="kbd" aria-label="keyboard">⌨</button>
       <!-- A drag over the terminal can mean read the scrollback, or it can
            mean select this text. It cannot mean both, so which one is a mode
@@ -1015,7 +1017,6 @@
            that can be selected from is also the only place with anything to
            paste into. -->
       <button id="sel" aria-label="copy and paste text">copy</button>
-      <button id="hide" aria-label="hide the keys">hide</button>
     </div>
   </div>
   <!-- All that is left when the pad is hidden, at the very bottom edge where
