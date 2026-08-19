@@ -316,20 +316,17 @@
   }
   #edge button {
     /* 44, not the 26 the handle used to be. It sits on the bottom edge, so
-       a thumb cannot overshoot it downward -- but there are two targets
-       here now, and 26px of height between them is a row a thumb has to
+       a thumb cannot overshoot it downward -- but 26px is still a row you
        aim at rather than land on. */
     min-height: 44px; border: 0; background: none;
     /* Raised from #6e6e78, which measured 3.64:1 here. This strip is the
-       only way back to the keys once they are hidden, and now the only way
-       back to the list; it cannot be the hardest thing on screen to see. */
+       only way back to the keys once they are hidden; it cannot be the
+       hardest thing on screen to see. */
     color: #9096a0; font: 13px/1 ui-monospace, Menlo, monospace;
     -webkit-tap-highlight-color: transparent;
   }
   #edge button:active { background: #26262c; }
-  /* The way out on the left, where the back gesture already lives, and the
-     handle taking the rest -- it is the one you reach for without looking. */
-  #exit { flex: 0 0 auto; padding: 0 16px; border-right: 1px solid #2a2a30; }
+  /* The full width, so there is nothing to aim at along it either. */
   #grip { flex: 1 1 auto; }
 
   /* ── selecting text ───────────────────────────────────────────────────
@@ -984,28 +981,24 @@
     <button id="grab" aria-expanded="false"
             aria-label="more keys"><span></span><b id="grabcount"></b></button>
     <div id="tabs">
-      <!-- The way out. From inside a session the only route back to the list
-           was `detach`, seventh key into the drawer under `tmux` -- and this
-           page is built to be installed to the home screen, where there is no
-           browser chrome to fall back on. It sends the same thing that key
-           does; the socket closing is what returns you. -->
-      <button id="back" aria-label="back to the session list">‹ list</button>
-      <!-- Two controls used to live here that do not belong in a settings
-           row. `⌄ 38` opened the drawer -- a drawer opens from its edge, so
-           it is the handle above now. `☆` chose which keys to keep, which is
-           only meaningful while you can see the keys, so it is at the top of
-           the sheet. What is left is only things that change how the pad
-           behaves, which is what this row is for.
-           Six buttons, so each gets a word where a word is clearer than a
-           glyph -- there was never room for that at eight. -->
-      <span class="spacer"></span>
+      <!-- What is left of a row that held eight. `⌄ 38` opened the drawer --
+           a drawer opens from its edge, so it is the handle above now. `☆`
+           chose which keys to keep, which is only meaningful while you can
+           see the keys, so it is at the top of the sheet. `A− A A+`, `hide`
+           and `‹ list` were all a finger's own gestures spelled out as
+           buttons. What is left is the two things no gesture reaches, at the
+           corner a thumb rests on. -->
       <!-- One, and usually none. `A− A A+` was three buttons for something a
            pinch already does -- and this row is only ever on a touch screen,
            so the pinch is always there. What a pinch cannot do is give the
            decision *back*, so that is the only one left, and it appears only
-           once there is a decision to give back. -->
+           once there is a decision to give back.
+           At the far end from the other two, so that the row gaining a
+           button never moves the buttons that were already there -- the same
+           reason the navigation row is not allowed to reflow. -->
       <button id="fontauto" hidden
               aria-label="size chosen by the layout again">auto</button>
+      <span class="spacer"></span>
       <button id="kbd" aria-label="keyboard">⌨</button>
       <!-- A drag over the terminal can mean read the scrollback, or it can
            mean select this text. It cannot mean both, so which one is a mode
@@ -1020,16 +1013,12 @@
     </div>
   </div>
   <!-- All that is left when the pad is hidden, at the very bottom edge where
-       a thumb cannot overshoot it.
-
-       It used to be the handle alone, and the handle alone was a trap: this
-       page opens with the pad collapsed -- deliberately, so a session lands
-       in a full screen of terminal -- and `‹ list` lives in the settings row
-       inside the pad, so a console you had just opened had no visible way
-       back to the list. Measured: `‹ list` was 0x0 until the pad was up.
-       Two targets now, and the strip is 44 tall rather than 26. -->
+       a thumb cannot overshoot it. The handle, and only the handle: `‹ list`
+       stood here too, and beside it in the settings row, for a trip a swipe
+       in from the left edge already makes. 44 tall rather than the 26 it was
+       when it really was only a handle -- the pad opens from it, and a thumb
+       should land on that rather than aim at it. -->
   <div id="edge">
-    <button id="exit" aria-label="back to the session list">‹ list</button>
     <button id="grip" aria-label="show the keys">⌃</button>
   </div>
 </div>

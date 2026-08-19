@@ -1586,28 +1586,20 @@
   // ── the way out ───────────────────────────────────────────────────────
   // `prefix d`, which is what the drawer's `detach` key sends. Detaching ends
   // the pty, the socket closes with reason "exit", and onclose navigates back
-  // to the list -- so this button does not have to know where the list is.
+  // to the list -- so nothing here has to know where the list is.
   //
-  // It exists because there was no visible way back at all: `detach` is
-  // seventh into the sheet under `tmux`, and this page is built to be
-  // installed to the home screen, where there is no browser chrome to fall
-  // back on.
-  // Two elements, one meaning, and never both on screen: `#back` is in the
-  // settings row inside the pad, `#exit` is on the strip that is all there
-  // is when the pad is hidden. One handler, so they cannot drift into doing
-  // different things -- which is what "one affordance" is actually about.
-  ['back', 'exit'].forEach(function (id) {
-    var button = document.getElementById(id);
-    if (!button) return;
-    keepFocus(button);
-    button.addEventListener('click', function (event) {
-      event.preventDefault();
-      // Through typed(), so that reading history is left first: sending the
-      // prefix into a pane still in copy-mode reaches nothing at all.
-      typed(prefixSeq + 'd');
-      haptic();
-    });
-  });
+  // This used to be two buttons of the same name: `‹ list` in the settings
+  // row inside the pad, and another on the edge strip for when the pad was
+  // hidden. Both spent permanent screen on something the hand already does.
+  // Swiping in from the left edge is how you go back on this device, and the
+  // gesture is the affordance now -- see the touchmove handler.
+  function goList() {
+    // Through typed(), so that reading history is left first: sending the
+    // prefix into a pane still in copy-mode reaches nothing at all.
+    typed(prefixSeq + 'd');
+    haptic();
+    say('detaching…');
+  }
 
   // ── getting out of the way ────────────────────────────────────────────
   // The pad is two hundred pixels of a phone screen, and there are stretches
@@ -2455,15 +2447,31 @@
   // exist, and there is nothing on a terminal to hint at one -- but a tip
   // repeated on every attach is noise from the second time onwards.
   var PRESS_HINT = 'atmux.presshint';
-  function offerPressHint() {
-    if (!touch) return;
+  var BACK_HINT = 'atmux.backhint';
+
+  function unseen(key) {
     try {
-      if (localStorage.getItem(PRESS_HINT)) return;
-      localStorage.setItem(PRESS_HINT, '1');
-    } catch (e) { return; }
+      if (localStorage.getItem(key)) return false;
+      localStorage.setItem(key, '1');
+    } catch (e) { return false; }
+    return true;
+  }
+
+  // In order and spaced apart, because say() is one box: two tips fired
+  // together is one tip, the second having overwritten the first inside its
+  // 1.6s.
+  function offerHints() {
+    if (!touch) return;
+    var tips = [];
+    // The way out first. It is the only one of these whose absence leaves
+    // somebody stuck on a screen -- the rest are conveniences.
+    if (unseen(BACK_HINT)) tips.push('swipe in from the left edge for the list');
     // What the gesture does, not what it used to do: it hands you a
     // selection to adjust, it does not copy a line behind your back.
-    setTimeout(function () { say('press and hold a line to select it'); }, 1200);
+    if (unseen(PRESS_HINT)) tips.push('press and hold a line to select it');
+    tips.forEach(function (tip, i) {
+      setTimeout(function () { say(tip); }, 1200 + i * 2600);
+    });
   }
 
   function rowUnder() {
@@ -2529,7 +2537,22 @@
   var dragFromX = 0, switched = false;
   var SWITCH_TRAVEL = 60;      // far enough that a crooked scroll is not one
   var SWITCH_BIAS = 1.6;       // and decisively sideways rather than merely
-  var EDGE_GUARD = 24;         // iOS owns the first stripe: that is Back
+  var EDGE_GUARD = 24;         // the first stripe is the way out, below
+
+  // ── swiping back to the list ──────────────────────────────────────────
+  // The first stripe, which is exactly the region a window switch already
+  // refuses -- so this takes nothing away from switching windows, it uses
+  // the strip that was being left alone.
+  //
+  // Left to iOS would have been less code and is what happens in a browser
+  // tab anyway. It is not enough: installed to the home screen there is no
+  // chrome to fall back on, and if the console is what was installed there
+  // is no history behind it either. That is the screen with no way out, and
+  // it is the only one that matters, so the page owns the gesture.
+  //
+  // Further than a window switch, because the two start 24px apart and
+  // being detached when you meant `◀ win` is the worse mistake of the two.
+  var BACK_TRAVEL = 96;
 
   function swipeWindow(dx) {
     if (published !== 'external' || !prefixSeq) return false;
@@ -2618,7 +2641,16 @@
     }
     var dy = event.touches[0].clientY - dragFrom;
     var dx = event.touches[0].clientX - dragFromX;
-    // Sideways first, and only while nothing vertical has already been
+    // The way out first of all, because it starts where nothing else does.
+    if (!swiped && !switched && dragFromX <= EDGE_GUARD &&
+        dx > BACK_TRAVEL && dx > SWITCH_BIAS * Math.abs(dy)) {
+      cancelPress();
+      switched = true;         // the rest of this finger belongs to leaving
+      event.preventDefault();
+      goList();
+      return;
+    }
+    // Sideways next, and only while nothing vertical has already been
     // claimed: a gesture is one thing or the other, and a scroll that drifts
     // must not turn into a window switch half way down.
     if (!swiped && !switched &&
@@ -2980,6 +3012,6 @@
   if (boot) boot.style.display = 'none';
   connect();
   checkBuild();
-  offerPressHint();
+  offerHints();
   term.focus();
 })();

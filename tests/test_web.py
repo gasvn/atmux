@@ -1892,11 +1892,10 @@ class BottomEdgeTests(unittest.TestCase):
     """What is on screen when the console has just opened.
 
     The pad arrives collapsed, deliberately: a session should land in a full
-    screen of terminal. That put `‹ list` -- which lives in the settings row
-    inside the pad -- at 0x0 on the screen you land on, so the only way back
-    to the session list was a browser gesture this page is built not to have
-    (it is installed to the home screen). What was left was the handle, 26px
-    tall, below anyone's minimum.
+    screen of terminal. All that leaves is this strip, and it used to be the
+    handle alone at 26px -- below anyone's minimum, and next to it for a
+    while a second `‹ list` for the trip a swipe in from the left edge now
+    makes. One target, and it clears the minimum.
     """
 
     @classmethod
@@ -1908,21 +1907,23 @@ class BottomEdgeTests(unittest.TestCase):
         start = cls.html.index('<div id="edge">')
         cls.edge = cls.html[start:cls.html.index('</div>', start)]
 
-    def test_the_way_out_is_on_the_strip_that_is_always_there(self):
-        for what in ('id="exit"', 'id="grip"'):
-            with self.subTest(what=what):
-                self.assertIn(what, self.edge)
-        self.assertIn('‹ list', self.edge)
+    def test_the_strip_is_the_handle_and_nothing_else(self):
+        """`‹ list` stood here, and again in the settings row inside the pad.
+        Both are gone: the swipe in from the left edge is the way out, and a
+        button whose whole job a gesture does is a button that is only ever
+        in the way."""
+        self.assertIn('id="grip"', self.edge)
+        self.assertEqual(re.findall(r'<button id="(\w+)"', self.edge), ['grip'])
+        self.assertNotIn('‹ list</button>', self.html)
 
     def test_the_strip_appears_exactly_where_the_pad_does_not(self):
-        """One or the other, never neither: the pad's own row has `‹ list`
-        in it, so a second copy while it is open would be two of the same
-        button."""
+        """One or the other, never neither: the handle is how the pad comes
+        back, so it exists exactly while the pad does not."""
         self.assertIn('body.touch.nopad #pad { display: none; }', self.html)
         self.assertIn('body.touch.nopad #edge {', self.html)
         self.assertIn('#edge { display: none; }', self.html)
 
-    def test_both_targets_clear_the_minimum(self):
+    def test_the_target_clears_the_minimum(self):
         rule = re.search(r'#edge button \{(.*?)\}', self.html, re.S)
         self.assertIsNotNone(rule)
         size = re.search(r'min-height:\s*(\d+)px', rule.group(1))
@@ -1932,7 +1933,8 @@ class BottomEdgeTests(unittest.TestCase):
     def test_a_short_screen_may_shrink_it_but_not_below_the_other_floor(self):
         """Height is the one dimension a short screen cannot spend, and 40 is
         Android's minimum where 44 is Apple's -- the same trade the keys
-        make. This strip carries the only way back, so not below that."""
+        make. This strip is the only way back to the keys, so not below
+        that."""
         block = re.search(
             r'@media \(orientation: landscape\)[^{]*\{(.*?)\n  \}',
             self.html, re.S)
@@ -1944,13 +1946,13 @@ class BottomEdgeTests(unittest.TestCase):
         self.assertIsNotNone(size)
         self.assertGreaterEqual(int(size.group(1)), 40)
 
-    def test_the_two_back_buttons_cannot_drift_apart(self):
-        """Two elements, one meaning, never both on screen. One handler, so
-        they cannot come to do different things -- which is what "one
-        affordance" is actually about."""
-        self.assertIn("['back', 'exit'].forEach", self.js)
-        # And exactly one place that sends the detach.
+    def test_there_is_exactly_one_place_that_leaves(self):
+        """It was two buttons sharing a handler so they could not drift
+        apart. It is one function now, and the gesture is its only caller --
+        the same invariant with one fewer thing in it."""
         self.assertEqual(self.js.count("prefixSeq + 'd'"), 1)
+        self.assertIn("prefixSeq + 'd'", _extract(self.js, 'goList'))
+        self.assertEqual(self.js.count('goList('), 2)   # declared, called once
 
     def test_a_key_label_breaks_at_its_spaces(self):
         """`overflow-wrap: anywhere` puts a break opportunity between every
@@ -3003,8 +3005,8 @@ class KeypadVocabularyTests(unittest.TestCase):
 
     def test_the_swipe_never_takes_the_gesture_the_scrollback_owns(self):
         """A drag is one thing or the other. It must be decisively sideways,
-        it must not start where iOS owns the stripe -- that is Back -- and a
-        scroll that drifts must not become a window switch half way down."""
+        it must not start in the stripe the way out owns, and a scroll that
+        drifts must not become a window switch half way down."""
         move = self.js[self.js.index('SWITCH_TRAVEL'):]
         move = move[:move.index('showDebug(dy)')]
         for guard in ('!swiped', '!switched', 'SWITCH_BIAS', 'EDGE_GUARD'):
@@ -3012,6 +3014,46 @@ class KeypadVocabularyTests(unittest.TestCase):
                 self.assertIn(guard, move)
         # And it is only offered where tmux is the thing on the other end.
         self.assertNotIn("published === 'app'", _extract(self.js, 'swipeWindow'))
+
+    def test_the_way_out_starts_in_the_stripe_a_window_switch_refuses(self):
+        """`‹ list` was two permanent buttons for the trip a swipe in from
+        the left edge already makes on this device. Owned by the page rather
+        than left to iOS, because the one case that matters cannot be checked
+        from here: installed to the home screen with the console as the icon
+        there is no chrome to fall back on and no history behind it either,
+        and that is the screen with no way out.
+
+        It costs the window switch nothing: `EDGE_GUARD` is exactly the
+        region that switch already refused, so this uses the strip that was
+        being left alone rather than taking one."""
+        move = self.js[self.js.index('// The way out first of all'):]
+        move = move[:move.index('// Sideways next')]
+        self.assertIn('dragFromX <= EDGE_GUARD', move)
+        self.assertIn('goList()', move)
+        for guard in ('!swiped', '!switched', 'SWITCH_BIAS'):
+            with self.subTest(guard=guard):
+                self.assertIn(guard, move)
+        # Rightwards only: leftwards from the left edge is not a gesture
+        # anybody makes, and `dx > ` is what says so.
+        self.assertIn('dx > BACK_TRAVEL', move)
+        self.assertNotIn('Math.abs(dx)', move)
+
+    def test_leaving_asks_for_more_than_switching_does(self):
+        """They start 24px apart, and being detached when you meant `◀ win`
+        is the worse mistake of the two."""
+        travel = int(re.search(r'var BACK_TRAVEL = (\d+)', self.js).group(1))
+        switch = int(re.search(r'var SWITCH_TRAVEL = (\d+)', self.js).group(1))
+        self.assertGreater(travel, switch)
+
+    def test_leaving_goes_out_through_the_same_door_detach_does(self):
+        """Detaching ends the pty, the socket closes with reason "exit", and
+        onclose is what returns you -- so the gesture does not have to know
+        where the list is. Through typed(), because a pane still in copy-mode
+        does not hear the prefix."""
+        body = _extract(self.js, 'goList')
+        self.assertIn("typed(prefixSeq + 'd')", body)
+        self.assertIn('haptic()', body)
+        self.assertIn('say(', body)
 
     def test_the_visible_verbs_are_the_ones_no_gesture_covers(self):
         """The pad shows the first few without being asked, so those should
@@ -3915,10 +3957,28 @@ That reasoning was about the clipboard, which needs a user gesture. The
     def test_the_gesture_is_mentioned_once_and_only_once(self):
         """There is nothing on a terminal to hint at a gesture, and a tip
         repeated on every attach is noise from the second time onwards."""
-        source = _extract(self.js, 'offerPressHint')
+        source = _extract(self.js, 'unseen')
         self.assertIn('localStorage', source)
         self.assertIn('setItem', source)
-        self.assertIn('press and hold', source)
+        self.assertIn('press and hold', _extract(self.js, 'offerHints'))
+
+    def test_the_way_out_is_the_tip_that_comes_first(self):
+        """Two tips and one status box: fired together, the second overwrites
+        the first inside its 1.6s and only one of them was ever said. Spaced,
+        and the way out leads -- it is the only one of these whose absence
+        leaves somebody stuck on a screen."""
+        source = _extract(self.js, 'offerHints')
+        self.assertLess(source.index('left edge'), source.index('press and hold'))
+        self.assertIn('BACK_HINT', source)
+        self.assertIn('PRESS_HINT', source)
+        # Separate keys, so somebody who has been here since before the
+        # gesture existed is still told about it once.
+        keys = re.findall(r"var (?:BACK|PRESS)_HINT = '([^']+)'", self.js)
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(len(set(keys)), 2)
+        gap = re.search(r'1200 \+ i \* (\d+)', source)
+        self.assertIsNotNone(gap)
+        self.assertGreater(int(gap.group(1)), 1600)
 
     def test_copying_does_not_need_a_gesture_to_be_recognised(self):
         """Long press is what everyone reaches for, and twice it has not
@@ -4889,16 +4949,15 @@ That reasoning was about the clipboard, which needs a user gesture. The
               [!!document.body._cls.nopad, store[PAD_STATE]]));'''),
             [True, 'hidden'])
 
-    def test_hiding_it_leaves_a_way_back_to_both_places(self):
+    def test_hiding_it_leaves_a_way_back(self):
         """A hidden pad with no way back is a terminal you have to reload to
         type in. The strip is outside #pad, so hiding the pad cannot hide it.
 
-        Both places, now: to the keys, and to the session list. This page
-        opens with the pad collapsed, so `‹ list` inside the pad was 0x0 on
-        the screen you land on -- and it is installed to the home screen,
-        where there is no browser chrome to fall back on."""
+        Back to the keys, which is all this has to carry now: the way back to
+        the session list stood here too for a while, and is a swipe in from
+        the left edge."""
         self.assertIn('id="grip"', self.html)
-        self.assertIn('id="exit"', self.html)
+        self.assertNotIn('id="exit"', self.html)
         pad = self.html[self.html.index('<div id="pad">'):]
         self.assertLess(pad.index('</div>'), pad.index('id="edge"'))
         css = re.sub(r'/\*.*?\*/', '', self.html, flags=re.S)
@@ -4914,10 +4973,12 @@ That reasoning was about the clipboard, which needs a user gesture. The
 
         So `A−` and `A+` are gone -- this row only ever exists on a touch
         screen, so the pinch is always there -- and `hide` is the end of the
-        pull the grip already answers. `auto` is what a pinch *cannot* do:
-        give the decision back. `copy` stays, because the long press opens
-        the view at the line you pressed and the button opens it at all of
-        them, and because `copy` is the word people look for.
+        pull the grip already answers. `‹ list` went the same way once the
+        swipe in from the left edge became this page's own gesture rather
+        than one borrowed from iOS. `auto` is what a pinch *cannot* do: give
+        the decision back. `copy` stays, because the long press opens the
+        view at the line you pressed and the button opens it at all of them,
+        and because `copy` is the word people look for.
         """
         # Every button on the page, in order. The first three cost the
         # settings row nothing: `selpaste` and `seldone` live inside the
@@ -4926,18 +4987,17 @@ That reasoning was about the clipboard, which needs a user gesture. The
         controls = re.findall(r'<button id="(\w+)"', self.html)
         self.assertEqual(controls,
                          ['selcopy', 'selpaste', 'seldone', 'hist', 'newbuild',
-                          'edit', 'grab', 'back', 'fontauto',
-                          'kbd', 'sel', 'exit', 'grip'])
+                          'edit', 'grab', 'fontauto', 'kbd', 'sel', 'grip'])
         row = self.html[self.html.index('<div id="tabs">'):]
         row = row[:row.index('</div>')]
         self.assertEqual(re.findall(r'<button id="(\w+)"', row),
-                         ['back', 'fontauto', 'kbd', 'sel'])
-        # Three of them, usually: `auto` only appears once there is a
-        # decision to give back.
+                         ['fontauto', 'kbd', 'sel'])
+        # Two of them, usually: `auto` only appears once there is a decision
+        # to give back.
         self.assertIn('<button id="fontauto" hidden', self.html)
-        self.assertIn('>‹ list</button>', self.html)
         # And what is gone is gone, not merely hidden.
-        for dead in ('fontminus', 'fontplus', '"hide"'):
+        for dead in ('fontminus', 'fontplus', '"hide"', 'id="back"',
+                     'id="exit"'):
             with self.subTest(dead=dead):
                 self.assertNotIn(dead, self.html)
                 self.assertNotIn(dead, self.js)
